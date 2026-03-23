@@ -69,15 +69,43 @@ def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_leng
     
     return valid_embeds.cpu().float().numpy(), tokens, valid_input_ids
 
-def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highlight_words=None, only_show_highlighted=False):
+def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highlight_words=None, only_show_highlighted=False, phrase_to_extract=None):
     """Generate and save various visualizations for the embeddings."""
     os.makedirs(out_dir, exist_ok=True)
     
     if highlight_words is None:
         highlight_words = []
         
-    # If only_show_highlighted is True, filter the embeds and tokens
-    if only_show_highlighted and highlight_words:
+    # If phrase_to_extract is provided, find the contiguous sequence of tokens
+    if phrase_to_extract:
+        phrase_words = phrase_to_extract.lower().split()
+        start_idx = -1
+        end_idx = -1
+        
+        # Simple sliding window to find the phrase
+        for i in range(len(tokens) - len(phrase_words) + 1):
+            match = True
+            for j, word in enumerate(phrase_words):
+                clean_token = tokens[i+j].strip().replace('\n', '\\n').lower()
+                # Check if the token contains the word or vice versa (handling subwords)
+                if word not in clean_token and clean_token not in word:
+                    match = False
+                    break
+            
+            if match:
+                start_idx = i
+                end_idx = i + len(phrase_words)
+                break
+                
+        if start_idx != -1:
+            print(f"Found phrase '{phrase_to_extract}' at token indices {start_idx} to {end_idx-1}")
+            embeds = embeds[start_idx:end_idx]
+            tokens = tokens[start_idx:end_idx]
+        else:
+            print(f"Warning: Could not find exact phrase '{phrase_to_extract}' in tokens. Showing all tokens.")
+            
+    # If only_show_highlighted is True (and we didn't just extract a phrase), filter the embeds and tokens
+    elif only_show_highlighted and highlight_words:
         filtered_embeds = []
         filtered_tokens = []
         for i, token in enumerate(tokens):
@@ -196,6 +224,7 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=256, help="Max sequence length for the tokenizer")
     parser.add_argument("--highlight_words", type=str, nargs='+', default=[], help="Words to highlight in the visualizations (e.g. red two female Asian)")
     parser.add_argument("--only_show_highlighted", action="store_true", help="If set, only the highlighted words will be shown in the visualizations")
+    parser.add_argument("--extract_phrase", type=str, default=None, help="Extract and visualize only a specific contiguous phrase (e.g. 'a yellow umbrella')")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -226,7 +255,7 @@ def main():
         print(f"  [{i:3d}] ID: {valid_input_ids[i].item():5} | Token: '{clean_token}'")
     
     print("\nGenerating visualizations...")
-    visualize_embeddings(embeds, tokens, args.out_dir, args.highlight_words, args.only_show_highlighted)
+    visualize_embeddings(embeds, tokens, args.out_dir, args.highlight_words, args.only_show_highlighted, args.extract_phrase)
 
 if __name__ == "__main__":
     main()
