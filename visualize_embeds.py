@@ -69,15 +69,40 @@ def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_leng
     
     return valid_embeds.cpu().float().numpy(), tokens, valid_input_ids
 
-def visualize_embeddings(embeds, tokens, out_dir="output_visualizations"):
+def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highlight_words=None):
     """Generate and save various visualizations for the embeddings."""
     os.makedirs(out_dir, exist_ok=True)
     
+    if highlight_words is None:
+        highlight_words = []
+        
+    # Create highlighted labels
+    labels = []
+    is_highlighted = []
+    for token in tokens:
+        clean_token = token.strip().replace('\n', '\\n')
+        if not clean_token:
+            clean_token = "[SPACE]"
+            
+        highlight = any(hw.lower() in clean_token.lower() for hw in highlight_words)
+        is_highlighted.append(highlight)
+        if highlight:
+            labels.append(f"*{clean_token}*")
+        else:
+            labels.append(clean_token)
+            
     # 1. Heatmap of the embeddings (subsampled if too large)
     plt.figure(figsize=(12, max(6, len(tokens) * 0.2)))
     # Subsample hidden dimensions for better visualization if it's huge (e.g., 4096 -> 100)
     dim_step = max(1, embeds.shape[1] // 100)
-    sns.heatmap(embeds[:, ::dim_step], cmap="viridis", yticklabels=tokens)
+    ax = sns.heatmap(embeds[:, ::dim_step], cmap="viridis", yticklabels=labels)
+    
+    # Color highlighted y-tick labels red
+    for i, tick_label in enumerate(ax.get_yticklabels()):
+        if is_highlighted[i]:
+            tick_label.set_color('red')
+            tick_label.set_fontweight('bold')
+            
     plt.title("Token Embeddings Heatmap (Subsampled Dimensions)")
     plt.xlabel("Hidden Dimensions")
     plt.ylabel("Tokens")
@@ -92,7 +117,18 @@ def visualize_embeddings(embeds, tokens, out_dir="output_visualizations"):
     similarity_matrix = np.dot(norm_embeds, norm_embeds.T)
     
     plt.figure(figsize=(max(8, len(tokens) * 0.3), max(8, len(tokens) * 0.3)))
-    sns.heatmap(similarity_matrix, cmap="coolwarm", xticklabels=tokens, yticklabels=tokens, annot=False)
+    ax = sns.heatmap(similarity_matrix, cmap="coolwarm", xticklabels=labels, yticklabels=labels, annot=False)
+    
+    # Color highlighted tick labels red
+    for i, tick_label in enumerate(ax.get_xticklabels()):
+        if is_highlighted[i]:
+            tick_label.set_color('red')
+            tick_label.set_fontweight('bold')
+    for i, tick_label in enumerate(ax.get_yticklabels()):
+        if is_highlighted[i]:
+            tick_label.set_color('red')
+            tick_label.set_fontweight('bold')
+            
     plt.title("Token-to-Token Cosine Similarity")
     plt.xticks(rotation=90)
     plt.tight_layout()
@@ -105,16 +141,23 @@ def visualize_embeddings(embeds, tokens, out_dir="output_visualizations"):
         embeds_2d = pca.fit_transform(embeds)
         
         plt.figure(figsize=(12, 10))
-        plt.scatter(embeds_2d[:, 0], embeds_2d[:, 1], alpha=0.6, s=100)
         
-        for i, token in enumerate(tokens):
-            # Clean up token string for display
-            clean_token = token.strip().replace('\n', '\\n')
-            if not clean_token:
-                clean_token = "[SPACE]"
-                
-            plt.annotate(clean_token, (embeds_2d[i, 0], embeds_2d[i, 1]), 
-                         fontsize=9, alpha=0.8, xytext=(5, 5), textcoords='offset points')
+        # Plot normal points and highlighted points separately for different colors
+        normal_idx = [i for i, h in enumerate(is_highlighted) if not h]
+        high_idx = [i for i, h in enumerate(is_highlighted) if h]
+        
+        if normal_idx:
+            plt.scatter(embeds_2d[normal_idx, 0], embeds_2d[normal_idx, 1], alpha=0.6, s=100, c='blue', label='Normal Tokens')
+        if high_idx:
+            plt.scatter(embeds_2d[high_idx, 0], embeds_2d[high_idx, 1], alpha=0.9, s=150, c='red', marker='*', label='Attribute Tokens')
+            plt.legend()
+        
+        for i, label in enumerate(labels):
+            color = 'red' if is_highlighted[i] else 'black'
+            weight = 'bold' if is_highlighted[i] else 'normal'
+            plt.annotate(label, (embeds_2d[i, 0], embeds_2d[i, 1]), 
+                         fontsize=10 if is_highlighted[i] else 9, 
+                         color=color, fontweight=weight, alpha=0.8, xytext=(5, 5), textcoords='offset points')
             
         plt.title("PCA Projection of Token Embeddings")
         plt.xlabel(f"Principal Component 1 ({pca.explained_variance_ratio_[0]:.1%} variance)")
@@ -131,6 +174,7 @@ def main():
     parser.add_argument("--prompt", type=str, default="A beautiful sunset over the mountains, cinematic lighting, 8k resolution", help="Prompt to visualize")
     parser.add_argument("--out_dir", type=str, default="embed_visualizations", help="Output directory for plots")
     parser.add_argument("--max_seq_len", type=int, default=256, help="Max sequence length for the tokenizer")
+    parser.add_argument("--highlight_words", type=str, nargs='+', default=[], help="Words to highlight in the visualizations (e.g. red two female Asian)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -161,7 +205,7 @@ def main():
         print(f"  [{i:3d}] ID: {valid_input_ids[i].item():5} | Token: '{clean_token}'")
     
     print("\nGenerating visualizations...")
-    visualize_embeddings(embeds, tokens, args.out_dir)
+    visualize_embeddings(embeds, tokens, args.out_dir, args.highlight_words)
 
 if __name__ == "__main__":
     main()
