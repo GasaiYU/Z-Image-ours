@@ -11,5 +11,5 @@ python benchmarks/geneval/evaluation/evaluate_images.py \
     --outfile $OUTFILE \
     --model-path $MODEL_PATH
 
-# Run summary scores (optional, if you want to see the final score)
-python benchmarks/geneval/evaluation/summary_scores.py $OUTFILE
+# # Run summary scores (optional, if you want to see the final score)
+# python benchmarks/geneval/evaluation/summary_scores.py $OUTFILE
