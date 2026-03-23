@@ -47,7 +47,27 @@ def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_leng
     # Decode tokens for visualization labels
     tokens = [tokenizer.decode([tid]) for tid in valid_input_ids]
     
-    return valid_embeds.cpu().float().numpy(), tokens
+    # Filter out special tokens (like <|im_start|>, user, assistant, <|im_end|>)
+    # We only want the actual prompt content
+    content_start_idx = 0
+    content_end_idx = len(tokens)
+    
+    # Find the actual prompt content between user and <|im_end|>
+    for i, token in enumerate(tokens):
+        if 'user' in token:
+            content_start_idx = i + 1
+        elif '<|im_end|>' in token and i > content_start_idx:
+            content_end_idx = i
+            break
+            
+    # If we couldn't find the exact markers, just use the whole thing
+    # Otherwise, slice the arrays to only include the content
+    if content_start_idx < content_end_idx and content_start_idx > 0:
+        valid_embeds = valid_embeds[content_start_idx:content_end_idx]
+        valid_input_ids = valid_input_ids[content_start_idx:content_end_idx]
+        tokens = tokens[content_start_idx:content_end_idx]
+    
+    return valid_embeds.cpu().float().numpy(), tokens, valid_input_ids
 
 def visualize_embeddings(embeds, tokens, out_dir="output_visualizations"):
     """Generate and save various visualizations for the embeddings."""
@@ -129,16 +149,16 @@ def main():
     tokenizer = components["tokenizer"]
     
     print(f"\nEncoding prompt: '{args.prompt}'")
-    embeds, tokens = get_prompt_embeds(args.prompt, text_encoder, tokenizer, device, args.max_seq_len)
+    embeds, tokens, valid_input_ids = get_prompt_embeds(args.prompt, text_encoder, tokenizer, device, args.max_seq_len)
     
     print(f"Extracted embeddings shape: {embeds.shape}")
-    print(f"Number of valid tokens (excluding padding): {len(tokens)}")
+    print(f"Number of valid tokens (excluding padding and special tokens): {len(tokens)}")
     
     print("\nToken sequence:")
     for i, token in enumerate(tokens):
         # Clean up newlines for printing
         clean_token = token.replace('\n', '\\n')
-        print(f"  [{i:3d}] ID: {valid_input_ids[i].item() if 'valid_input_ids' in locals() else 'N/A':5} | Token: '{clean_token}'")
+        print(f"  [{i:3d}] ID: {valid_input_ids[i].item():5} | Token: '{clean_token}'")
     
     print("\nGenerating visualizations...")
     visualize_embeddings(embeds, tokens, args.out_dir)
