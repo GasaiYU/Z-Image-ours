@@ -83,6 +83,13 @@ def parse_args():
         action="store_true",
         help="skip saving grid",
     )
+    parser.add_argument(
+        "--tags",
+        type=str,
+        nargs="+",
+        help="only run prompts with these tags (e.g. counting position color_attr colors)",
+        default=None
+    )
     opt = parser.parse_args()
     return opt
 
@@ -91,6 +98,10 @@ def main(opt):
     # Load prompts
     with open(opt.metadata_file) as fp:
         metadatas = [json.loads(line) for line in fp]
+
+    if opt.tags is not None:
+        metadatas = [m for m in metadatas if m.get("tag") in opt.tags]
+        print(f"Filtered prompts to {len(metadatas)} items matching tags: {opt.tags}")
 
     # Device selection priority: cuda -> tpu -> mps -> cpu
     if torch.cuda.is_available():
