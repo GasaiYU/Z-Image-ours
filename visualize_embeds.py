@@ -69,13 +69,29 @@ def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_leng
     
     return valid_embeds.cpu().float().numpy(), tokens, valid_input_ids
 
-def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highlight_words=None):
+def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highlight_words=None, only_show_highlighted=False):
     """Generate and save various visualizations for the embeddings."""
     os.makedirs(out_dir, exist_ok=True)
     
     if highlight_words is None:
         highlight_words = []
         
+    # If only_show_highlighted is True, filter the embeds and tokens
+    if only_show_highlighted and highlight_words:
+        filtered_embeds = []
+        filtered_tokens = []
+        for i, token in enumerate(tokens):
+            clean_token = token.strip().replace('\n', '\\n')
+            if any(hw.lower() in clean_token.lower() for hw in highlight_words):
+                filtered_embeds.append(embeds[i])
+                filtered_tokens.append(token)
+        
+        if not filtered_tokens:
+            print("Warning: No highlighted words found in the prompt. Showing all tokens.")
+        else:
+            embeds = np.array(filtered_embeds)
+            tokens = filtered_tokens
+            
     # Create highlighted labels
     labels = []
     is_highlighted = []
@@ -92,10 +108,14 @@ def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highli
             labels.append(clean_token)
             
     # 1. Heatmap of the embeddings (subsampled if too large)
-    plt.figure(figsize=(12, max(6, len(tokens) * 0.2)))
+    plt.figure(figsize=(12, max(6, len(tokens) * 0.4)))
     # Subsample hidden dimensions for better visualization if it's huge (e.g., 4096 -> 100)
     dim_step = max(1, embeds.shape[1] // 100)
-    ax = sns.heatmap(embeds[:, ::dim_step], cmap="viridis", yticklabels=labels)
+    
+    # Remove the first dimension (outlier) for better visualization of the rest
+    clean_embeds = embeds[:, 1:]
+    
+    ax = sns.heatmap(clean_embeds[:, ::dim_step], cmap="viridis", yticklabels=labels)
     
     # Color highlighted y-tick labels red
     for i, tick_label in enumerate(ax.get_yticklabels()):
@@ -103,7 +123,7 @@ def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highli
             tick_label.set_color('red')
             tick_label.set_fontweight('bold')
             
-    plt.title("Token Embeddings Heatmap (Subsampled Dimensions)")
+    plt.title("Token Embeddings Heatmap (Subsampled, Dim 0 Removed)")
     plt.xlabel("Hidden Dimensions")
     plt.ylabel("Tokens")
     plt.tight_layout()
@@ -116,8 +136,8 @@ def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highli
     norm_embeds = embeds / norms
     similarity_matrix = np.dot(norm_embeds, norm_embeds.T)
     
-    plt.figure(figsize=(max(8, len(tokens) * 0.3), max(8, len(tokens) * 0.3)))
-    ax = sns.heatmap(similarity_matrix, cmap="coolwarm", xticklabels=labels, yticklabels=labels, annot=False)
+    plt.figure(figsize=(max(8, len(tokens) * 0.5), max(8, len(tokens) * 0.5)))
+    ax = sns.heatmap(similarity_matrix, cmap="coolwarm", xticklabels=labels, yticklabels=labels, annot=len(tokens) <= 15, fmt=".2f")
     
     # Color highlighted tick labels red
     for i, tick_label in enumerate(ax.get_xticklabels()):
@@ -156,7 +176,7 @@ def visualize_embeddings(embeds, tokens, out_dir="output_visualizations", highli
             color = 'red' if is_highlighted[i] else 'black'
             weight = 'bold' if is_highlighted[i] else 'normal'
             plt.annotate(label, (embeds_2d[i, 0], embeds_2d[i, 1]), 
-                         fontsize=10 if is_highlighted[i] else 9, 
+                         fontsize=12 if is_highlighted[i] else 9, 
                          color=color, fontweight=weight, alpha=0.8, xytext=(5, 5), textcoords='offset points')
             
         plt.title("PCA Projection of Token Embeddings")
@@ -175,6 +195,7 @@ def main():
     parser.add_argument("--out_dir", type=str, default="embed_visualizations", help="Output directory for plots")
     parser.add_argument("--max_seq_len", type=int, default=256, help="Max sequence length for the tokenizer")
     parser.add_argument("--highlight_words", type=str, nargs='+', default=[], help="Words to highlight in the visualizations (e.g. red two female Asian)")
+    parser.add_argument("--only_show_highlighted", action="store_true", help="If set, only the highlighted words will be shown in the visualizations")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -205,7 +226,7 @@ def main():
         print(f"  [{i:3d}] ID: {valid_input_ids[i].item():5} | Token: '{clean_token}'")
     
     print("\nGenerating visualizations...")
-    visualize_embeddings(embeds, tokens, args.out_dir, args.highlight_words)
+    visualize_embeddings(embeds, tokens, args.out_dir, args.highlight_words, args.only_show_highlighted)
 
 if __name__ == "__main__":
     main()
