@@ -1,0 +1,30 @@
+{"tag": "color_attr", "include": [{"class": "car", "count": 1, "color": "red"}, {"class": "bicycle", "count": 1, "color": "blue"}], "prompt": "A photo of a red car and a blue bicycle."}
+{"tag": "color_attr", "include": [{"class": "couch", "count": 1, "color": "purple"}, {"class": "tv", "count": 1, "color": "yellow"}], "prompt": "A photo of a purple couch and a yellow tv."}
+{"tag": "color_attr", "include": [{"class": "dog", "count": 1, "color": "black"}, {"class": "frisbee", "count": 1, "color": "pink"}], "prompt": "A photo of a black dog and a pink frisbee."}
+{"tag": "color_attr", "include": [{"class": "apple", "count": 1, "color": "green"}, {"class": "cup", "count": 1, "color": "orange"}], "prompt": "A photo of a green apple and an orange cup."}
+{"tag": "color_attr", "include": [{"class": "suitcase", "count": 1, "color": "white"}, {"class": "backpack", "count": 1, "color": "brown"}], "prompt": "A photo of a white suitcase and a brown backpack."}
+{"tag": "colors", "include": [{"class": "umbrella", "count": 1, "color": "yellow"}], "prompt": "A photo of a yellow umbrella."}
+{"tag": "colors", "include": [{"class": "bird", "count": 1, "color": "blue"}], "prompt": "A photo of a blue bird."}
+{"tag": "colors", "include": [{"class": "motorcycle", "count": 1, "color": "green"}], "prompt": "A photo of a green motorcycle."}
+{"tag": "colors", "include": [{"class": "tie", "count": 1, "color": "red"}], "prompt": "A photo of a red tie."}
+{"tag": "colors", "include": [{"class": "teddy bear", "count": 1, "color": "pink"}], "prompt": "A photo of a pink teddy bear."}
+{"tag": "counting", "include": [{"class": "cat", "count": 3}], "exclude": [{"class": "cat", "count": 4}], "prompt": "A photo of 3 cats."}
+{"tag": "counting", "include": [{"class": "book", "count": 4}], "exclude": [{"class": "book", "count": 5}], "prompt": "A photo of 4 books."}
+{"tag": "counting", "include": [{"class": "chair", "count": 2}], "exclude": [{"class": "chair", "count": 3}], "prompt": "A photo of 2 chairs."}
+{"tag": "counting", "include": [{"class": "apple", "count": 5}], "exclude": [{"class": "apple", "count": 6}], "prompt": "A photo of 5 apples."}
+{"tag": "counting", "include": [{"class": "car", "count": 2}], "exclude": [{"class": "car", "count": 3}], "prompt": "A photo of 2 cars."}
+{"tag": "counting", "include": [{"class": "bird", "count": 6}], "exclude": [{"class": "bird", "count": 7}], "prompt": "A photo of 6 birds."}
+{"tag": "counting", "include": [{"class": "cup", "count": 3}], "exclude": [{"class": "cup", "count": 4}], "prompt": "A photo of 3 cups."}
+{"tag": "counting", "include": [{"class": "dog", "count": 2}], "exclude": [{"class": "dog", "count": 3}], "prompt": "A photo of 2 dogs."}
+{"tag": "counting", "include": [{"class": "potted plant", "count": 4}], "exclude": [{"class": "potted plant", "count": 5}], "prompt": "A photo of 4 potted plants."}
+{"tag": "counting", "include": [{"class": "bicycle", "count": 3}], "exclude": [{"class": "bicycle", "count": 4}], "prompt": "A photo of 3 bicycles."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "female", "race": "Asian"}], "prompt": "A photo of an Asian female."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "male", "race": "Black"}], "prompt": "A photo of a Black male."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "female", "race": "Caucasian"}], "prompt": "A photo of a Caucasian female."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "male", "race": "Hispanic"}], "prompt": "A photo of a Hispanic male."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "female", "race": "Indian"}], "prompt": "A photo of an Indian female."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "male", "race": "Middle Eastern"}], "prompt": "A photo of a Middle Eastern male."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "female", "race": "Black"}], "prompt": "A photo of a Black female."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "male", "race": "Asian"}], "prompt": "A photo of an Asian male."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "female", "race": "Hispanic"}], "prompt": "A photo of a Hispanic female."}
+{"tag": "gender_race", "include": [{"class": "person", "count": 1, "gender": "male", "race": "Caucasian"}], "prompt": "A photo of a Caucasian male."}
