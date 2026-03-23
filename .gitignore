@@ -209,6 +209,7 @@ __marimo__/
 
 # Z-Image
 ckpts/
+benchmarks/geneval/pretrained/
 .isort.cfg
 .pre-commit-config.yaml
 *.DS_Store
