@@ -39,6 +39,7 @@ SUBJECT_BANK = [
     "apple", "banana", "orange", "grape", "watermelon", "strawberry", "pineapple", "mango", "peach", "pear",
     "table", "chair", "sofa", "bed", "desk", "cabinet", "shelf", "wardrobe", "stool", "bench",
     "tree", "flower", "grass", "bush", "plant", "leaf", "branch", "root", "stem", "trunk",
+    "vase", "vases", "cup", "cups", "bottle", "bottles", "plate", "plates", "bowl", "bowls"
 ]
 
 # ---------------------------------------------------------------------------
@@ -196,7 +197,8 @@ def generate_subject_variants(prompt, subject_bank=None, num_variants=8, seed=42
     sorted_bank = sorted(subject_bank, key=len, reverse=True)
     
     for subj in sorted_bank:
-        pattern = r'(?<!\w)' + re.escape(subj.lower()) + r'(?!\w)'
+        # Use simple word boundary regex
+        pattern = r'\b' + re.escape(subj.lower()) + r'\b'
         if re.search(pattern, text_lower):
             found.append(subj)
             
@@ -215,8 +217,8 @@ def generate_subject_variants(prompt, subject_bank=None, num_variants=8, seed=42
         label_parts = []
         for orig_subj in found:
             replacement = rng.choice(candidates)
-            # Replace case-insensitively
-            pattern = r'(?<!\w)' + re.escape(orig_subj) + r'(?!\w)'
+            # Replace case-insensitively with word boundaries
+            pattern = r'\b' + re.escape(orig_subj) + r'\b'
             variant = re.sub(pattern, replacement, variant, count=1, flags=re.IGNORECASE)
             label_parts.append(f"{orig_subj}→{replacement}")
         variants.append((" | ".join(label_parts), variant))
