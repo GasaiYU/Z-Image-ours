@@ -97,7 +97,7 @@ def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_leng
         valid_input_ids = valid_input_ids[content_start_idx:content_end_idx]
         tokens = tokens[content_start_idx:content_end_idx]
 
-    return valid_embeds.cpu().float().numpy(), tokens, valid_input_ids
+    return valid_embeds.detach().cpu().float().numpy(), tokens, valid_input_ids
 
 
 # ---------------------------------------------------------------------------
