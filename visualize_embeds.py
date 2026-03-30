@@ -80,7 +80,7 @@ def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_leng
             input_ids=text_input_ids,
             attention_mask=prompt_masks,
             output_hidden_states=True,
-        ).hidden_states[-2]
+        ).hidden_states[-8]
 
     # In Z-Image, the DiT backbone's cap_embedder applies an RMSNorm to the text features
     # right after receiving them. We instantiate an equivalent RMSNorm here to apply it.
