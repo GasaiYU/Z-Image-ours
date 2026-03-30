@@ -43,6 +43,15 @@ SUBJECT_BANK = [
 ]
 
 # ---------------------------------------------------------------------------
+# Color word bank
+# ---------------------------------------------------------------------------
+COLOR_BANK = [
+    "red", "blue", "green", "yellow", "purple", "orange", "pink", "brown", "black", "white",
+    "gray", "grey", "cyan", "magenta", "maroon", "navy", "olive", "teal", "silver", "gold",
+    "indigo", "violet", "turquoise", "beige", "coral", "crimson", "khaki", "lavender", "plum", "salmon"
+]
+
+# ---------------------------------------------------------------------------
 # Embedding extraction (unchanged from original)
 # ---------------------------------------------------------------------------
 def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_length=256):
@@ -221,6 +230,47 @@ def generate_subject_variants(prompt, subject_bank=None, num_variants=8, seed=42
             pattern = r'\b' + re.escape(orig_subj) + r'\b'
             variant = re.sub(pattern, replacement, variant, count=1, flags=re.IGNORECASE)
             label_parts.append(f"{orig_subj}→{replacement}")
+        variants.append((" | ".join(label_parts), variant))
+
+    return variants, found
+
+def generate_color_variants(prompt, color_bank=None, num_variants=8, seed=42):
+    """
+    Detect color words in `prompt` and create `num_variants` new prompts by
+    replacing each detected color with a randomly chosen alternative.
+    """
+    if color_bank is None:
+        color_bank = COLOR_BANK
+
+    rng = random.Random(seed)
+    
+    found = []
+    text_lower = prompt.lower()
+    sorted_bank = sorted(color_bank, key=len, reverse=True)
+    
+    for color in sorted_bank:
+        pattern = r'\b' + re.escape(color.lower()) + r'\b'
+        if re.search(pattern, text_lower):
+            found.append(color)
+            
+    if not found:
+        print(f"  [WARNING] No color words found in: '{prompt}'")
+        return [("original", prompt)], []
+
+    print(f"  Detected color words: {found}")
+
+    variants = [("original", prompt)]
+    found_lower = {f.lower() for f in found}
+    candidates = [c for c in color_bank if c.lower() not in found_lower]
+
+    for _ in range(num_variants):
+        variant = prompt
+        label_parts = []
+        for orig_color in found:
+            replacement = rng.choice(candidates)
+            pattern = r'\b' + re.escape(orig_color) + r'\b'
+            variant = re.sub(pattern, replacement, variant, count=1, flags=re.IGNORECASE)
+            label_parts.append(f"{orig_color}→{replacement}")
         variants.append((" | ".join(label_parts), variant))
 
     return variants, found
@@ -566,6 +616,9 @@ def main():
     parser.add_argument("--subject_swap", action="store_true",
                         help="Enable subject-swap mode: randomly replace subject/noun words in the "
                              "prompt and compare resulting embeddings")
+    parser.add_argument("--color_swap", action="store_true",
+                        help="Enable color-swap mode: randomly replace color words in the "
+                             "prompt and compare resulting embeddings")
     parser.add_argument("--num_variants", type=int, default=8,
                         help="Number of swap variants to generate (default: 8)")
     parser.add_argument("--seed", type=int, default=42,
@@ -575,6 +628,8 @@ def main():
                              "Defaults to the built-in numeric + vague quantity bank.")
     parser.add_argument("--subject_bank", type=str, nargs='+', default=None,
                         help="Custom list of subject words to use as the swap bank.")
+    parser.add_argument("--color_bank", type=str, nargs='+', default=None,
+                        help="Custom list of color words to use as the swap bank.")
 
     args = parser.parse_args()
 
@@ -592,20 +647,29 @@ def main():
     # ------------------------------------------------------------------
     # Swap modes
     # ------------------------------------------------------------------
-    if args.quantity_swap or args.subject_swap:
-        swap_type = "quantity" if args.quantity_swap else "subject"
+    if args.quantity_swap or args.subject_swap or args.color_swap:
+        if args.quantity_swap:
+            swap_type = "quantity"
+        elif args.subject_swap:
+            swap_type = "subject"
+        else:
+            swap_type = "color"
         
         if swap_type == "quantity":
             word_bank = args.quantity_bank if args.quantity_bank else ALL_QUANTITIES
-            found_words = find_quantities_in_prompt(args.prompt, word_bank)
             variants, found_words = generate_quantity_variants(
                 args.prompt, word_bank, num_variants=args.num_variants, seed=args.seed
-            ), found_words
+            ), find_quantities_in_prompt(args.prompt, word_bank)
             # The generate_quantity_variants returns variants directly, let's fix the tuple unpacking
             variants = generate_quantity_variants(args.prompt, word_bank, num_variants=args.num_variants, seed=args.seed)
-        else:
+        elif swap_type == "subject":
             word_bank = args.subject_bank if args.subject_bank else SUBJECT_BANK
             variants, found_words = generate_subject_variants(
+                args.prompt, word_bank, num_variants=args.num_variants, seed=args.seed
+            )
+        else:
+            word_bank = args.color_bank if args.color_bank else COLOR_BANK
+            variants, found_words = generate_color_variants(
                 args.prompt, word_bank, num_variants=args.num_variants, seed=args.seed
             )
             
