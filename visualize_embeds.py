@@ -60,6 +60,24 @@ def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_leng
             output_hidden_states=True,
         ).hidden_states[-2]
 
+    # In Z-Image, the DiT backbone's cap_embedder applies an RMSNorm to the text features
+    # right after receiving them. We instantiate an equivalent RMSNorm here to apply it.
+    hidden_size = prompt_embeds.shape[-1]
+    
+    class SimpleRMSNorm(torch.nn.Module):
+        def __init__(self, dim: int, eps: float = 1e-5):
+            super().__init__()
+            self.eps = eps
+            self.weight = torch.nn.Parameter(torch.ones(dim))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+            return output * self.weight
+            
+    # Apply the norm to match what the DiT actually sees
+    norm_layer = SimpleRMSNorm(hidden_size).to(device, dtype=prompt_embeds.dtype)
+    prompt_embeds = norm_layer(prompt_embeds)
+
     valid_embeds = prompt_embeds[0][prompt_masks[0]]
     valid_input_ids = text_input_ids[0][prompt_masks[0]]
 
