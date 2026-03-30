@@ -30,6 +30,18 @@ ALL_QUANTITIES = NUMERIC_QUANTITIES + VAGUE_QUANTITIES
 
 
 # ---------------------------------------------------------------------------
+# Subject word bank
+# ---------------------------------------------------------------------------
+SUBJECT_BANK = [
+    "cat", "dog", "bird", "horse", "elephant", "lion", "tiger", "bear", "monkey", "rabbit",
+    "car", "truck", "bus", "bicycle", "motorcycle", "train", "airplane", "boat", "ship", "helicopter",
+    "man", "woman", "boy", "girl", "child", "person", "student", "teacher", "doctor", "nurse",
+    "apple", "banana", "orange", "grape", "watermelon", "strawberry", "pineapple", "mango", "peach", "pear",
+    "table", "chair", "sofa", "bed", "desk", "cabinet", "shelf", "wardrobe", "stool", "bench",
+    "tree", "flower", "grass", "bush", "plant", "leaf", "branch", "root", "stem", "trunk",
+]
+
+# ---------------------------------------------------------------------------
 # Embedding extraction (unchanged from original)
 # ---------------------------------------------------------------------------
 def get_prompt_embeds(prompt, text_encoder, tokenizer, device, max_sequence_length=256):
@@ -167,6 +179,50 @@ def generate_quantity_variants(prompt, quantity_bank=None, num_variants=8, seed=
     return variants
 
 
+def generate_subject_variants(prompt, subject_bank=None, num_variants=8, seed=42):
+    """
+    Detect subject words in `prompt` and create `num_variants` new prompts by
+    replacing each detected subject with a randomly chosen alternative.
+    """
+    if subject_bank is None:
+        subject_bank = SUBJECT_BANK
+
+    rng = random.Random(seed)
+    
+    # Simple heuristic: find words in the prompt that are in the subject bank
+    found = []
+    text_lower = prompt.lower()
+    # Sort by length descending to match longest possible phrases first
+    sorted_bank = sorted(subject_bank, key=len, reverse=True)
+    
+    for subj in sorted_bank:
+        pattern = r'(?<!\w)' + re.escape(subj.lower()) + r'(?!\w)'
+        if re.search(pattern, text_lower):
+            found.append(subj)
+            
+    if not found:
+        print(f"  [WARNING] No subject words found in: '{prompt}'")
+        return [("original", prompt)], []
+
+    print(f"  Detected subject words: {found}")
+
+    variants = [("original", prompt)]
+    found_lower = {f.lower() for f in found}
+    candidates = [s for s in subject_bank if s.lower() not in found_lower]
+
+    for _ in range(num_variants):
+        variant = prompt
+        label_parts = []
+        for orig_subj in found:
+            replacement = rng.choice(candidates)
+            # Replace case-insensitively
+            pattern = r'(?<!\w)' + re.escape(orig_subj) + r'(?!\w)'
+            variant = re.sub(pattern, replacement, variant, count=1, flags=re.IGNORECASE)
+            label_parts.append(f"{orig_subj}→{replacement}")
+        variants.append((" | ".join(label_parts), variant))
+
+    return variants, found
+
 def mean_pool(embeds):
     """Mean-pool token embeddings into a single vector."""
     return embeds.mean(axis=0)
@@ -201,18 +257,19 @@ def find_quantity_token_indices(tokens, qty_word):
 
 
 # ---------------------------------------------------------------------------
-# Quantity swap visualizations
+# Swap visualizations (used for both quantity and subject swap)
 # ---------------------------------------------------------------------------
-def visualize_quantity_swap(
+def visualize_swap(
     variants_data,   # list of (label, prompt_text, embeds_array, tokens_list)
-    found_quantities,
-    out_dir="quantity_swap_visualizations",
+    found_words,
+    out_dir="swap_visualizations",
+    swap_type="quantity"
 ):
     """
     Produce three figures:
       1. Prompt-level cosine similarity heatmap (mean-pooled embeddings).
-      2. Bar chart: cosine similarity of each variant's quantity-token embedding
-         vs. the original's quantity-token embedding.
+      2. Bar chart: cosine similarity of each variant's swapped-token embedding
+         vs. the original's swapped-token embedding.
       3. PCA projection of mean-pooled embeddings across all variants.
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -240,70 +297,68 @@ def visualize_quantity_swap(
         vmin=vmin, vmax=1.0, ax=ax,
         linewidths=0.5, linecolor='gray',
     )
-    ax.set_title("Prompt-Level Cosine Similarity\n(mean-pooled embeddings, quantity words swapped)")
+    ax.set_title(f"Prompt-Level Cosine Similarity\n(mean-pooled embeddings, {swap_type} words swapped)")
     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=9)
     ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=9)
     # Highlight the original row/col
     ax.add_patch(plt.Rectangle((0, 0), n, 1, fill=False, edgecolor='lime', lw=3))
     ax.add_patch(plt.Rectangle((0, 0), 1, n, fill=False, edgecolor='lime', lw=3))
     plt.tight_layout()
-    out_path = os.path.join(out_dir, "prompt_similarity_heatmap.png")
+    out_path = os.path.join(out_dir, f"prompt_similarity_heatmap_{swap_type}.png")
     plt.savefig(out_path, dpi=150)
     plt.close()
     print(f"  Saved: {out_path}")
 
     # ------------------------------------------------------------------
-    # 2. Bar chart: quantity-token embedding similarity to original
+    # 2. Bar chart: swapped-token embedding similarity to original
     # ------------------------------------------------------------------
     orig_tokens = all_tokens[0]
     orig_embeds = all_embeds[0]
 
-    # Collect (original) quantity-token mean embedding
-    qty_token_sims = []
-    qty_labels_found = []
+    # Collect (original) swapped-token mean embedding
+    token_sims = []
     any_found = False
 
-    for qty in found_quantities:
-        orig_idxs = find_quantity_token_indices(orig_tokens, qty)
+    for word in found_words:
+        orig_idxs = find_quantity_token_indices(orig_tokens, word)
         if not orig_idxs:
             continue
-        orig_qty_vec = orig_embeds[orig_idxs].mean(axis=0)
+        orig_vec = orig_embeds[orig_idxs].mean(axis=0)
 
-        sims_for_qty = []
+        sims_for_word = []
         bar_labels = []
         for variant_label, _, v_embeds, v_tokens in variants_data:
-            # Determine the replaced quantity word in this variant
-            # (grab whatever replaced `qty` by scanning the label string)
-            replacement_word = qty  # fallback = same
+            # Determine the replaced word in this variant
+            replacement_word = word  # fallback = same
             for part in variant_label.split(' | '):
-                if f'{qty}→' in part:
+                if f'{word}→' in part:
                     replacement_word = part.split('→')[1]
                     break
             v_idxs = find_quantity_token_indices(v_tokens, replacement_word)
             if not v_idxs:
                 # fall back: find original word in case it wasn't replaced
-                v_idxs = find_quantity_token_indices(v_tokens, qty)
+                v_idxs = find_quantity_token_indices(v_tokens, word)
             if v_idxs:
-                v_qty_vec = v_embeds[v_idxs].mean(axis=0)
-                sims_for_qty.append(cosine_similarity(orig_qty_vec, v_qty_vec))
+                v_vec = v_embeds[v_idxs].mean(axis=0)
+                sims_for_word.append(cosine_similarity(orig_vec, v_vec))
             else:
-                sims_for_qty.append(0.0)
+                sims_for_word.append(0.0)
             bar_labels.append(variant_label[:35])
 
-        qty_token_sims.append((qty, sims_for_qty, bar_labels))
+        token_sims.append((word, sims_for_word, bar_labels))
         any_found = True
 
     if any_found:
-        num_plots = len(qty_token_sims)
+        num_plots = len(token_sims)
         fig, axes = plt.subplots(num_plots, 1, figsize=(max(10, n * 0.8), 5 * num_plots), squeeze=False)
-        for plot_i, (qty, sims, bar_labels) in enumerate(qty_token_sims):
+        for plot_i, (word, sims, bar_labels) in enumerate(token_sims):
             ax = axes[plot_i][0]
             colors = ['#2ecc71' if i == 0 else '#3498db' for i in range(len(sims))]
             bars = ax.bar(range(len(sims)), sims, color=colors, edgecolor='black', linewidth=0.5)
             ax.set_xticks(range(len(bar_labels)))
             ax.set_xticklabels(bar_labels, rotation=45, ha='right', fontsize=8)
             ax.set_ylabel("Cosine Similarity to Original")
-            ax.set_title(f"Quantity Token '{qty}' Embedding Similarity vs. Original")
+            ax.set_title(f"{swap_type.capitalize()} Token '{word}' Embedding Similarity vs. Original")
             ax.set_ylim(max(0, min(sims) - 0.05), 1.05)
             ax.axhline(1.0, color='gray', linestyle='--', alpha=0.5)
             ax.axhline(sims[0], color='green', linestyle=':', alpha=0.7, label='original self-sim')
@@ -313,12 +368,12 @@ def visualize_quantity_swap(
             ax.legend(fontsize=8)
 
         plt.tight_layout()
-        out_path = os.path.join(out_dir, "quantity_token_sim_bar.png")
+        out_path = os.path.join(out_dir, f"{swap_type}_token_sim_bar.png")
         plt.savefig(out_path, dpi=150)
         plt.close()
         print(f"  Saved: {out_path}")
     else:
-        print("  [WARNING] Could not locate quantity tokens in token sequences; skipping bar chart.")
+        print(f"  [WARNING] Could not locate {swap_type} tokens in token sequences; skipping bar chart.")
 
     # ------------------------------------------------------------------
     # 3. PCA of mean-pooled embeddings
@@ -341,17 +396,17 @@ def visualize_quantity_swap(
                         color='darkred' if i == 0 else 'black',
                         fontweight='bold' if i == 0 else 'normal')
 
-        ax.set_title("PCA of Mean-Pooled Prompt Embeddings (Quantity Swap Variants)")
+        ax.set_title(f"PCA of Mean-Pooled Prompt Embeddings ({swap_type.capitalize()} Swap Variants)")
         ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)")
         ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)")
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        out_path = os.path.join(out_dir, "pca_quantity_variants.png")
+        out_path = os.path.join(out_dir, f"pca_{swap_type}_variants.png")
         plt.savefig(out_path, dpi=150)
         plt.close()
         print(f"  Saved: {out_path}")
 
-    print(f"\nAll quantity-swap visualizations saved to: {out_dir}/")
+    print(f"\nAll {swap_type}-swap visualizations saved to: {out_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -506,13 +561,18 @@ def main():
     parser.add_argument("--quantity_swap", action="store_true",
                         help="Enable quantity-swap mode: randomly replace quantity words in the "
                              "prompt and compare resulting embeddings")
+    parser.add_argument("--subject_swap", action="store_true",
+                        help="Enable subject-swap mode: randomly replace subject/noun words in the "
+                             "prompt and compare resulting embeddings")
     parser.add_argument("--num_variants", type=int, default=8,
-                        help="Number of quantity-swap variants to generate (default: 8)")
+                        help="Number of swap variants to generate (default: 8)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for variant generation (default: 42)")
     parser.add_argument("--quantity_bank", type=str, nargs='+', default=None,
                         help="Custom list of quantity words to use as the swap bank. "
                              "Defaults to the built-in numeric + vague quantity bank.")
+    parser.add_argument("--subject_bank", type=str, nargs='+', default=None,
+                        help="Custom list of subject words to use as the swap bank.")
 
     args = parser.parse_args()
 
@@ -528,19 +588,29 @@ def main():
     tokenizer = components["tokenizer"]
 
     # ------------------------------------------------------------------
-    # Quantity swap mode
+    # Swap modes
     # ------------------------------------------------------------------
-    if args.quantity_swap:
-        qty_bank = args.quantity_bank if args.quantity_bank else ALL_QUANTITIES
-        print(f"\n[Quantity Swap Mode]")
+    if args.quantity_swap or args.subject_swap:
+        swap_type = "quantity" if args.quantity_swap else "subject"
+        
+        if swap_type == "quantity":
+            word_bank = args.quantity_bank if args.quantity_bank else ALL_QUANTITIES
+            found_words = find_quantities_in_prompt(args.prompt, word_bank)
+            variants, found_words = generate_quantity_variants(
+                args.prompt, word_bank, num_variants=args.num_variants, seed=args.seed
+            ), found_words
+            # The generate_quantity_variants returns variants directly, let's fix the tuple unpacking
+            variants = generate_quantity_variants(args.prompt, word_bank, num_variants=args.num_variants, seed=args.seed)
+        else:
+            word_bank = args.subject_bank if args.subject_bank else SUBJECT_BANK
+            variants, found_words = generate_subject_variants(
+                args.prompt, word_bank, num_variants=args.num_variants, seed=args.seed
+            )
+            
+        print(f"\n[{swap_type.capitalize()} Swap Mode]")
         print(f"Base prompt : '{args.prompt}'")
-        print(f"Quantity bank ({len(qty_bank)} words): {qty_bank}")
+        print(f"Word bank ({len(word_bank)} words): {word_bank[:10]}...")
         print(f"Generating {args.num_variants} variants (seed={args.seed})...\n")
-
-        found_qtys = find_quantities_in_prompt(args.prompt, qty_bank)
-        variants = generate_quantity_variants(
-            args.prompt, qty_bank, num_variants=args.num_variants, seed=args.seed
-        )
 
         print(f"Generated {len(variants)} prompts (1 original + {len(variants)-1} variants):\n")
         variants_data = []
@@ -554,7 +624,7 @@ def main():
             variants_data.append((label, variant_prompt, embeds, tokens))
 
         print(f"\nGenerating visualizations...")
-        visualize_quantity_swap(variants_data, found_qtys, out_dir=args.out_dir)
+        visualize_swap(variants_data, found_words, out_dir=args.out_dir, swap_type=swap_type)
 
     # ------------------------------------------------------------------
     # Original single-prompt visualization mode
