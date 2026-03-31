@@ -4,11 +4,12 @@ import sys
 import re
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+from pytorch_lightning import seed_everything
 
 # Add src to path so we can import Z-Image modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
-from utils import ensure_model_weights, load_from_local_dir
+from utils import ensure_model_weights, load_from_local_dir, set_attention_backend
 from zimage.pipeline import generate
 
 # Word banks to identify tokens that should use shallow features
@@ -193,6 +194,9 @@ def main():
         shallow_layer_idx=args.shallow_layer
     )
     
+    baseline_images = []
+    ours_images = []
+
     for i in range(args.num_seeds):
         current_seed = args.start_seed + i
         print(f"\n=== Testing Seed {current_seed} ({i+1}/{args.num_seeds}) ===")
@@ -203,9 +207,7 @@ def main():
             components["tokenizer"], components["scheduler"],
             args.prompt, baseline_embeds, device, seed=current_seed
         )
-        base_path = os.path.join(args.out_dir, f"baseline_deep_only_seed{current_seed}.png")
-        img_baseline.save(base_path)
-        print(f"   Saved baseline to {base_path}")
+        baseline_images.append(img_baseline)
         
         print(f"2. Generating OURS image (Token-wise Mixed Features)...")
         img_ours = custom_generate(
@@ -213,11 +215,53 @@ def main():
             components["tokenizer"], components["scheduler"],
             args.prompt, mixed_embeds, device, seed=current_seed
         )
-        ours_path = os.path.join(args.out_dir, f"ours_mixed_layer{args.shallow_layer}_seed{current_seed}.png")
-        img_ours.save(ours_path)
-        print(f"   Saved ours to {ours_path}")
-    
-    print("\nDone! Please compare the images in the output directory to see if attribute leakage/counting is improved.")
+        ours_images.append(img_ours)
+
+    # Build comparison grid:
+    # Row 0: label row
+    # Row 1: Baseline images (one per seed)
+    # Row 2: Ours images     (one per seed)
+    n = len(baseline_images)
+    img_w, img_h = baseline_images[0].size
+    label_h = 60
+    pad = 8
+    total_w = n * img_w + (n + 1) * pad
+    total_h = 2 * img_h + 3 * label_h + (2 + 1) * pad  # 2 rows of images + 3 label rows (top + per row)
+
+    grid = Image.new("RGB", (total_w, total_h), color=(240, 240, 240))
+    draw = ImageDraw.Draw(grid)
+
+    try:
+        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+    except Exception:
+        font_large = ImageFont.load_default()
+        font_small = font_large
+
+    # Top title
+    title = f'Prompt: "{args.prompt}"'
+    draw.text((pad, pad), title, fill=(30, 30, 30), font=font_large)
+
+    row_labels = ["Baseline (Deep Layer Only)", f"Ours (Layer {args.shallow_layer} for color/quantity tokens)"]
+    for row_idx, (images, label) in enumerate(zip([baseline_images, ours_images], row_labels)):
+        row_y_label = label_h + pad + row_idx * (img_h + label_h + pad)
+        row_y_img   = row_y_label + label_h
+
+        # Row label
+        draw.rectangle([pad, row_y_label, total_w - pad, row_y_label + label_h - 4], fill=(200, 220, 255) if row_idx == 0 else (200, 255, 210))
+        draw.text((pad * 2, row_y_label + 10), label, fill=(20, 20, 20), font=font_small)
+
+        for col_idx, img in enumerate(images):
+            x = pad + col_idx * (img_w + pad)
+            grid.paste(img, (x, row_y_img))
+            # Seed label on each image
+            seed_label = f"seed={args.start_seed + col_idx}"
+            draw.text((x + 6, row_y_img + 6), seed_label, fill=(255, 255, 255), font=font_small)
+
+    grid_path = os.path.join(args.out_dir, f"comparison_layer{args.shallow_layer}.png")
+    grid.save(grid_path)
+    print(f"\nSaved comparison grid to: {grid_path}")
+    print("Done!")
 
 if __name__ == "__main__":
     main()
