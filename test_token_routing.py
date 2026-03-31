@@ -245,7 +245,8 @@ def main():
     parser = argparse.ArgumentParser(description="Test Training-Free Token-wise Routing")
     parser.add_argument("--prompt", type=str, default="A red apple and a blue cup", help="Prompt to test")
     parser.add_argument("--shallow_layer", type=int, default=4, help="Which shallow layer to use for attributes")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for generation")
+    parser.add_argument("--num_seeds", type=int, default=4, help="Number of different random seeds to test")
+    parser.add_argument("--start_seed", type=int, default=42, help="Starting random seed")
     parser.add_argument("--out_dir", type=str, default="routing_test_results", help="Output directory")
     args = parser.parse_args()
 
@@ -270,27 +271,31 @@ def main():
         shallow_layer_idx=args.shallow_layer
     )
     
-    print(f"\n1. Generating BASELINE image (All Deep Features)...")
-    img_baseline = custom_generate(
-        components["transformer"], components["vae"], components["text_encoder"],
-        components["tokenizer"], components["scheduler"],
-        args.prompt, baseline_embeds, input_ids, masks, device, seed=args.seed
-    )
-    base_path = os.path.join(args.out_dir, "baseline_deep_only.png")
-    img_baseline.save(base_path)
-    print(f"Saved baseline to {base_path}")
+    for i in range(args.num_seeds):
+        current_seed = args.start_seed + i
+        print(f"\n=== Testing Seed {current_seed} ({i+1}/{args.num_seeds}) ===")
+        
+        print(f"1. Generating BASELINE image (All Deep Features)...")
+        img_baseline = custom_generate(
+            components["transformer"], components["vae"], components["text_encoder"],
+            components["tokenizer"], components["scheduler"],
+            args.prompt, baseline_embeds, input_ids, masks, device, seed=current_seed
+        )
+        base_path = os.path.join(args.out_dir, f"baseline_deep_only_seed{current_seed}.png")
+        img_baseline.save(base_path)
+        print(f"   Saved baseline to {base_path}")
+        
+        print(f"2. Generating OURS image (Token-wise Mixed Features)...")
+        img_ours = custom_generate(
+            components["transformer"], components["vae"], components["text_encoder"],
+            components["tokenizer"], components["scheduler"],
+            args.prompt, mixed_embeds, input_ids, masks, device, seed=current_seed
+        )
+        ours_path = os.path.join(args.out_dir, f"ours_mixed_layer{args.shallow_layer}_seed{current_seed}.png")
+        img_ours.save(ours_path)
+        print(f"   Saved ours to {ours_path}")
     
-    print(f"\n2. Generating OURS image (Token-wise Mixed Features)...")
-    img_ours = custom_generate(
-        components["transformer"], components["vae"], components["text_encoder"],
-        components["tokenizer"], components["scheduler"],
-        args.prompt, mixed_embeds, input_ids, masks, device, seed=args.seed
-    )
-    ours_path = os.path.join(args.out_dir, f"ours_mixed_layer{args.shallow_layer}.png")
-    img_ours.save(ours_path)
-    print(f"Saved ours to {ours_path}")
-    
-    print("\nDone! Please compare the two images to see if attribute leakage/counting is improved.")
+    print("\nDone! Please compare the images in the output directory to see if attribute leakage/counting is improved.")
 
 if __name__ == "__main__":
     main()
