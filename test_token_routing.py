@@ -35,10 +35,10 @@ def find_target_token_indices(tokens, target_words):
                 break
     return indices
 
-def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, shallow_layer_idx=4, max_sequence_length=512, alpha=0.3):
+def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode="blend", shallow_layer_idx=12, alpha=0.3, decay_rate=0.1, max_sequence_length=256):
     """
     Extract token embeddings, blending specific tokens (colors/quantities) 
-    with features from a shallow layer, while keeping the rest from the deep layer.
+    with features from a shallow layer, or using a weighted sum of all layers.
     """
     messages = [{"role": "user", "content": prompt}]
     formatted_prompt = tokenizer.apply_chat_template(
@@ -104,12 +104,33 @@ def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, shallow_lay
     # We create a new mixed embedding tensor
     mixed_embeds = deep_embeds.clone()
     
-    # Soft Blending: Combine deep and shallow features for specific tokens
-    # alpha controls how much shallow feature to inject (e.g., 0.3 means 30% shallow, 70% deep)
-    print(f"  [Debug] Applying Soft Blending with alpha={alpha}")
-    for idx in target_indices_in_full:
-        mixed_embeds[0, idx, :] = (1 - alpha) * deep_embeds[0, idx, :] + alpha * shallow_embeds[0, idx, :]
+    if fusion_mode == "blend":
+        # Soft Blending: Combine deep and one specific shallow layer
+        print(f"  [Debug] Applying Soft Blending (Layer {shallow_layer_idx}) with alpha={alpha}")
+        shallow_embeds = hidden_states_tuple[shallow_layer_idx].clone()
+        for idx in target_indices_in_full:
+            mixed_embeds[0, idx, :] = (1 - alpha) * deep_embeds[0, idx, :] + alpha * shallow_embeds[0, idx, :]
+            
+    elif fusion_mode == "decay":
+        # All-layer Weighted Sum: Exponential decay weights (shallow gets more, deep gets less)
+        # We use layers 1 to -2 (skipping layer 0 which is raw embeddings)
+        layers_to_fuse = hidden_states_tuple[1:-1]
+        num_layers = len(layers_to_fuse)
         
+        # Calculate weights: w_i = exp(-decay_rate * i)
+        # i=0 (layer 1) gets highest weight, i=30 (layer -2) gets lowest weight
+        weights = torch.exp(-decay_rate * torch.arange(num_layers, device=device, dtype=deep_embeds.dtype))
+        weights = weights / weights.sum() # Normalize so they sum to 1
+        
+        print(f"  [Debug] Applying All-Layer Decay (rate={decay_rate}).")
+        print(f"          Weight for Layer 1: {weights[0]:.4f}, Layer {num_layers}: {weights[-1]:.4f}")
+        
+        for idx in target_indices_in_full:
+            token_fused = torch.zeros_like(deep_embeds[0, idx, :])
+            for i, layer_embeds in enumerate(layers_to_fuse):
+                token_fused += weights[i] * layer_embeds[0, idx, :]
+            mixed_embeds[0, idx, :] = token_fused
+            
     return mixed_embeds, deep_embeds, text_input_ids, prompt_masks
 
 def custom_generate(
@@ -163,8 +184,10 @@ def custom_generate(
 def main():
     parser = argparse.ArgumentParser(description="Test Training-Free Token-wise Routing")
     parser.add_argument("--prompt", type=str, default="A red apple and a blue cup", help="Prompt to test")
-    parser.add_argument("--shallow_layer", type=int, default=4, help="Which shallow layer to use for attributes")
-    parser.add_argument("--alpha", type=float, default=0.7, help="Soft blending alpha (0.0=all deep, 1.0=all shallow)")
+    parser.add_argument("--mode", type=str, choices=["blend", "decay"], default="decay", help="Fusion mode: 'blend' (single shallow layer) or 'decay' (all layers weighted)")
+    parser.add_argument("--shallow_layer", type=int, default=4, help="Which shallow layer to use (for 'blend' mode)")
+    parser.add_argument("--alpha", type=float, default=0.7, help="Soft blending alpha (for 'blend' mode)")
+    parser.add_argument("--decay_rate", type=float, default=0.1, help="Exponential decay rate (for 'decay' mode). Higher = more weight on shallow layers.")
     parser.add_argument("--num_seeds", type=int, default=4, help="Number of different random seeds to test")
     parser.add_argument("--start_seed", type=int, default=42, help="Starting random seed")
     parser.add_argument("--out_dir", type=str, default="routing_test_results", help="Output directory")
@@ -188,8 +211,10 @@ def main():
         components["text_encoder"], 
         components["tokenizer"], 
         device,
+        fusion_mode=args.mode,
         shallow_layer_idx=args.shallow_layer,
-        alpha=args.alpha
+        alpha=args.alpha,
+        decay_rate=args.decay_rate
     )
     
     baseline_images = []
@@ -247,7 +272,14 @@ def main():
     title = f'Prompt: "{args.prompt}"'
     draw.text((pad, pad), title, fill=(30, 30, 30), font=font_large)
 
-    row_labels = ["Baseline (Deep Layer Only)", f"Ours (Layer {args.shallow_layer}, alpha {args.alpha})"]
+    if args.mode == "blend":
+        ours_label = f"Ours (Blend Layer {args.shallow_layer}, alpha {args.alpha})"
+        out_name = f"comparison_blend_layer{args.shallow_layer}_alpha{args.alpha}.png"
+    else:
+        ours_label = f"Ours (All-Layer Decay, rate {args.decay_rate})"
+        out_name = f"comparison_decay_rate{args.decay_rate}.png"
+        
+    row_labels = ["Baseline (Deep Layer Only)", ours_label]
     
     for block_idx in range(num_blocks):
         start_idx = block_idx * max_cols
@@ -275,7 +307,7 @@ def main():
                 seed_label = f"seed={args.start_seed + start_idx + col_idx}"
                 draw.text((x + 6, row_y_img + 6), seed_label, fill=(255, 255, 255), font=font_small)
 
-    grid_path = os.path.join(args.out_dir, f"comparison_layer{args.shallow_layer}_alpha{args.alpha}.png")
+    grid_path = os.path.join(args.out_dir, out_name)
     grid.save(grid_path)
     print(f"\nSaved comparison grid to: {grid_path}")
     print("Done!")
