@@ -231,8 +231,8 @@ def custom_generate(
             tokenizer=tokenizer,
             scheduler=scheduler,
             prompt=prompt,
-            num_inference_steps=30, # Faster testing
-            guidance_scale=4.0,
+            num_inference_steps=8, # Match Z-Image-Turbo defaults
+            guidance_scale=0.0,    # Match Z-Image-Turbo defaults
             generator=generator
         )
     finally:
