@@ -35,9 +35,9 @@ def find_target_token_indices(tokens, target_words):
                 break
     return indices
 
-def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, shallow_layer_idx=4, max_sequence_length=512):
+def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, shallow_layer_idx=4, max_sequence_length=512, alpha=0.3):
     """
-    Extract token embeddings, replacing specific tokens (colors/quantities) 
+    Extract token embeddings, blending specific tokens (colors/quantities) 
     with features from a shallow layer, while keeping the rest from the deep layer.
     """
     messages = [{"role": "user", "content": prompt}]
@@ -104,15 +104,11 @@ def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, shallow_lay
     # We create a new mixed embedding tensor
     mixed_embeds = deep_embeds.clone()
     
-    # Replace the specific token features with shallow ones
-    # Note: We NO LONGER apply RMSNorm here!
-    # Because Z-Image's DiT cap_embedder applies RMSNorm across the hidden dimension
-    # for each token independently. This means the absolute magnitude difference 
-    # between shallow and deep layers will be automatically normalized by the DiT!
-    
-    # Splice in the normed shallow features for specific tokens
+    # Soft Blending: Combine deep and shallow features for specific tokens
+    # alpha controls how much shallow feature to inject (e.g., 0.3 means 30% shallow, 70% deep)
+    print(f"  [Debug] Applying Soft Blending with alpha={alpha}")
     for idx in target_indices_in_full:
-        mixed_embeds[0, idx, :] = shallow_embeds[0, idx, :]
+        mixed_embeds[0, idx, :] = (1 - alpha) * deep_embeds[0, idx, :] + alpha * shallow_embeds[0, idx, :]
         
     return mixed_embeds, deep_embeds, text_input_ids, prompt_masks
 
@@ -167,7 +163,8 @@ def custom_generate(
 def main():
     parser = argparse.ArgumentParser(description="Test Training-Free Token-wise Routing")
     parser.add_argument("--prompt", type=str, default="A red apple and a blue cup", help="Prompt to test")
-    parser.add_argument("--shallow_layer", type=int, default=4, help="Which shallow layer to use for attributes")
+    parser.add_argument("--shallow_layer", type=int, default=12, help="Which shallow layer to use for attributes")
+    parser.add_argument("--alpha", type=float, default=0.3, help="Soft blending alpha (0.0=all deep, 1.0=all shallow)")
     parser.add_argument("--num_seeds", type=int, default=4, help="Number of different random seeds to test")
     parser.add_argument("--start_seed", type=int, default=42, help="Starting random seed")
     parser.add_argument("--out_dir", type=str, default="routing_test_results", help="Output directory")
@@ -191,7 +188,8 @@ def main():
         components["text_encoder"], 
         components["tokenizer"], 
         device,
-        shallow_layer_idx=args.shallow_layer
+        shallow_layer_idx=args.shallow_layer,
+        alpha=args.alpha
     )
     
     baseline_images = []
@@ -242,7 +240,7 @@ def main():
     title = f'Prompt: "{args.prompt}"'
     draw.text((pad, pad), title, fill=(30, 30, 30), font=font_large)
 
-    row_labels = ["Baseline (Deep Layer Only)", f"Ours (Layer {args.shallow_layer} for color/quantity tokens)"]
+    row_labels = ["Baseline (Deep Layer Only)", f"Ours (Layer {args.shallow_layer}, alpha {args.alpha})"]
     for row_idx, (images, label) in enumerate(zip([baseline_images, ours_images], row_labels)):
         row_y_label = label_h + pad + row_idx * (img_h + label_h + pad)
         row_y_img   = row_y_label + label_h
@@ -258,7 +256,7 @@ def main():
             seed_label = f"seed={args.start_seed + col_idx}"
             draw.text((x + 6, row_y_img + 6), seed_label, fill=(255, 255, 255), font=font_small)
 
-    grid_path = os.path.join(args.out_dir, f"comparison_layer{args.shallow_layer}.png")
+    grid_path = os.path.join(args.out_dir, f"comparison_layer{args.shallow_layer}_alpha{args.alpha}.png")
     grid.save(grid_path)
     print(f"\nSaved comparison grid to: {grid_path}")
     print("Done!")
