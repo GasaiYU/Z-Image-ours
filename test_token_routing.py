@@ -34,7 +34,7 @@ def find_target_token_indices(tokens, target_words):
                 break
     return indices
 
-def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, shallow_layer_idx=4, max_sequence_length=256):
+def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, shallow_layer_idx=4, max_sequence_length=512):
     """
     Extract token embeddings, replacing specific tokens (colors/quantities) 
     with features from a shallow layer, while keeping the rest from the deep layer.
