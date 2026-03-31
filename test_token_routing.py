@@ -35,7 +35,7 @@ def find_target_token_indices(tokens, target_words):
                 break
     return indices
 
-def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode="blend", shallow_layer_idx=12, alpha=0.3, decay_rate=0.1, scale_factor=2.0, max_sequence_length=256):
+def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode="blend", shallow_layer_idx=12, alpha=0.3, decay_rate=0.1, scale_factor=2.0, max_sequence_length=512):
     """
     Extract token embeddings, blending specific tokens (colors/quantities) 
     with features from a shallow layer, using a weighted sum of all layers,
