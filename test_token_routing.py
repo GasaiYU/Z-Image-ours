@@ -216,15 +216,22 @@ def main():
         ours_images.append(img_ours)
 
     # Build comparison grid:
-    # Row 0: label row
-    # Row 1: Baseline images (one per seed)
-    # Row 2: Ours images     (one per seed)
+    # If n > 4, we wrap it to multiple blocks to avoid an extremely wide image.
     n = len(baseline_images)
+    max_cols = 4
+    num_blocks = (n + max_cols - 1) // max_cols
+    
     img_w, img_h = baseline_images[0].size
     label_h = 60
     pad = 8
-    total_w = n * img_w + (n + 1) * pad
-    total_h = 2 * img_h + 3 * label_h + (2 + 1) * pad  # 2 rows of images + 3 label rows (top + per row)
+    
+    # Calculate grid dimensions
+    cols = min(n, max_cols)
+    total_w = cols * img_w + (cols + 1) * pad
+    
+    # Each block has: 1 top title (only for first block) + 2 row labels + 2 rows of images
+    block_h = 2 * img_h + 2 * label_h + 3 * pad
+    total_h = label_h + pad + num_blocks * block_h  # Add space for the main title at the very top
 
     grid = Image.new("RGB", (total_w, total_h), color=(240, 240, 240))
     draw = ImageDraw.Draw(grid)
@@ -241,20 +248,32 @@ def main():
     draw.text((pad, pad), title, fill=(30, 30, 30), font=font_large)
 
     row_labels = ["Baseline (Deep Layer Only)", f"Ours (Layer {args.shallow_layer}, alpha {args.alpha})"]
-    for row_idx, (images, label) in enumerate(zip([baseline_images, ours_images], row_labels)):
-        row_y_label = label_h + pad + row_idx * (img_h + label_h + pad)
-        row_y_img   = row_y_label + label_h
+    
+    for block_idx in range(num_blocks):
+        start_idx = block_idx * max_cols
+        end_idx = min(start_idx + max_cols, n)
+        block_n = end_idx - start_idx
+        
+        block_y_offset = label_h + pad + block_idx * block_h
+        
+        for row_idx, (all_images, label) in enumerate(zip([baseline_images, ours_images], row_labels)):
+            images = all_images[start_idx:end_idx]
+            
+            row_y_label = block_y_offset + row_idx * (img_h + label_h + pad)
+            row_y_img   = row_y_label + label_h
 
-        # Row label
-        draw.rectangle([pad, row_y_label, total_w - pad, row_y_label + label_h - 4], fill=(200, 220, 255) if row_idx == 0 else (200, 255, 210))
-        draw.text((pad * 2, row_y_label + 10), label, fill=(20, 20, 20), font=font_small)
+            # Row label
+            draw.rectangle([pad, row_y_label, total_w - pad, row_y_label + label_h - 4], fill=(200, 220, 255) if row_idx == 0 else (200, 255, 210))
+            # Add block info to label if multiple blocks
+            display_label = label if num_blocks == 1 else f"{label} (Seeds {args.start_seed + start_idx} to {args.start_seed + end_idx - 1})"
+            draw.text((pad * 2, row_y_label + 10), display_label, fill=(20, 20, 20), font=font_small)
 
-        for col_idx, img in enumerate(images):
-            x = pad + col_idx * (img_w + pad)
-            grid.paste(img, (x, row_y_img))
-            # Seed label on each image
-            seed_label = f"seed={args.start_seed + col_idx}"
-            draw.text((x + 6, row_y_img + 6), seed_label, fill=(255, 255, 255), font=font_small)
+            for col_idx, img in enumerate(images):
+                x = pad + col_idx * (img_w + pad)
+                grid.paste(img, (x, row_y_img))
+                # Seed label on each image
+                seed_label = f"seed={args.start_seed + start_idx + col_idx}"
+                draw.text((x + 6, row_y_img + 6), seed_label, fill=(255, 255, 255), font=font_small)
 
     grid_path = os.path.join(args.out_dir, f"comparison_layer{args.shallow_layer}_alpha{args.alpha}.png")
     grid.save(grid_path)
