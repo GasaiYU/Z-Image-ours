@@ -35,10 +35,11 @@ def find_target_token_indices(tokens, target_words):
                 break
     return indices
 
-def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode="blend", shallow_layer_idx=12, alpha=0.3, decay_rate=0.1, max_sequence_length=512):
+def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode="blend", shallow_layer_idx=12, alpha=0.3, decay_rate=0.1, scale_factor=2.0, max_sequence_length=256):
     """
     Extract token embeddings, blending specific tokens (colors/quantities) 
-    with features from a shallow layer, or using a weighted sum of all layers.
+    with features from a shallow layer, using a weighted sum of all layers,
+    or scaling up the deep features.
     """
     messages = [{"role": "user", "content": prompt}]
     formatted_prompt = tokenizer.apply_chat_template(
@@ -129,7 +130,11 @@ def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode
             token_fused = torch.zeros_like(deep_embeds[0, idx, :])
             for i, layer_embeds in enumerate(layers_to_fuse):
                 token_fused += weights[i] * layer_embeds[0, idx, :]
-            mixed_embeds[0, idx, :] = token_fused
+    elif fusion_mode == "scale":
+        # Scale Up Deep Features: Just multiply the target tokens' deep features by a scalar
+        print(f"  [Debug] Applying Feature Scaling (factor={scale_factor}) to target tokens.")
+        for idx in target_indices_in_full:
+            mixed_embeds[0, idx, :] = deep_embeds[0, idx, :] * scale_factor
             
     return mixed_embeds, deep_embeds, text_input_ids, prompt_masks
 
@@ -184,10 +189,11 @@ def custom_generate(
 def main():
     parser = argparse.ArgumentParser(description="Test Training-Free Token-wise Routing")
     parser.add_argument("--prompt", type=str, default="A red apple and a blue cup", help="Prompt to test")
-    parser.add_argument("--mode", type=str, choices=["blend", "decay"], default="decay", help="Fusion mode: 'blend' (single shallow layer) or 'decay' (all layers weighted)")
+    parser.add_argument("--mode", type=str, choices=["blend", "decay", "scale"], default="decay", help="Fusion mode: 'blend', 'decay', or 'scale'")
     parser.add_argument("--shallow_layer", type=int, default=4, help="Which shallow layer to use (for 'blend' mode)")
     parser.add_argument("--alpha", type=float, default=0.7, help="Soft blending alpha (for 'blend' mode)")
-    parser.add_argument("--decay_rate", type=float, default=0.1, help="Exponential decay rate (for 'decay' mode). Higher = more weight on shallow layers.")
+    parser.add_argument("--decay_rate", type=float, default=0.1, help="Exponential decay rate (for 'decay' mode)")
+    parser.add_argument("--scale_factor", type=float, default=2.0, help="Multiplier for target tokens (for 'scale' mode)")
     parser.add_argument("--num_seeds", type=int, default=4, help="Number of different random seeds to test")
     parser.add_argument("--start_seed", type=int, default=42, help="Starting random seed")
     parser.add_argument("--out_dir", type=str, default="routing_test_results", help="Output directory")
@@ -214,7 +220,8 @@ def main():
         fusion_mode=args.mode,
         shallow_layer_idx=args.shallow_layer,
         alpha=args.alpha,
-        decay_rate=args.decay_rate
+        decay_rate=args.decay_rate,
+        scale_factor=args.scale_factor
     )
     
     baseline_images = []
@@ -275,9 +282,12 @@ def main():
     if args.mode == "blend":
         ours_label = f"Ours (Blend Layer {args.shallow_layer}, alpha {args.alpha})"
         out_name = f"comparison_blend_layer{args.shallow_layer}_alpha{args.alpha}.png"
-    else:
+    elif args.mode == "decay":
         ours_label = f"Ours (All-Layer Decay, rate {args.decay_rate})"
         out_name = f"comparison_decay_rate{args.decay_rate}.png"
+    else:
+        ours_label = f"Ours (Scale Deep Features, factor {args.scale_factor})"
+        out_name = f"comparison_scale_factor{args.scale_factor}.png"
         
     row_labels = ["Baseline (Deep Layer Only)", ours_label]
     
