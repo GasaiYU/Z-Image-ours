@@ -104,135 +104,57 @@ def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, shallow_lay
     mixed_embeds = deep_embeds.clone()
     
     # Replace the specific token features with shallow ones
-    # IMPORTANT: We apply RMSNorm to both to ensure scale matching before splicing
-    hidden_size = deep_embeds.shape[-1]
-    
-    class SimpleRMSNorm(torch.nn.Module):
-        def __init__(self, dim: int, eps: float = 1e-5):
-            super().__init__()
-            self.eps = eps
-            self.weight = torch.nn.Parameter(torch.ones(dim))
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-            return output * self.weight
-            
-    norm_layer = SimpleRMSNorm(hidden_size).to(device, dtype=deep_embeds.dtype)
-    
-    # Normalize both before splicing to ensure they are in the same numerical scale
-    normed_deep = norm_layer(deep_embeds)
-    normed_shallow = norm_layer(shallow_embeds)
-    
-    # Start with normed deep features
-    final_mixed_embeds = normed_deep.clone()
+    # Note: We NO LONGER apply RMSNorm here!
+    # Because Z-Image's DiT cap_embedder applies RMSNorm across the hidden dimension
+    # for each token independently. This means the absolute magnitude difference 
+    # between shallow and deep layers will be automatically normalized by the DiT!
     
     # Splice in the normed shallow features for specific tokens
     for idx in target_indices_in_full:
-        final_mixed_embeds[0, idx, :] = normed_shallow[0, idx, :]
+        mixed_embeds[0, idx, :] = shallow_embeds[0, idx, :]
         
-    # We also need to return the baseline (just normed deep) for comparison
-    return final_mixed_embeds, normed_deep, text_input_ids, prompt_masks
+    return mixed_embeds, deep_embeds, text_input_ids, prompt_masks
 
 def custom_generate(
     transformer, vae, text_encoder, tokenizer, scheduler, 
-    prompt, mixed_embeds, text_input_ids, prompt_masks,
-    device, seed=42
+    prompt, mixed_embeds, device, seed=42
 ):
     """
     A modified version of the pipeline generate function that accepts pre-computed embeds.
     """
+    # Match zimage_generate.py seed logic exactly
+    from pytorch_lightning import seed_everything
+    seed_everything(seed)
     generator = torch.Generator(device=device).manual_seed(seed)
     
-    # Extract valid embeds based on mask
-    prompt_embeds_list = [mixed_embeds[0][prompt_masks[0]]]
-    
-    # Handle negative prompt (empty string)
-    neg_messages = [{"role": "user", "content": ""}]
-    neg_formatted = tokenizer.apply_chat_template(
-        neg_messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
-    )
-    neg_inputs = tokenizer(
-        [neg_formatted], padding="max_length", max_length=256, truncation=True, return_tensors="pt"
-    )
-    neg_input_ids = neg_inputs.input_ids.to(device)
-    neg_masks = neg_inputs.attention_mask.to(device).bool()
-    
-    with torch.no_grad():
-        neg_embeds = text_encoder(
-            input_ids=neg_input_ids,
-            attention_mask=neg_masks,
-            output_hidden_states=True,
-        ).hidden_states[-2]
-        
-        # Apply the same norm to negative embeds
-        hidden_size = neg_embeds.shape[-1]
-        class SimpleRMSNorm(torch.nn.Module):
-            def __init__(self, dim: int, eps: float = 1e-5):
-                super().__init__()
-                self.eps = eps
-                self.weight = torch.nn.Parameter(torch.ones(dim))
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-                return output * self.weight
-        norm_layer = SimpleRMSNorm(hidden_size).to(device, dtype=neg_embeds.dtype)
-        neg_embeds = norm_layer(neg_embeds)
-        
-    negative_prompt_embeds_list = [neg_embeds[0][neg_masks[0]]]
-
-    # Call the rest of the generation logic using a hack:
-    # We temporarily mock the text_encoder to return our pre-computed embeds
-    # This avoids rewriting the entire 200-line generate function
-    class MockTextEncoder:
-        def __call__(self, input_ids, attention_mask, **kwargs):
-            class Output:
-                pass
-            out = Output()
-            # If it's the positive prompt, return our mixed embeds
-            if input_ids.shape == text_input_ids.shape and torch.all(input_ids == text_input_ids):
-                out.hidden_states = [None] * 32
-                out.hidden_states[-2] = mixed_embeds
-            else:
-                out.hidden_states = [None] * 32
-                out.hidden_states[-2] = neg_embeds
-            return out
-
-    # We need to bypass the internal norm in generate if we already normed it
-    # But since we can't easily modify the internal generate without copying it,
-    # we'll just pass our embeds to the original generate function
-    
-    # Actually, it's safer to just copy the core latent loop here to ensure it works
-    # with our custom embeds.
-    
-    # For simplicity in this test script, we will just use the standard generate
-    # but we monkey-patch the text encoder temporarily
     original_forward = text_encoder.forward
     
     def patched_forward(input_ids, attention_mask, **kwargs):
         class Output:
             pass
         out = Output()
-        if input_ids.shape == text_input_ids.shape and torch.all(input_ids == text_input_ids):
-            out.hidden_states = [None] * 32
-            out.hidden_states[-2] = mixed_embeds
-        else:
-            # For negative prompt, we just run the original
-            real_out = original_forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-            out.hidden_states = [None] * 32
-            # Apply norm to negative too so scales match
-            out.hidden_states[-2] = norm_layer(real_out.hidden_states[-2])
+        # Unconditionally return our mixed embeds to guarantee it works
+        # (Since guidance_scale=0.0, this is only called once for the positive prompt)
+        print("  [Debug] Monkey patch hit! Injecting custom embeddings.")
+        out.hidden_states = [None] * 32
+        out.hidden_states[-2] = mixed_embeds
         return out
         
     text_encoder.forward = patched_forward
     
     try:
+        # Match zimage_generate.py arguments exactly
         image = generate(
             transformer=transformer,
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             scheduler=scheduler,
-            prompt=prompt,
-            num_inference_steps=8, # Match Z-Image-Turbo defaults
-            guidance_scale=0.0,    # Match Z-Image-Turbo defaults
+            prompt=[prompt], # Pass as list to match batched format
+            height=1024,     # Explicitly set to 1024
+            width=1024,      # Explicitly set to 1024
+            num_inference_steps=8, 
+            guidance_scale=0.0,    
             generator=generator
         )
     finally:
@@ -263,7 +185,7 @@ def main():
     components = load_from_local_dir(model_path, device=device, dtype=torch.bfloat16)
     
     print(f"\nPreparing embeddings for prompt: '{args.prompt}'")
-    mixed_embeds, baseline_embeds, input_ids, masks = get_mixed_prompt_embeds(
+    mixed_embeds, baseline_embeds, _, _ = get_mixed_prompt_embeds(
         args.prompt, 
         components["text_encoder"], 
         components["tokenizer"], 
@@ -279,7 +201,7 @@ def main():
         img_baseline = custom_generate(
             components["transformer"], components["vae"], components["text_encoder"],
             components["tokenizer"], components["scheduler"],
-            args.prompt, baseline_embeds, input_ids, masks, device, seed=current_seed
+            args.prompt, baseline_embeds, device, seed=current_seed
         )
         base_path = os.path.join(args.out_dir, f"baseline_deep_only_seed{current_seed}.png")
         img_baseline.save(base_path)
@@ -289,7 +211,7 @@ def main():
         img_ours = custom_generate(
             components["transformer"], components["vae"], components["text_encoder"],
             components["tokenizer"], components["scheduler"],
-            args.prompt, mixed_embeds, input_ids, masks, device, seed=current_seed
+            args.prompt, mixed_embeds, device, seed=current_seed
         )
         ours_path = os.path.join(args.out_dir, f"ours_mixed_layer{args.shallow_layer}_seed{current_seed}.png")
         img_ours.save(ours_path)
