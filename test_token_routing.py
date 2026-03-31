@@ -164,7 +164,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test Training-Free Token-wise Routing")
     parser.add_argument("--prompt", type=str, default="A red apple and a blue cup", help="Prompt to test")
     parser.add_argument("--shallow_layer", type=int, default=4, help="Which shallow layer to use for attributes")
-    parser.add_argument("--alpha", type=float, default=0.3, help="Soft blending alpha (0.0=all deep, 1.0=all shallow)")
+    parser.add_argument("--alpha", type=float, default=0.7, help="Soft blending alpha (0.0=all deep, 1.0=all shallow)")
     parser.add_argument("--num_seeds", type=int, default=4, help="Number of different random seeds to test")
     parser.add_argument("--start_seed", type=int, default=42, help="Starting random seed")
     parser.add_argument("--out_dir", type=str, default="routing_test_results", help="Output directory")
