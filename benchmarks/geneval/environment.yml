@@ -156,7 +156,6 @@ dependencies:
     - multilingual-clip==1.0.10
     - networkx==3.1
     - nltk==3.8.1
-    - nvidia-cublas-cu117
     - nvidia-cuda-runtime-cu11
     - nvidia-cuda-runtime-cu117
     - nvidia-cudnn-cu11
