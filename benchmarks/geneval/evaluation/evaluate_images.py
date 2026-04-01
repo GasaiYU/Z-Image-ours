@@ -17,6 +17,7 @@ import pandas as pd
 from PIL import Image, ImageOps
 import torch
 import mmdet
+from mmcv import Config
 from mmdet.apis import inference_detector, init_detector
 
 import open_clip
@@ -61,7 +62,12 @@ def load_models(args):
     CONFIG_PATH = args.model_config
     OBJECT_DETECTOR = args.options.get('model', "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco")
     CKPT_PATH = os.path.join(args.model_path, f"{OBJECT_DETECTOR}.pth")
-    object_detector = init_detector(CONFIG_PATH, CKPT_PATH, device=DEVICE)
+    cfg = Config.fromfile(CONFIG_PATH)
+    # Disable mixed precision for detector inference to avoid illegal memory access
+    # on some CUDA/MMCV combinations when using ms_deformable_attn kernels.
+    if cfg.get("fp16", None) is not None:
+        cfg.fp16 = None
+    object_detector = init_detector(cfg, CKPT_PATH, device=DEVICE)
 
     clip_arch = args.options.get('clip_model', "ViT-L-14")
     clip_model, _, transform = open_clip.create_model_and_transforms(clip_arch, pretrained="openai", device=DEVICE)
