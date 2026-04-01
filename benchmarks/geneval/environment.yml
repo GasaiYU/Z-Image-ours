@@ -1,7 +1,6 @@
 name: geneval
 channels:
   - pytorch
-  - nvidia/label/cuda-11.3.0
   - conda-forge
   - defaults
 dependencies:
@@ -16,8 +15,6 @@ dependencies:
   - charset-normalizer=2.0.4=pyhd3eb1b0_0
   - colorama=0.4.6=pyhd8ed1ab_0
   - cryptography=39.0.1=py39h9ce1e76_0
-  - cuda-nvcc=11.3.58=h2467b9f_0
-  - cudatoolkit=11.3.1=h2bc3f7f_2
   - diffusers=0.24.0=pyhd8ed1ab_0
   - ffmpeg=4.3=hf484d3e_0
   - freetype=2.12.1=h4a9f257_0
