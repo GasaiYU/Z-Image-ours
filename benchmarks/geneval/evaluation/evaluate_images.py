@@ -36,11 +36,18 @@ def parse_args():
     parser.add_argument("--options", nargs="*", type=str, default=[])
     args = parser.parse_args()
     args.options = dict(opt.split("=", 1) for opt in args.options)
+    detector_name = args.options.get("model", "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco")
     if args.model_config is None:
-        args.model_config = os.path.join(
-            os.path.dirname(mmdet.__file__),
-            "../configs/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py"
-        )
+        if detector_name == "faster_rcnn_r50_fpn_1x_coco":
+            args.model_config = os.path.join(
+                os.path.dirname(mmdet.__file__),
+                "../configs/faster_rcnn/faster_rcnn_r50_fpn_1x_coco.py"
+            )
+        else:
+            args.model_config = os.path.join(
+                os.path.dirname(mmdet.__file__),
+                "../configs/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py"
+            )
     return args
 
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,6 +73,11 @@ def load_models(args):
     DETECTOR_DEVICE = args.options.get("detector_device", DEFAULT_DEVICE)
     CLIP_DEVICE = args.options.get("clip_device", DEFAULT_DEVICE)
     CKPT_PATH = os.path.join(args.model_path, f"{OBJECT_DETECTOR}.pth")
+    if not os.path.exists(CKPT_PATH):
+        raise FileNotFoundError(
+            f"Detector checkpoint not found: {CKPT_PATH}\n"
+            f"Please download {OBJECT_DETECTOR}.pth into --model-path."
+        )
     cfg = Config.fromfile(CONFIG_PATH)
     # Disable mixed precision for detector inference to avoid illegal memory access
     # on some CUDA/MMCV combinations when using ms_deformable_attn kernels.
