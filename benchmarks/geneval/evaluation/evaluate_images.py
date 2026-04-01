@@ -43,8 +43,9 @@ def parse_args():
         )
     return args
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-assert DEVICE == "cuda"
+DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DETECTOR_DEVICE = DEFAULT_DEVICE
+CLIP_DEVICE = DEFAULT_DEVICE
 
 def timed(fn):
     def wrapper(*args, **kwargs):
@@ -59,19 +60,23 @@ def timed(fn):
 
 @timed
 def load_models(args):
+    global DETECTOR_DEVICE, CLIP_DEVICE
     CONFIG_PATH = args.model_config
     OBJECT_DETECTOR = args.options.get('model', "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco")
+    DETECTOR_DEVICE = args.options.get("detector_device", DEFAULT_DEVICE)
+    CLIP_DEVICE = args.options.get("clip_device", DEFAULT_DEVICE)
     CKPT_PATH = os.path.join(args.model_path, f"{OBJECT_DETECTOR}.pth")
     cfg = Config.fromfile(CONFIG_PATH)
     # Disable mixed precision for detector inference to avoid illegal memory access
     # on some CUDA/MMCV combinations when using ms_deformable_attn kernels.
     if cfg.get("fp16", None) is not None:
         cfg.fp16 = None
-    object_detector = init_detector(cfg, CKPT_PATH, device=DEVICE)
+    object_detector = init_detector(cfg, CKPT_PATH, device=DETECTOR_DEVICE)
 
     clip_arch = args.options.get('clip_model', "ViT-L-14")
-    clip_model, _, transform = open_clip.create_model_and_transforms(clip_arch, pretrained="openai", device=DEVICE)
+    clip_model, _, transform = open_clip.create_model_and_transforms(clip_arch, pretrained="openai", device=CLIP_DEVICE)
     tokenizer = open_clip.get_tokenizer(clip_arch)
+    print(f"[Geneval Eval] detector_device={DETECTOR_DEVICE}, clip_device={CLIP_DEVICE}")
 
     with open(os.path.join(os.path.dirname(__file__), "object_names.txt")) as cls_file:
         classnames = [line.strip() for line in cls_file]
@@ -121,7 +126,7 @@ def color_classification(image, bboxes, classname):
                 f"a photo of a {{c}}-colored {classname}",
                 f"a photo of a {{c}} object"
             ],
-            DEVICE
+            CLIP_DEVICE
         )
     clf = COLOR_CLASSIFIERS[classname]
     dataloader = torch.utils.data.DataLoader(
@@ -129,7 +134,7 @@ def color_classification(image, bboxes, classname):
         batch_size=16, num_workers=4
     )
     with torch.no_grad():
-        pred, _ = zsc.run_classification(clip_model, clf, dataloader, DEVICE)
+        pred, _ = zsc.run_classification(clip_model, clf, dataloader, CLIP_DEVICE)
         return [COLORS[index.item()] for index in pred.argmax(1)]
 
 
