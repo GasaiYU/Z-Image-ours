@@ -4,8 +4,8 @@
 IMAGEDIR="outputs/outputs_geneval_sub"
 OUTFILE="evaluation_results.jsonl"
 MODEL_PATH="/mmu-vcg/gaomingju/workspace/T2I/Z-Image-ours/benchmarks/geneval/pretrained"
-# Use Faster R-CNN to avoid ms_deformable_attn CUDA kernel crash on some A100/A800 environments
-DETECTOR_MODEL="faster_rcnn_r50_fpn_1x_coco"
+# Use Mask2Former on GPU
+DETECTOR_MODEL="mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco"
 
 # Run evaluation
 python benchmarks/geneval/evaluation/evaluate_images.py \
