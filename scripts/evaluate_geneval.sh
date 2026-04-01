@@ -3,7 +3,7 @@
 # Define directories
 IMAGEDIR="outputs"
 OUTFILE="evaluation_results.jsonl"
-MODEL_PATH="/mmu-vcg/gaomingju/workspace/T2I/Z-Image-ours/benchmarks/geneval/pretrained/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth"
+MODEL_PATH="/mmu-vcg/gaomingju/workspace/T2I/Z-Image-ours/benchmarks/geneval/pretrained"
 
 # Run evaluation
 python benchmarks/geneval/evaluation/evaluate_images.py \
