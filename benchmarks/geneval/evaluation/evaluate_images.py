@@ -283,14 +283,15 @@ def evaluate_image(filepath, metadata):
 
 def main(args):
     full_results = []
-    for subfolder in os.listdir(args.imagedir):
+    from tqdm import tqdm
+    for subfolder in tqdm(os.listdir(args.imagedir)):
         folderpath = os.path.join(args.imagedir, subfolder)
         if not os.path.isdir(folderpath) or not subfolder.isdigit():
             continue
         with open(os.path.join(folderpath, "metadata.jsonl")) as fp:
             metadata = json.load(fp)
         # Evaluate each image
-        for imagename in os.listdir(os.path.join(folderpath, "samples")):
+        for imagename in tqdm(os.listdir(os.path.join(folderpath, "samples"))):
             imagepath = os.path.join(folderpath, "samples", imagename)
             if not os.path.isfile(imagepath) or not re.match(r"\d+\.png", imagename):
                 continue
