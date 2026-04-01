@@ -1,5 +1,5 @@
 #!/bin/bash
-
+export CUDA_LAUNCH_BLOCKING=1
 # Define directories
 IMAGEDIR="outputs/outputs_geneval_sub"
 OUTFILE="evaluation_results.jsonl"
