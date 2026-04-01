@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define directories
-IMAGEDIR="outputs"
+IMAGEDIR="outputs/outputs_geneval_sub"
 OUTFILE="evaluation_results.jsonl"
 MODEL_PATH="/mmu-vcg/gaomingju/workspace/T2I/Z-Image-ours/benchmarks/geneval/pretrained"
 
