@@ -156,16 +156,15 @@ dependencies:
     - multilingual-clip==1.0.10
     - networkx==3.1
     - nltk==3.8.1
-    - nvidia-cublas-cu11==2022.4.8
-    - nvidia-cublas-cu117==11.10.1.25
-    - nvidia-cuda-runtime-cu11==2022.4.25
-    - nvidia-cuda-runtime-cu117==11.7.60
-    - nvidia-cudnn-cu11==2022.5.19
-    - nvidia-cudnn-cu116==8.4.0.27
-    - nvidia-cusolver-cu11==2022.4.8
-    - nvidia-cusolver-cu117==11.3.5.50
-    - nvidia-cusparse-cu11==2022.4.8
-    - nvidia-cusparse-cu117==11.7.3.50
+    - nvidia-cublas-cu117
+    - nvidia-cuda-runtime-cu11
+    - nvidia-cuda-runtime-cu117
+    - nvidia-cudnn-cu11
+    - nvidia-cudnn-cu116
+    - nvidia-cusolver-cu11
+    - nvidia-cusolver-cu117
+    - nvidia-cusparse-cu11
+    - nvidia-cusparse-cu117
     - nvidia-pyindex==1.0.9
     - oauthlib==3.2.2
     - omegaconf==2.1.1
