@@ -81,8 +81,8 @@ def load_models(args):
     cfg = Config.fromfile(CONFIG_PATH)
     # Disable mixed precision for detector inference to avoid illegal memory access
     # on some CUDA/MMCV combinations when using ms_deformable_attn kernels.
-    if cfg.get("fp16", None) is not None:
-        cfg.fp16 = None
+    # if cfg.get("fp16", None) is not None:
+    #     cfg.fp16 = None
     object_detector = init_detector(cfg, CKPT_PATH, device=DETECTOR_DEVICE)
 
     clip_arch = args.options.get('clip_model', "ViT-L-14")
