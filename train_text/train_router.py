@@ -29,10 +29,11 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from transformers import AutoModel, AutoTokenizer
 from tqdm import tqdm
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
+# Use the same loading path as test_token_routing.py
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+from utils import ensure_model_weights, load_from_local_dir
 
 
 # =============================================================================
@@ -136,11 +137,14 @@ class TripletDataset(Dataset):
         print(f"[Dataset] Loaded {len(self.data)} triplets from {len(triplet_files)} files.")
 
     def _format(self, text: str) -> str:
-        """Optionally apply chat template (for inference-consistent features)."""
+        """Apply chat template consistent with test_token_routing.py inference."""
         if self.use_chat_template:
             messages = [{"role": "user", "content": text}]
             return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,   # matches test_token_routing.py exactly
             )
         return text
 
@@ -324,24 +328,28 @@ def extract_token_features(fused_embeds: torch.Tensor, token_indices: list) -> t
 def train(args):
     device = torch.device(args.device)
 
-    # ---- Load tokenizer ----
-    print("[Init] Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(Path(args.model_dir) / "tokenizer"),
-        trust_remote_code=True,
-    )
-
-    # ---- Load frozen text encoder ----
-    print("[Init] Loading frozen text encoder...")
-    text_encoder = AutoModel.from_pretrained(
-        str(Path(args.model_dir) / "text_encoder"),
+    # ---- Load text_encoder + tokenizer (same as test_token_routing.py) ----
+    # load_from_local_dir also loads transformer/vae/scheduler which we don't need,
+    # but it correctly handles tokenizer path fallback (tokenizer/ or text_encoder/).
+    print("[Init] Loading text encoder and tokenizer via load_from_local_dir...")
+    components = load_from_local_dir(
+        args.model_dir,
+        device=str(device),
         dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).to(device).eval()
+        verbose=True,
+    )
+    text_encoder = components["text_encoder"]
+    tokenizer    = components["tokenizer"]
+
+    # Free the components we don't need to save GPU memory
+    del components["transformer"], components["vae"], components["scheduler"]
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
 
     # Freeze all LLM parameters
     for p in text_encoder.parameters():
         p.requires_grad_(False)
+    text_encoder.eval()
 
     # Probe hidden_size and num_layers with a dummy forward pass
     with torch.no_grad():
@@ -532,8 +540,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train DynamicTokenRouter with Triplet Contrastive Loss")
 
     # Paths
-    parser.add_argument('--model_dir',   type=str, required=True,
-                        help='Path to Z-Image model directory (must contain text_encoder/ and tokenizer/)')
+    parser.add_argument('--model_dir',   type=str, default='ckpts/Z-Image-Turbo',
+                        help='Path to Z-Image model directory, same as used in test_token_routing.py '
+                             '(e.g. ckpts/Z-Image-Turbo). Loaded via load_from_local_dir.')
     parser.add_argument('--triplet_dir', type=str, default='data/train_triplets',
                         help='Directory containing *_triplets.jsonl files')
     parser.add_argument('--output_dir',  type=str, default='checkpoints/router',
