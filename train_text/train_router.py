@@ -85,11 +85,15 @@ class DynamicTokenRouter(nn.Module):
         stacked = torch.stack(layers, dim=2)                         # [B, S, L, D]
 
         # Use deep features as the routing decision signal (detach: no gradient into LLM)
-        decision_feat = all_hidden_states[-2].detach()               # [B, S, D]
+        # Cast to float32 for the MLP (LLM may output bf16, MLP is always fp32)
+        decision_feat = all_hidden_states[-2].detach().float()       # [B, S, D]
 
         # Compute per-token routing logits → weights
         routing_logits   = self.router_mlp(decision_feat)            # [B, S, L]
         routing_weights  = F.softmax(routing_logits, dim=-1)         # [B, S, L]
+
+        # Cast back to input dtype before weighted sum (keep fused_embeds same dtype as LLM)
+        routing_weights = routing_weights.to(stacked.dtype)
 
         # Weighted sum: fused_embeds[b, s, d] = sum_l w[b,s,l] * stacked[b,s,l,d]
         fused_embeds = (stacked * routing_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
