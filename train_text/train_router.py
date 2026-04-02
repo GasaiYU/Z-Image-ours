@@ -27,15 +27,68 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 # Use the same loading path as test_token_routing.py
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 from utils import ensure_model_weights, load_from_local_dir
 import random
+
+
+# =============================================================================
+# 0. Distributed helpers
+# =============================================================================
+def init_distributed():
+    """Initialize DDP if launched via torchrun, otherwise return single-GPU defaults."""
+    if 'RANK' not in os.environ:
+        return 0, 1, 0   # rank, world_size, local_rank
+    dist.init_process_group(backend='nccl')
+    rank       = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
+
+
+def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    All-gather a tensor across all GPUs while keeping gradients on the local slice.
+
+    Standard DDP contrastive trick (used in CLIP, MoCo v3, etc.):
+      - torch.distributed.all_gather() has no grad → we restore the local slice
+        with the original tensor that still has its computation graph attached.
+      - Result: gradients flow only through the local portion, but the similarity
+        matrix is built from the globally gathered features.
+    """
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return tensor
+    world_size = dist.get_world_size()
+    rank       = dist.get_rank()
+    gathered   = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor.contiguous())
+    gathered[rank] = tensor          # restore grad-carrying local slice
+    return torch.cat(gathered, dim=0)
+
+
+def all_gather_strings(str_list: list) -> list:
+    """All-gather a list of strings across GPUs (no grad needed)."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return str_list
+    world_size = dist.get_world_size()
+    gathered   = [None] * world_size
+    dist.all_gather_object(gathered, str_list)
+    return [s for sublist in gathered for s in sublist]
 
 
 # =============================================================================
@@ -228,11 +281,15 @@ class HalfTaskBatchSampler(Sampler):
 
     这样保证 counting batch 里 two/three/four 必然同框，互为有效负样本，
     同时不损失跨 task 的多样性。
+
+    DDP 用法：每个 rank 传入不同的 seed（如 base_seed + rank），
+    确保各 GPU 处理不同的 batch（之后 all_gather 汇总做 contrastive loss）。
     """
-    def __init__(self, dataset: TripletDataset, batch_size: int, shuffle: bool = True):
+    def __init__(self, dataset: TripletDataset, batch_size: int, shuffle: bool = True, seed: int = 42):
         self.batch_size = batch_size
         self.half = batch_size // 2
         self.shuffle = shuffle
+        self.seed = seed
 
         # 按 task 分组索引
         task_to_indices: dict[str, list[int]] = defaultdict(list)
@@ -252,22 +309,25 @@ class HalfTaskBatchSampler(Sampler):
         return self.n_batches
 
     def __iter__(self):
-        # 每个 epoch 开始时打乱各组
+        # 每个 epoch 用固定 seed 初始化 RNG，不同 rank 因 seed 不同而产生不同 batch
+        rng = random.Random(self.seed)
+        self.seed += 1   # 每次迭代递增，确保不同 epoch 也不同
+
         task_pools: dict[str, list[int]] = {}
         for task, indices in self.task_indices.items():
             pool = indices.copy()
             if self.shuffle:
-                random.shuffle(pool)
+                rng.shuffle(pool)
             task_pools[task] = pool
 
         other_pool = self.all_indices.copy()
         if self.shuffle:
-            random.shuffle(other_pool)
+            rng.shuffle(other_pool)
 
         # 轮换 task（每个 batch 换一个 task 作为"主角"）
         task_cycle = self.tasks.copy()
         if self.shuffle:
-            random.shuffle(task_cycle)
+            rng.shuffle(task_cycle)
 
         other_cursor = 0
         for batch_idx in range(self.n_batches):
@@ -280,7 +340,7 @@ class HalfTaskBatchSampler(Sampler):
                 if len(focal_pool) == 0:
                     focal_pool = self.task_indices[focal_task].copy()
                     if self.shuffle:
-                        random.shuffle(focal_pool)
+                        rng.shuffle(focal_pool)
                     task_pools[focal_task] = focal_pool
                 focal_samples.append(focal_pool.pop())
 
@@ -290,14 +350,14 @@ class HalfTaskBatchSampler(Sampler):
                 if other_cursor >= len(other_pool):
                     other_pool = self.all_indices.copy()
                     if self.shuffle:
-                        random.shuffle(other_pool)
+                        rng.shuffle(other_pool)
                     other_cursor = 0
                 other_samples.append(other_pool[other_cursor])
                 other_cursor += 1
 
             batch = focal_samples + other_samples
             if self.shuffle:
-                random.shuffle(batch)
+                rng.shuffle(batch)
             yield batch
 
 
@@ -462,17 +522,31 @@ def extract_token_features(fused_embeds: torch.Tensor, token_indices: list) -> t
 # 5. Training Loop
 # =============================================================================
 def train(args):
-    device = torch.device(args.device)
+    # ---- Distributed init ----
+    rank, world_size, local_rank = init_distributed()
+    is_main = (rank == 0)
+    device = torch.device(f'cuda:{local_rank}')
+
+    # ---- WandB (rank 0 only) ----
+    use_wandb = args.use_wandb and is_main and _WANDB_AVAILABLE
+    if args.use_wandb and not _WANDB_AVAILABLE:
+        print("[WandB] wandb not installed, skipping. Run: pip install wandb")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run or None,
+            config=vars(args),
+        )
+        print(f"[WandB] Run: {wandb.run.url}")
 
     # ---- Load text_encoder + tokenizer (same as test_token_routing.py) ----
-    # load_from_local_dir also loads transformer/vae/scheduler which we don't need,
-    # but it correctly handles tokenizer path fallback (tokenizer/ or text_encoder/).
-    print("[Init] Loading text encoder and tokenizer via load_from_local_dir...")
+    if is_main:
+        print("[Init] Loading text encoder and tokenizer via load_from_local_dir...")
     components = load_from_local_dir(
         args.model_dir,
         device=str(device),
         dtype=torch.bfloat16,
-        verbose=True,
+        verbose=is_main,
     )
     text_encoder = components["text_encoder"]
     tokenizer    = components["tokenizer"]
@@ -489,18 +563,23 @@ def train(args):
 
     # Probe hidden_size and num_layers with a dummy forward pass
     with torch.no_grad():
-        dummy_ids = torch.zeros(1, 4, dtype=torch.long, device=device)
-        dummy_mask = torch.ones(1, 4, dtype=torch.long, device=device)
-        dummy_out = text_encoder(input_ids=dummy_ids, attention_mask=dummy_mask, output_hidden_states=True)
+        dummy_ids  = torch.zeros(1, 4, dtype=torch.long, device=device)
+        dummy_mask = torch.ones(1,  4, dtype=torch.long, device=device)
+        dummy_out  = text_encoder(input_ids=dummy_ids, attention_mask=dummy_mask, output_hidden_states=True)
     hidden_size = dummy_out.hidden_states[0].shape[-1]
-    num_layers = len(dummy_out.hidden_states) - 1   # subtract embedding layer
-    print(f"[Init] LLM: hidden_size={hidden_size}, num_transformer_layers={num_layers}")
+    num_layers  = len(dummy_out.hidden_states) - 1   # subtract embedding layer
+    if is_main:
+        print(f"[Init] LLM: hidden_size={hidden_size}, num_transformer_layers={num_layers}")
     del dummy_out
 
     # ---- Build router ----
     router = DynamicTokenRouter(hidden_size=hidden_size, num_layers=num_layers, mid_dim=args.mid_dim).to(device)
+    if world_size > 1:
+        router = DDP(router, device_ids=[local_rank])
     n_params = sum(p.numel() for p in router.parameters())
-    print(f"[Init] Router params: {n_params:,}  (~{n_params/1e6:.2f}M)")
+    if is_main:
+        print(f"[Init] Router params: {n_params:,}  (~{n_params/1e6:.2f}M)")
+        print(f"[Init] world_size={world_size}")
 
     # ---- Dataset ----
     triplet_files = [
@@ -513,7 +592,11 @@ def train(args):
         max_length=args.max_length,
         use_chat_template=args.use_chat_template,
     )
-    batch_sampler = HalfTaskBatchSampler(dataset, batch_size=args.batch_size, shuffle=True)
+    # Each rank uses a different seed → different batches per GPU
+    # After forward, features are all-gathered across ranks for a larger effective batch
+    batch_sampler = HalfTaskBatchSampler(
+        dataset, batch_size=args.batch_size, shuffle=True, seed=args.seed + rank
+    )
     loader = DataLoader(
         dataset, batch_sampler=batch_sampler,
         num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
@@ -538,7 +621,7 @@ def train(args):
         n_batches = 0
         skipped = 0
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         for batch in pbar:
             # Move ids/masks to device
             a_ids  = batch['a_ids'].to(device)
@@ -557,8 +640,6 @@ def train(args):
             deep_a = hs_a[-2].detach()   # [B, S, D]
 
             # ---- Step 2: Route through DynamicTokenRouter ----
-            # For contrastive loss: we need to enable gradients here
-            # (router parameters receive gradient from this path)
             fused_a, rw_a = router(hs_a, attention_mask=a_mask)
             fused_p, _    = router(hs_p, attention_mask=p_mask)
             fused_n, _    = router(hs_n, attention_mask=n_mask)
@@ -571,7 +652,6 @@ def train(args):
             if args.loss_type == 'triplet':
                 valid = vm_a & vm_p & vm_n
             else:
-                # supcon only needs anchor + positive
                 valid = vm_a & vm_p
 
             if valid.sum() < 2:
@@ -588,17 +668,22 @@ def train(args):
             if args.loss_type == 'triplet':
                 loss_contrastive = triplet_margin_loss(ea, ep, en, margin=args.margin)
             else:
-                # SupCon: same target_word pairs become extra positives, not false negatives
-                loss_contrastive = supcon_loss(ea, ep, batch_target_words, temperature=args.temperature)
+                # SupCon with DDP all-gather:
+                #   - Each GPU has local ea/ep of shape [N_local, D]
+                #   - all_gather_with_grad() concatenates across all GPUs → [N_global, D]
+                #   - Gradients only flow through the local slice (standard contrastive DDP trick)
+                #   - Effective batch for similarity matrix = world_size × batch_size
+                ea_global    = all_gather_with_grad(ea)
+                ep_global    = all_gather_with_grad(ep)
+                words_global = all_gather_strings(batch_target_words)
+                loss_contrastive = supcon_loss(ea_global, ep_global, words_global,
+                                               temperature=args.temperature)
 
-            # ---- Step 4b: Noun Regularization Loss (optional) ----
-            # Mark all non-target positions as "noun-like" (conservative: just use valid token positions)
+            # ---- Step 4b: Noun Regularization Loss (local, no gather needed) ----
             loss_reg = fused_a.new_tensor(0.0)
             if args.lambda_reg > 0:
-                # Build noun_mask: valid tokens that are NOT the target token
                 B, S, D = fused_a.shape
-                noun_mask = a_mask.bool().clone()   # [B, S]
-                # Remove target token positions from noun_mask
+                noun_mask = a_mask.bool().clone()
                 for i, tidx in enumerate(batch['a_tidx']):
                     if 0 <= tidx < S:
                         noun_mask[i, tidx] = False
@@ -618,56 +703,78 @@ def train(args):
             n_batches += 1
             global_step += 1
 
-            pbar.set_postfix({
-                'L_contra': f'{loss_contrastive.item():.4f}',
-                'L_reg':    f'{loss_reg.item():.4f}' if args.lambda_reg > 0 else '—',
-                'lr':       f'{scheduler.get_last_lr()[0]:.2e}',
-                'skipped':  skipped,
-            })
+            if is_main:
+                pbar.set_postfix({
+                    'L_contra': f'{loss_contrastive.item():.4f}',
+                    'L_reg':    f'{loss_reg.item():.4f}' if args.lambda_reg > 0 else '—',
+                    'lr':       f'{scheduler.get_last_lr()[0]:.2e}',
+                    'skipped':  skipped,
+                })
+                if use_wandb:
+                    wandb.log({
+                        'train/loss_contrastive': loss_contrastive.item(),
+                        'train/loss_reg':         loss_reg.item() if args.lambda_reg > 0 else 0.0,
+                        'train/loss_total':        loss.item(),
+                        'train/lr':               scheduler.get_last_lr()[0],
+                        'train/skipped':          skipped,
+                    }, step=global_step)
 
-            # Save checkpoint every N steps
-            if global_step % args.save_every == 0:
+            # Save checkpoint every N steps (rank 0 only)
+            if is_main and global_step % args.save_every == 0:
                 ckpt_path = os.path.join(args.output_dir, f"router_step{global_step}.pt")
+                raw_state = router.module.state_dict() if world_size > 1 else router.state_dict()
                 torch.save({
                     'step': global_step,
-                    'router_state_dict': router.state_dict(),
+                    'router_state_dict': raw_state,
                     'hidden_size': hidden_size,
                     'num_layers': num_layers,
                     'mid_dim': args.mid_dim,
                 }, ckpt_path)
                 print(f"\n[Checkpoint] Saved -> {ckpt_path}")
 
-        # ---- End of epoch stats ----
-        avg_contra = epoch_loss_contrastive / max(n_batches, 1)
-        avg_reg    = epoch_loss_reg          / max(n_batches, 1)
-        print(f"\n[Epoch {epoch}] avg_contrastive={avg_contra:.4f}  avg_reg={avg_reg:.4f}  skipped={skipped}")
+        # ---- End of epoch stats (rank 0 only) ----
+        if is_main:
+            avg_contra = epoch_loss_contrastive / max(n_batches, 1)
+            avg_reg    = epoch_loss_reg          / max(n_batches, 1)
+            print(f"\n[Epoch {epoch}] avg_contrastive={avg_contra:.4f}  avg_reg={avg_reg:.4f}  skipped={skipped}")
+            if use_wandb:
+                wandb.log({
+                    'epoch/loss_contrastive': avg_contra,
+                    'epoch/loss_reg':         avg_reg,
+                    'epoch/epoch':            epoch,
+                }, step=global_step)
 
-        # Save best checkpoint
-        if avg_contra < best_loss:
-            best_loss = avg_contra
-            best_path = os.path.join(args.output_dir, "router_best.pt")
-            torch.save({
-                'epoch': epoch,
-                'step': global_step,
-                'router_state_dict': router.state_dict(),
-                'hidden_size': hidden_size,
-                'num_layers': num_layers,
-                'mid_dim': args.mid_dim,
-                'best_loss': best_loss,
-            }, best_path)
-            print(f"[Best] New best loss={best_loss:.4f} -> {best_path}")
+            # Save best checkpoint
+            if avg_contra < best_loss:
+                best_loss = avg_contra
+                best_path = os.path.join(args.output_dir, "router_best.pt")
+                raw_state = router.module.state_dict() if world_size > 1 else router.state_dict()
+                torch.save({
+                    'epoch': epoch,
+                    'step': global_step,
+                    'router_state_dict': raw_state,
+                    'hidden_size': hidden_size,
+                    'num_layers': num_layers,
+                    'mid_dim': args.mid_dim,
+                    'best_loss': best_loss,
+                }, best_path)
+                print(f"[Best] New best loss={best_loss:.4f} -> {best_path}")
 
-    # ---- Save final checkpoint ----
-    final_path = os.path.join(args.output_dir, "router_final.pt")
-    torch.save({
-        'epoch': args.epochs,
-        'step': global_step,
-        'router_state_dict': router.state_dict(),
-        'hidden_size': hidden_size,
-        'num_layers': num_layers,
-        'mid_dim': args.mid_dim,
-    }, final_path)
-    print(f"\n[Done] Final checkpoint saved -> {final_path}")
+    # ---- Save final checkpoint (rank 0 only) ----
+    if is_main:
+        final_path = os.path.join(args.output_dir, "router_final.pt")
+        raw_state  = router.module.state_dict() if world_size > 1 else router.state_dict()
+        torch.save({
+            'epoch': args.epochs,
+            'step': global_step,
+            'router_state_dict': raw_state,
+            'hidden_size': hidden_size,
+            'num_layers': num_layers,
+            'mid_dim': args.mid_dim,
+        }, final_path)
+        print(f"\n[Done] Final checkpoint saved -> {final_path}")
+        if use_wandb:
+            wandb.finish()
 
 
 # =============================================================================
@@ -717,17 +824,28 @@ def parse_args():
     parser.add_argument('--num_workers', type=int,   default=4)
     parser.add_argument('--save_every',  type=int,   default=500,
                         help='Save checkpoint every N global steps')
-    parser.add_argument('--device',      type=str,   default='cuda')
+    parser.add_argument('--seed',        type=int,   default=42,
+                        help='Base random seed; each DDP rank uses seed+rank for data diversity')
+
+    # WandB
+    parser.add_argument('--use_wandb',      action='store_true',
+                        help='Enable Weights & Biases logging (rank 0 only)')
+    parser.add_argument('--wandb_project',  type=str, default='z-image-router',
+                        help='WandB project name')
+    parser.add_argument('--wandb_run',      type=str, default='',
+                        help='WandB run name (auto-generated if empty)')
 
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
-    print("=" * 60)
-    print("  DynamicTokenRouter Contrastive Training")
-    print("=" * 60)
-    for k, v in vars(args).items():
-        print(f"  {k:<20} = {v}")
-    print("=" * 60)
+    # Only rank 0 prints the config header (DDP may not be init yet, check env)
+    if int(os.environ.get('RANK', 0)) == 0:
+        print("=" * 60)
+        print("  DynamicTokenRouter Contrastive Training")
+        print("=" * 60)
+        for k, v in vars(args).items():
+            print(f"  {k:<20} = {v}")
+        print("=" * 60)
     train(args)
