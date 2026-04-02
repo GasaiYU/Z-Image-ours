@@ -1,4 +1,4 @@
-python train_router.py \
+python train_text/train_router.py \
     --model_dir /mmu-vcg/gaomingju/workspace/T2I/Z-Image-ours/benchmarks/geneval/pretrained \
     --triplet_dir data/train_triplets \
     --output_dir checkpoints/router \
