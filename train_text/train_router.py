@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
@@ -34,6 +34,7 @@ from tqdm import tqdm
 # Use the same loading path as test_token_routing.py
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 from utils import ensure_model_weights, load_from_local_dir
+import random
 
 
 # =============================================================================
@@ -214,6 +215,87 @@ def collate_fn(batch):
     }
 
 
+class HalfTaskBatchSampler(Sampler):
+    """
+    每个 batch 中：
+      - 前 50%（half）来自随机选定的同一个 task（轮换采样）
+      - 后 50% 来自其他所有 task 的混合
+
+    这样保证 counting batch 里 two/three/four 必然同框，互为有效负样本，
+    同时不损失跨 task 的多样性。
+    """
+    def __init__(self, dataset: TripletDataset, batch_size: int, shuffle: bool = True):
+        self.batch_size = batch_size
+        self.half = batch_size // 2
+        self.shuffle = shuffle
+
+        # 按 task 分组索引
+        task_to_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, item in enumerate(dataset.data):
+            task_to_indices[item['task']].append(idx)
+
+        self.tasks = list(task_to_indices.keys())
+        self.task_indices = task_to_indices   # {"counting": [...], "color": [...], ...}
+
+        # 所有索引的扁平列表（用于采 other 50%）
+        self.all_indices = list(range(len(dataset)))
+
+        # 每个 epoch 需要多少个 batch（以数据集总量 / batch_size 为准）
+        self.n_batches = len(self.all_indices) // batch_size
+
+    def __len__(self):
+        return self.n_batches
+
+    def __iter__(self):
+        # 每个 epoch 开始时打乱各组
+        task_pools: dict[str, list[int]] = {}
+        for task, indices in self.task_indices.items():
+            pool = indices.copy()
+            if self.shuffle:
+                random.shuffle(pool)
+            task_pools[task] = pool
+
+        other_pool = self.all_indices.copy()
+        if self.shuffle:
+            random.shuffle(other_pool)
+
+        # 轮换 task（每个 batch 换一个 task 作为"主角"）
+        task_cycle = self.tasks.copy()
+        if self.shuffle:
+            random.shuffle(task_cycle)
+
+        other_cursor = 0
+        for batch_idx in range(self.n_batches):
+            focal_task = task_cycle[batch_idx % len(task_cycle)]
+            focal_pool = task_pools[focal_task]
+
+            # 从 focal_task 采 half 个（循环复用，数量不足时重新打乱）
+            focal_samples = []
+            while len(focal_samples) < self.half:
+                if len(focal_pool) == 0:
+                    focal_pool = self.task_indices[focal_task].copy()
+                    if self.shuffle:
+                        random.shuffle(focal_pool)
+                    task_pools[focal_task] = focal_pool
+                focal_samples.append(focal_pool.pop())
+
+            # 从其余数据采 half 个
+            other_samples = []
+            while len(other_samples) < self.half:
+                if other_cursor >= len(other_pool):
+                    other_pool = self.all_indices.copy()
+                    if self.shuffle:
+                        random.shuffle(other_pool)
+                    other_cursor = 0
+                other_samples.append(other_pool[other_cursor])
+                other_cursor += 1
+
+            batch = focal_samples + other_samples
+            if self.shuffle:
+                random.shuffle(batch)
+            yield batch
+
+
 # =============================================================================
 # 3. Loss Functions
 # =============================================================================
@@ -231,35 +313,84 @@ def triplet_margin_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, ma
     return loss.mean()
 
 
-def infoNCE_loss(ea: torch.Tensor, ep: torch.Tensor, temperature: float = 0.07):
+def supcon_loss(
+    ea: torch.Tensor,
+    ep: torch.Tensor,
+    target_words: list,
+    temperature: float = 0.07,
+):
     """
-    InfoNCE Loss with In-batch Negatives.
-    
-    For each anchor ea[i], its positive is ep[i].
-    All other ep[j] (j != i) are treated as negatives automatically.
-    This gives (N-1) negatives per anchor for free, making it far more
-    data-efficient than triplet loss with a single explicit negative.
+    Supervised Contrastive Loss (SupCon, NeurIPS 2020).
 
-    Mathematically equivalent to cross-entropy on a similarity matrix:
-        Loss = -mean(diag(log_softmax(sim_matrix / temperature)))
+    Fixes the "false negative" problem of vanilla InfoNCE:
+    - Vanilla InfoNCE treats ALL other in-batch samples as negatives.
+    - But if two samples share the same target_word (e.g. both are "red"),
+      their features SHOULD be similar — pushing them apart is wrong.
+
+    SupCon fix:
+    - Positives: same target_word  (both diagonal AND same-class off-diagonal)
+    - Negatives: different target_word ONLY
+
+    For each anchor ea[i]:
+        L_i = -1/|P(i)| * sum_{p in P(i)} log [
+            exp(sim(ea_i, ep_p) / tau) /
+            sum_{j: target_words[j] != target_words[i]} exp(sim(ea_i, ep_j) / tau)
+        ]
 
     Args:
-        ea: [N, D]  L2-normalized anchor features
-        ep: [N, D]  L2-normalized positive features
-        temperature: scaling factor (smaller = harder, typical: 0.07-0.2)
+        ea:           [N, D]  L2-normalized anchor features
+        ep:           [N, D]  L2-normalized positive features
+        target_words: list of N strings, e.g. ["red", "two", "red", "wooden"]
+        temperature:  scalar, typical 0.07~0.2
     """
-    # sim_matrix[i, j] = cosine_similarity(anchor_i, positive_j)  [N, N]
-    sim_matrix = torch.matmul(ea, ep.T) / temperature
+    N = ea.shape[0]
+    device = ea.device
 
-    # Correct label for anchor i is positive i (diagonal)
-    labels = torch.arange(ea.shape[0], device=ea.device)
+    # Full similarity matrix [N, N]
+    sim_matrix = torch.matmul(ea, ep.T) / temperature   # [N, N]
 
-    # Cross-entropy loss on rows (anchor → positive direction)
-    loss_a2p = F.cross_entropy(sim_matrix, labels)
-    # Cross-entropy on columns (positive → anchor direction, symmetric)
-    loss_p2a = F.cross_entropy(sim_matrix.T, labels)
+    # Build same-class mask: same_mask[i, j] = True if target_words[i] == target_words[j]
+    same_mask = torch.zeros(N, N, dtype=torch.bool, device=device)
+    for i in range(N):
+        for j in range(N):
+            if target_words[i] == target_words[j]:
+                same_mask[i, j] = True
 
-    return (loss_a2p + loss_p2a) / 2
+    # Positive mask: same class AND not self  →  P(i)
+    pos_mask = same_mask.clone()
+    pos_mask.fill_diagonal_(False)                       # remove self-pair
+
+    # Negative mask: different class  →  used in denominator
+    # (self-pair is also excluded from denominator by convention)
+    neg_mask = ~same_mask                                # [N, N]
+    neg_mask.fill_diagonal_(False)
+
+    # For samples that have NO in-batch positive (unique target_word in this batch),
+    # fall back to the diagonal-only InfoNCE (standard behaviour).
+    has_pos = pos_mask.any(dim=1)                        # [N] bool
+
+    loss_total = ea.new_tensor(0.0)
+    n_valid = 0
+
+    for i in range(N):
+        # Denominator: diagonal (self-positive) + all negatives
+        denom_mask = neg_mask[i].clone()
+        denom_mask[i] = True                             # always include self positive ep[i]
+        log_denom = torch.logsumexp(sim_matrix[i][denom_mask], dim=0)
+
+        if has_pos[i]:
+            # Multiple positives: average log-likelihood over all same-class ep[j]
+            pos_indices = pos_mask[i].nonzero(as_tuple=True)[0]
+            log_probs = sim_matrix[i][pos_indices] - log_denom   # [|P(i)|]
+            loss_i = -log_probs.mean()
+        else:
+            # No same-class partner in this batch: treat diagonal as the only positive
+            loss_i = -(sim_matrix[i, i] - log_denom)
+
+        loss_total = loss_total + loss_i
+        n_valid += 1
+
+    return loss_total / max(n_valid, 1)
 
 
 def noun_regularization_loss(
@@ -377,8 +508,9 @@ def train(args):
         max_length=args.max_length,
         use_chat_template=args.use_chat_template,
     )
+    batch_sampler = HalfTaskBatchSampler(dataset, batch_size=args.batch_size, shuffle=True)
     loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
+        dataset, batch_sampler=batch_sampler,
         num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
     )
 
@@ -431,28 +563,28 @@ def train(args):
             ep, vm_p = extract_token_features(fused_p, batch['p_tidx'])
             en, vm_n = extract_token_features(fused_n, batch['n_tidx'])
 
-            if args.loss_type == 'infonce':
-                # InfoNCE: only needs anchor + positive; in-batch negatives are used automatically
-                valid = vm_a & vm_p
-            else:
-                # Triplet: needs all three
+            if args.loss_type == 'triplet':
                 valid = vm_a & vm_p & vm_n
+            else:
+                # supcon only needs anchor + positive
+                valid = vm_a & vm_p
 
-            if valid.sum() < 2:   # InfoNCE needs at least 2 valid samples
+            if valid.sum() < 2:
                 skipped += a_ids.shape[0]
                 continue
 
+            valid_idx = valid.nonzero(as_tuple=True)[0].tolist()
             ea = ea[valid]
             ep = ep[valid]
             en = en[valid] if args.loss_type == 'triplet' else None
+            batch_target_words = [batch['target_word'][i] for i in valid_idx]
 
             # ---- Step 4a: Contrastive Loss ----
-            if args.loss_type == 'infonce':
-                # In-batch negatives: every other positive in the batch is a negative.
-                # Effective negatives per sample = (N_valid - 1), much richer than triplet.
-                loss_contrastive = infoNCE_loss(ea, ep, temperature=args.temperature)
-            else:
+            if args.loss_type == 'triplet':
                 loss_contrastive = triplet_margin_loss(ea, ep, en, margin=args.margin)
+            else:
+                # SupCon: same target_word pairs become extra positives, not false negatives
+                loss_contrastive = supcon_loss(ea, ep, batch_target_words, temperature=args.temperature)
 
             # ---- Step 4b: Noun Regularization Loss (optional) ----
             # Mark all non-target positions as "noun-like" (conservative: just use valid token positions)
@@ -562,9 +694,10 @@ def parse_args():
                         help='Apply Qwen chat template during tokenization (consistent with inference)')
 
     # Loss
-    parser.add_argument('--loss_type',   type=str,   default='infonce',
-                        choices=['infonce', 'triplet'],
-                        help='infonce: in-batch negatives (recommended for small data); triplet: explicit negative')
+    parser.add_argument('--loss_type',   type=str,   default='supcon',
+                        choices=['supcon', 'triplet'],
+                        help='supcon: supervised contrastive, fixes false negatives (recommended); '
+                             'triplet: explicit hard negative, simpler but weaker')
     parser.add_argument('--temperature', type=float, default=0.07,
                         help='Temperature for InfoNCE loss (smaller = harder, typical: 0.07~0.2)')
     parser.add_argument('--margin',     type=float, default=0.3,
