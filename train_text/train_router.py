@@ -414,12 +414,10 @@ def supcon_loss(
     # Full similarity matrix [N, N]
     sim_matrix = torch.matmul(ea, ep.T) / temperature   # [N, N]
 
-    # Build same-class mask: same_mask[i, j] = True if target_words[i] == target_words[j]
-    same_mask = torch.zeros(N, N, dtype=torch.bool, device=device)
-    for i in range(N):
-        for j in range(N):
-            if target_words[i] == target_words[j]:
-                same_mask[i, j] = True
+    # Build same-class mask vectorized: hash each string → int64 tensor → broadcast compare
+    # hash() is deterministic within one process; collisions are astronomically rare for short words
+    word_ids = torch.tensor([hash(w) for w in target_words], dtype=torch.int64, device=device)
+    same_mask = (word_ids.unsqueeze(0) == word_ids.unsqueeze(1))   # [N, N]  O(N) not O(N²)
 
     # Positive mask: same class AND not self  →  P(i)
     pos_mask = same_mask.clone()
