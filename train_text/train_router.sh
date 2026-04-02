@@ -7,7 +7,7 @@
 NPROC=${NPROC:-1}
 
 torchrun \
-    --nproc_per_node=$NPROC \
+    --nproc_per_node=8 \
     --master_port=29500 \
     train_text/train_router.py \
     --model_dir  ckpts/Z-Image-Turbo \
