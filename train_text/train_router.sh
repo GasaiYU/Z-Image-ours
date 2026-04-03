@@ -15,7 +15,7 @@ torchrun \
     --output_dir  train_text/checkpoints/router_version2 \
     --loss_type   supcon \
     --temperature 0.07 \
-    --batch_size  96 \
+    --batch_size  128 \
     --epochs      20 \
     --lambda_reg  0.1 \
     --seed        42 \
