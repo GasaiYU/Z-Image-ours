@@ -12,7 +12,7 @@ torchrun \
     train_text/train_router.py \
     --model_dir  ckpts/Z-Image-Turbo \
     --triplet_dir data/train_triplets \
-    --output_dir  train_text/checkpoints/router \
+    --output_dir  train_text/checkpoints/router_version2 \
     --loss_type   supcon \
     --temperature 0.07 \
     --batch_size  96 \
