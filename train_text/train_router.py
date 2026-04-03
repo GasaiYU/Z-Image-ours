@@ -96,34 +96,68 @@ def all_gather_strings(str_list: list) -> list:
 # =============================================================================
 class DynamicTokenRouter(nn.Module):
     """
-    A lightweight MLP that takes the deep LLM features of a token as input,
-    and outputs per-layer routing weights (Softmax over all LLM layers).
-    
+    A lightweight MLP that takes multi-scale LLM features as input and outputs
+    per-layer routing weights (Softmax over all LLM layers).
+
+    Decision signal: concatenation of features from 4 representative layers
+      - layer 1           (surface / lexical form)
+      - layer num_layers//4   (early context)
+      - layer num_layers//2   (mid context)
+      - layer -2          (deep / final context)
+
+    This multi-scale signal lets the router distinguish counting words (e.g.
+    "two" vs "three") that are near-identical in deep features alone, because
+    their shallow-layer representations still carry strong lexical identity.
+
     The final fused embedding is a weighted sum of all LLM layers' features.
     Only this MLP is trained; the LLM itself is frozen.
-    
-    Params: ~1M (hidden_size=3584, mid_dim=256, num_layers=32)
+
+    Params: ~2M (hidden_size=3584, scale_layers=4, mid_dim=256, num_layers=32)
     """
+    # Indices into all_hidden_states (as fractions of num_layers) used as
+    # decision signal. Index 0 = token embedding, 1..L = transformer layers.
+    SCALE_FRACS = (0.0, 0.25, 0.5, 1.0)   # maps to layers 1, L//4, L//2, L-1 (≈ -2)
+
     def __init__(self, hidden_size: int, num_layers: int, mid_dim: int = 256):
         super().__init__()
-        self.num_layers = num_layers
+        self.num_layers  = num_layers
         self.hidden_size = hidden_size
 
+        # Compute the 4 representative layer indices (1-indexed into transformer layers)
+        self.scale_indices: list[int] = self._scale_indices(num_layers)
+
+        # MLP input = concat of len(SCALE_FRACS) layer features
+        in_dim = hidden_size * len(self.SCALE_FRACS)
         self.router_mlp = nn.Sequential(
-            nn.Linear(hidden_size, mid_dim),
+            nn.Linear(in_dim, mid_dim),
             nn.SiLU(),
             nn.Dropout(0.1),
             nn.Linear(mid_dim, num_layers),
         )
 
-        # Smart initialization: default to deep layer
-        # Since we use all_hidden_states[-2] as the target for noun regularization,
-        # we should initialize the prior to point to the EXACT SAME layer to avoid huge initial loss.
-        # layers = all_hidden_states[1 : num_layers + 1]. 
-        # all_hidden_states[-2] corresponds to layers[-2].
+        # Initialise to route everything to the deep layer (same prior as before,
+        # avoids a huge initial noun-regularisation loss).
         nn.init.zeros_(self.router_mlp[-1].weight)
         nn.init.zeros_(self.router_mlp[-1].bias)
         self.router_mlp[-1].bias.data[-2] = 5.0   # point to second-to-last layer
+
+    @classmethod
+    def _scale_indices(cls, num_layers: int) -> list[int]:
+        """
+        Map SCALE_FRACS to actual all_hidden_states indices.
+        all_hidden_states[0] = token embedding, [1..num_layers] = transformer layers.
+        frac=0.0 → layer 1 (shallowest transformer layer)
+        frac=1.0 → layer num_layers - 1  (= hidden_states[-2])
+        """
+        indices = []
+        for frac in cls.SCALE_FRACS:
+            # transformer layer index (1-based): clamp to [1, num_layers-1]
+            layer_idx = max(1, min(num_layers - 1, round(frac * (num_layers - 1)) + 1))
+            # frac=0.0 → round(0)+1=1, frac=1.0 → round(num_layers-1)+1 → clamped to num_layers-1
+            indices.append(layer_idx)
+        # Ensure frac=1.0 really lands on hidden_states[-2]
+        indices[-1] = num_layers - 1   # = all_hidden_states[-2] for a (num_layers+1)-tuple
+        return indices
 
     def forward(self, all_hidden_states: tuple, attention_mask: torch.Tensor = None):
         """
@@ -132,26 +166,30 @@ class DynamicTokenRouter(nn.Module):
                                Index 0 is the raw embedding layer; 1..num_layers are transformer layers.
             attention_mask: [B, S] bool mask (True = valid token).
         Returns:
-            fused_embeds: [B, S, D]   weighted sum across layers
-            routing_weights: [B, S, num_layers]   softmax weights (for visualization / aux loss)
+            fused_embeds:    [B, S, D]            weighted sum across layers
+            routing_weights: [B, S, num_layers]   softmax weights
         """
         # Stack transformer output layers (skip embedding layer at index 0)
-        # stacked: [B, S, num_layers, D]
-        layers = all_hidden_states[1 : self.num_layers + 1]
-        stacked = torch.stack(layers, dim=2)                         # [B, S, L, D]
+        layers  = all_hidden_states[1 : self.num_layers + 1]
+        stacked = torch.stack(layers, dim=2)                          # [B, S, L, D]
 
-        # Use deep features as the routing decision signal (detach: no gradient into LLM)
-        # Cast to float32 for the MLP (LLM may output bf16, MLP is always fp32)
-        decision_feat = all_hidden_states[-2].detach().float()       # [B, S, D]
+        # Multi-scale decision signal: concat features from 4 representative layers.
+        # Each is detached so no gradient flows back into the frozen LLM.
+        # Cast to float32 because the MLP is always fp32 (LLM may be bf16).
+        scale_feats = [
+            all_hidden_states[idx].detach().float()                   # [B, S, D]
+            for idx in self.scale_indices
+        ]
+        decision_feat = torch.cat(scale_feats, dim=-1)                # [B, S, 4*D]
 
-        # Compute per-token routing logits → weights
-        routing_logits   = self.router_mlp(decision_feat)            # [B, S, L]
-        routing_weights  = F.softmax(routing_logits, dim=-1)         # [B, S, L]
+        # Routing logits → softmax weights
+        routing_logits  = self.router_mlp(decision_feat)              # [B, S, L]
+        routing_weights = F.softmax(routing_logits, dim=-1)           # [B, S, L]
 
-        # Cast back to input dtype before weighted sum (keep fused_embeds same dtype as LLM)
+        # Cast back to LLM dtype before weighted sum
         routing_weights = routing_weights.to(stacked.dtype)
 
-        # Weighted sum: fused_embeds[b, s, d] = sum_l w[b,s,l] * stacked[b,s,l,d]
+        # Weighted sum across layers
         fused_embeds = (stacked * routing_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
 
         # Zero out pad tokens
@@ -459,6 +497,38 @@ def supcon_loss(
     return loss_total / max(n_valid, 1)
 
 
+def routing_entropy_loss(routing_weights: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+    """
+    Entropy regularisation on the routing weight distribution.
+
+    Maximising entropy encourages the router to spread weight across layers
+    rather than collapsing to a single layer (the deep-layer prior from init).
+    This is especially important for tokens whose deep features are similar
+    (e.g. "two" vs "three") — it keeps the routing distribution explorable
+    so that the contrastive loss can pull them apart.
+
+    Loss = -mean_entropy = mean[ sum_l w_l * log(w_l) ]
+    Minimising this loss maximises entropy (more uniform → lower loss_entropy).
+
+    Args:
+        routing_weights: [B, S, L]  softmax weights (already normalised).
+        attention_mask:  [B, S]     bool / int mask; only valid tokens count.
+    Returns:
+        scalar entropy loss (>= 0).
+    """
+    # entropy per token: -sum_l w * log(w),  shape [B, S]
+    entropy = -(routing_weights.float() * (routing_weights.float() + 1e-8).log()).sum(dim=-1)
+
+    if attention_mask is not None:
+        mask    = attention_mask.bool().float()          # [B, S]
+        entropy = (entropy * mask).sum() / mask.sum().clamp(min=1)
+    else:
+        entropy = entropy.mean()
+
+    # We want to maximise entropy → minimise negative entropy
+    return -entropy
+
+
 def noun_regularization_loss(
     fused_embeds: torch.Tensor,
     deep_embeds: torch.Tensor,
@@ -621,9 +691,10 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         router.train()
         epoch_loss_contrastive = 0.0
-        epoch_loss_reg = 0.0
+        epoch_loss_reg         = 0.0
+        epoch_loss_entropy     = 0.0
         n_batches = 0
-        skipped = 0
+        skipped   = 0
 
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         for batch in pbar:
@@ -693,7 +764,18 @@ def train(args):
                         noun_mask[i, tidx] = False
                 loss_reg = noun_regularization_loss(fused_a, deep_a, noun_mask)
 
-            loss = loss_contrastive + args.lambda_reg * loss_reg
+            # ---- Step 4c: Entropy Regularization Loss ----
+            # Maximise routing entropy so the router doesn't collapse to one layer.
+            # This keeps gradients flowing to shallow layers, allowing contrastive
+            # loss to separate counting words (two/three/four) that are near-identical
+            # in deep features.
+            loss_entropy = fused_a.new_tensor(0.0)
+            if args.lambda_entropy > 0:
+                loss_entropy = routing_entropy_loss(rw_a.float(), attention_mask=a_mask)
+
+            loss = (loss_contrastive
+                    + args.lambda_reg     * loss_reg
+                    + args.lambda_entropy * loss_entropy)
 
             # ---- Step 5: Backward ----
             optimizer.zero_grad()
@@ -704,21 +786,24 @@ def train(args):
 
             epoch_loss_contrastive += loss_contrastive.item()
             epoch_loss_reg         += loss_reg.item() if args.lambda_reg > 0 else 0.0
+            epoch_loss_entropy     += loss_entropy.item() if args.lambda_entropy > 0 else 0.0
             n_batches += 1
             global_step += 1
 
             if is_main:
                 pbar.set_postfix({
-                    'L_contra': f'{loss_contrastive.item():.4f}',
-                    'L_reg':    f'{loss_reg.item():.4f}' if args.lambda_reg > 0 else '—',
-                    'lr':       f'{scheduler.get_last_lr()[0]:.2e}',
-                    'skipped':  skipped,
+                    'L_contra':  f'{loss_contrastive.item():.4f}',
+                    'L_reg':     f'{loss_reg.item():.4f}' if args.lambda_reg > 0 else '—',
+                    'L_entropy': f'{loss_entropy.item():.4f}' if args.lambda_entropy > 0 else '—',
+                    'lr':        f'{scheduler.get_last_lr()[0]:.2e}',
+                    'skipped':   skipped,
                 })
                 if use_wandb:
                     wandb.log({
                         'train/loss_contrastive': loss_contrastive.item(),
                         'train/loss_reg':         loss_reg.item() if args.lambda_reg > 0 else 0.0,
-                        'train/loss_total':        loss.item(),
+                        'train/loss_entropy':     loss_entropy.item() if args.lambda_entropy > 0 else 0.0,
+                        'train/loss_total':       loss.item(),
                         'train/lr':               scheduler.get_last_lr()[0],
                         'train/skipped':          skipped,
                     }, step=global_step)
@@ -738,13 +823,16 @@ def train(args):
 
         # ---- End of epoch stats (rank 0 only) ----
         if is_main:
-            avg_contra = epoch_loss_contrastive / max(n_batches, 1)
-            avg_reg    = epoch_loss_reg          / max(n_batches, 1)
-            print(f"\n[Epoch {epoch}] avg_contrastive={avg_contra:.4f}  avg_reg={avg_reg:.4f}  skipped={skipped}")
+            avg_contra   = epoch_loss_contrastive / max(n_batches, 1)
+            avg_reg      = epoch_loss_reg          / max(n_batches, 1)
+            avg_entropy  = epoch_loss_entropy      / max(n_batches, 1)
+            print(f"\n[Epoch {epoch}] avg_contrastive={avg_contra:.4f}  "
+                  f"avg_reg={avg_reg:.4f}  avg_entropy={avg_entropy:.4f}  skipped={skipped}")
             if use_wandb:
                 wandb.log({
                     'epoch/loss_contrastive': avg_contra,
                     'epoch/loss_reg':         avg_reg,
+                    'epoch/loss_entropy':     avg_entropy,
                     'epoch/epoch':            epoch,
                 }, step=global_step)
 
@@ -820,6 +908,10 @@ def parse_args():
                         help='Margin for triplet loss (higher = harder constraint)')
     parser.add_argument('--lambda_reg', type=float, default=0.1,
                         help='Weight of noun regularization loss (0 to disable)')
+    parser.add_argument('--lambda_entropy', type=float, default=0.01,
+                        help='Weight of routing entropy loss (0 to disable). '
+                             'Maximises routing distribution entropy so the router '
+                             'does not collapse to a single layer. Recommended: 0.005~0.05.')
 
     # Training
     parser.add_argument('--epochs',      type=int,   default=10)
