@@ -179,6 +179,58 @@ def get_counting_weights(
 # ---------------------------------------------------------------------------
 # Plot
 # ---------------------------------------------------------------------------
+def plot_counting_by_word(all_token_weights, num_layers, save_path):
+    """
+    One curve per distinct counting word (one / two / three / …).
+    Shows how routing preferences differ across different counting words.
+    """
+    from collections import defaultdict
+
+    word_buckets = defaultdict(list)
+    for word, w in all_token_weights:
+        word_buckets[word].append(w)
+
+    # Sort words numerically where possible, then alphabetically
+    _order = ["one","1","two","2","three","3","four","4",
+              "five","5","six","6","seven","7","eight","8","nine","9","ten","10"]
+    words_sorted = sorted(
+        word_buckets.keys(),
+        key=lambda w: _order.index(w) if w in _order else 99
+    )
+
+    cmap = plt.get_cmap("tab10")
+    x    = np.arange(1, num_layers + 1)
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for idx, word in enumerate(words_sorted):
+        rows = np.stack(word_buckets[word])   # [N, L]
+        mean = rows.mean(axis=0)
+        std  = rows.std(axis=0)
+        color = cmap(idx % 10)
+        ax.plot(x, mean, color=color, linewidth=2,
+                label=f'"{word}"  (n={len(rows)})')
+        ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.12)
+
+    deep_layer = num_layers - 1
+    ax.axvline(deep_layer, color="#2c3e50", linestyle="--", linewidth=1.2,
+               label=f"default deep layer ({deep_layer})")
+
+    ax.set_xlabel("LLM Layer", fontsize=12)
+    ax.set_ylabel("Average Routing Weight (softmax)", fontsize=12)
+    ax.set_title("Routing Weight per Layer — Breakdown by Counting Word", fontsize=12)
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(4))
+    ax.xaxis.set_minor_locator(mticker.MultipleLocator(1))
+    ax.grid(axis="x", which="major", linestyle="--", alpha=0.35)
+    ax.grid(axis="y", linestyle=":", alpha=0.3)
+    ax.legend(fontsize=9, ncol=2)
+    ax.set_xlim(0.5, num_layers + 0.5)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] {save_path}")
+
+
 def plot_counting_avg(all_token_weights, num_layers, save_path):
     """
     Bar + error-bar chart: average softmax weight per LLM layer for all
@@ -317,6 +369,12 @@ def main():
     plot_counting_avg(
         all_token_weights, num_layers,
         os.path.join(args.out_dir, "counting_avg_weight.png"),
+    )
+
+    print("[Plotting] Per-word breakdown …")
+    plot_counting_by_word(
+        all_token_weights, num_layers,
+        os.path.join(args.out_dir, "counting_by_word.png"),
     )
 
     # ---- Save raw data ----
