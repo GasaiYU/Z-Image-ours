@@ -23,7 +23,9 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
+from collections import defaultdict
 
 import torch
 import numpy as np
@@ -31,6 +33,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import seaborn as sns
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 from utils import ensure_model_weights, load_from_local_dir
@@ -177,6 +180,230 @@ def get_counting_weights(
 
 
 # ---------------------------------------------------------------------------
+# Counting swap analysis
+# ---------------------------------------------------------------------------
+SWAP_TARGETS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
+
+
+def replace_counting_word(prompt: str, original: str, replacement: str) -> str:
+    """Replace the first whole-word occurrence of `original` with `replacement` (case-insensitive)."""
+    return re.sub(r'(?<!\w)' + re.escape(original) + r'(?!\w)',
+                  replacement, prompt, count=1, flags=re.IGNORECASE)
+
+
+@torch.no_grad()
+def get_counting_token_features(
+    prompt: str,
+    text_encoder,
+    tokenizer,
+    router: DynamicTokenRouter,
+    device,
+    max_sequence_length: int = 512,
+):
+    """
+    Run prompt through text encoder + router.
+    Returns for every counting token found:
+        (token_str, routing_weights[L], fused_embed[D])
+    """
+    messages  = [{"role": "user", "content": prompt}]
+    formatted = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+    )
+    enc = tokenizer(
+        [formatted],
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids      = enc.input_ids.to(device)
+    attention_mask = enc.attention_mask.to(device)
+
+    outputs = text_encoder(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+    )
+    fused_embeds, routing_weights = router(
+        outputs.hidden_states, attention_mask=attention_mask.bool()
+    )
+    # routing_weights: [1, S, L]   fused_embeds: [1, S, D]
+
+    valid_mask = attention_mask[0].bool()
+    valid_ids  = input_ids[0][valid_mask].tolist()
+    rw         = routing_weights[0][valid_mask].float().cpu().numpy()   # [T, L]
+    fe         = fused_embeds[0][valid_mask].float().cpu().numpy()      # [T, D]
+
+    all_tokens = [tokenizer.decode([tid]) for tid in valid_ids]
+    cs, ce     = find_content_span(all_tokens)
+
+    results = []
+    for i in range(cs, ce):
+        if is_counting_token(all_tokens[i]):
+            results.append((all_tokens[i].strip(), rw[i], fe[i]))
+    return results
+
+
+def run_swap_analysis(
+    base_prompt: str,
+    text_encoder,
+    tokenizer,
+    router: DynamicTokenRouter,
+    device,
+    max_sequence_length: int = 512,
+    swap_targets: list = None,
+):
+    """
+    Detect counting word(s) in base_prompt, then replace with every word in
+    swap_targets. Collect routing weights + fused embeddings for each variant.
+
+    Returns
+    -------
+    variants : list of dicts with keys
+        'word'  – the counting word in this variant (str)
+        'prompt' – full prompt (str)
+        'rw'    – routing_weights [L] np.ndarray for the counting token
+        'fe'    – fused_embed [D] np.ndarray for the counting token
+    found_word : str – the original counting word detected
+    """
+    if swap_targets is None:
+        swap_targets = SWAP_TARGETS
+
+    # Detect which counting word is in the base prompt
+    found_word = None
+    for w in swap_targets:
+        if re.search(r'(?<!\w)' + re.escape(w) + r'(?!\w)', base_prompt, re.IGNORECASE):
+            found_word = w
+            break
+    if found_word is None:
+        raise ValueError(f"No counting word from {swap_targets} found in: '{base_prompt}'")
+
+    print(f"  Base counting word detected: '{found_word}'")
+
+    variants = []
+    for target in swap_targets:
+        prompt = replace_counting_word(base_prompt, found_word, target)
+        feats  = get_counting_token_features(
+            prompt, text_encoder, tokenizer, router, device, max_sequence_length
+        )
+        if not feats:
+            print(f"  [skip] counting token not found after swap → '{target}'")
+            continue
+        tok, rw, fe = feats[0]   # take the first counting token
+        variants.append({"word": target, "prompt": prompt, "rw": rw, "fe": fe})
+        peak = int(rw.argmax()) + 1
+        print(f"  '{target}':  peak=layer {peak}  (w={rw.max():.3f})")
+
+    return variants, found_word
+
+
+def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir):
+    """
+    Three figures:
+    1. Routing-weight curves per variant (one line per count word).
+    2. Fused-embedding cosine-similarity heatmap across all variants.
+    3. Peak-layer bar chart per variant.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    words  = [v["word"]  for v in variants]
+    rws    = np.stack([v["rw"] for v in variants])   # [N, L]
+    fes    = np.stack([v["fe"] for v in variants])   # [N, D]
+    x      = np.arange(1, num_layers + 1)
+    cmap   = plt.get_cmap("tab10")
+    deep_layer = num_layers - 1
+
+    # ── 1. Routing weight curves ────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for i, (word, rw) in enumerate(zip(words, rws)):
+        lw    = 2.5 if word == found_word else 1.5
+        ls    = "-"  if word == found_word else "--"
+        alpha = 1.0  if word == found_word else 0.7
+        ax.plot(x, rw, color=cmap(i % 10), linewidth=lw,
+                linestyle=ls, alpha=alpha, label=f'"{word}"')
+
+    ax.axvline(deep_layer, color="#2c3e50", linestyle=":", linewidth=1.2,
+               label=f"default deep layer ({deep_layer})")
+    ax.set_xlabel("LLM Layer", fontsize=12)
+    ax.set_ylabel("Routing Weight (softmax)", fontsize=12)
+    ax.set_title(
+        f"Routing Weights per Counting Word — Swap Variants\n"
+        f'base: "{base_prompt}"  (original word: "{found_word}")',
+        fontsize=11,
+    )
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(4))
+    ax.xaxis.set_minor_locator(mticker.MultipleLocator(1))
+    ax.grid(axis="x", which="major", linestyle="--", alpha=0.35)
+    ax.grid(axis="y", linestyle=":", alpha=0.3)
+    ax.legend(fontsize=9, ncol=2)
+    ax.set_xlim(0.5, num_layers + 0.5)
+    plt.tight_layout()
+    p = os.path.join(out_dir, "swap_routing_curves.png")
+    plt.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] {p}")
+
+    # ── 2. Fused-embedding cosine similarity heatmap ────────────────────────
+    norms  = fes / (np.linalg.norm(fes, axis=1, keepdims=True) + 1e-8)
+    sim    = norms @ norms.T   # [N, N]
+
+    fig, ax = plt.subplots(figsize=(max(6, len(words) * 0.8), max(5, len(words) * 0.7)))
+    vmin = sim[~np.eye(len(words), dtype=bool)].min() - 0.01
+    sns.heatmap(
+        sim, annot=True, fmt=".3f", cmap="coolwarm",
+        xticklabels=words, yticklabels=words,
+        vmin=vmin, vmax=1.0, ax=ax,
+        linewidths=0.5, linecolor="gray",
+    )
+    # Highlight original word row/col
+    orig_idx = words.index(found_word) if found_word in words else 0
+    ax.add_patch(plt.Rectangle((0, orig_idx), len(words), 1,
+                                fill=False, edgecolor="lime", lw=3))
+    ax.add_patch(plt.Rectangle((orig_idx, 0), 1, len(words),
+                                fill=False, edgecolor="lime", lw=3))
+    ax.set_title(
+        f'Fused Embedding Cosine Similarity — Counting Token\n'
+        f'base: "{base_prompt}"',
+        fontsize=10,
+    )
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+    plt.tight_layout()
+    p = os.path.join(out_dir, "swap_embed_similarity.png")
+    plt.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] {p}")
+
+    # ── 3. Peak-layer bar chart ─────────────────────────────────────────────
+    peaks  = [int(rw.argmax()) + 1 for rw in rws]
+    colors = [cmap(i % 10) for i in range(len(words))]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(words) * 0.9), 4))
+    bars = ax.bar(words, peaks, color=colors, edgecolor="white", linewidth=0.8)
+    ax.axhline(deep_layer, color="#2c3e50", linestyle="--", linewidth=1.2,
+               label=f"default deep layer ({deep_layer})")
+    for bar, peak in zip(bars, peaks):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.15,
+                str(peak), ha="center", va="bottom", fontsize=9)
+    # Mark original word bar
+    if found_word in words:
+        bars[words.index(found_word)].set_edgecolor("red")
+        bars[words.index(found_word)].set_linewidth(2.5)
+    ax.set_xlabel("Counting Word", fontsize=12)
+    ax.set_ylabel("Peak Routing Layer", fontsize=12)
+    ax.set_ylim(0, num_layers + 1)
+    ax.set_title(
+        f'Peak Routing Layer per Counting Word\n'
+        f'base: "{base_prompt}"  (red border = original)',
+        fontsize=11,
+    )
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    p = os.path.join(out_dir, "swap_peak_layer.png")
+    plt.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] {p}")
+
+
+# ---------------------------------------------------------------------------
 # Plot
 # ---------------------------------------------------------------------------
 def plot_counting_by_word(all_token_weights, num_layers, save_path):
@@ -305,6 +532,15 @@ def parse_args():
                    help="Custom prompts (default: built-in counting prompts)")
     p.add_argument("--max_length",  type=int, default=512,
                    help="Max tokenizer sequence length")
+    # Swap mode
+    p.add_argument("--swap", action="store_true",
+                   help="Swap-analysis mode: replace the counting word with every other "
+                        "number word and compare routing weights + fused embeddings")
+    p.add_argument("--swap_prompt", type=str,
+                   default="two cats sitting on a sofa",
+                   help="Base prompt for swap analysis (must contain a counting word)")
+    p.add_argument("--swap_targets", type=str, nargs="+", default=None,
+                   help="Which counting words to swap in (default: one–ten)")
     return p.parse_args()
 
 
@@ -349,7 +585,35 @@ def main():
         print(f"[Router] epoch={ckpt['epoch']}, step={ckpt.get('step','?')}, "
               f"best_loss={ckpt.get('best_loss','N/A')}")
 
-    # ---- Collect counting-token weights ----
+    # ================================================================
+    # Mode A: swap analysis
+    # ================================================================
+    if args.swap:
+        swap_out = os.path.join(args.out_dir, "swap")
+        os.makedirs(swap_out, exist_ok=True)
+        print(f"\n[Swap Analysis] base prompt: '{args.swap_prompt}'")
+        swap_targets = args.swap_targets if args.swap_targets else SWAP_TARGETS
+
+        variants, found_word = run_swap_analysis(
+            args.swap_prompt, text_encoder, tokenizer, router,
+            device, args.max_length, swap_targets,
+        )
+        plot_swap_results(variants, args.swap_prompt, found_word, num_layers, swap_out)
+
+        # Save raw data
+        raw = [{"word": v["word"], "prompt": v["prompt"],
+                "peak_layer": int(v["rw"].argmax()) + 1,
+                "peak_weight": float(v["rw"].max()),
+                "rw": v["rw"].tolist()} for v in variants]
+        with open(os.path.join(swap_out, "swap_stats.json"), "w") as f:
+            json.dump(raw, f, indent=2)
+        print(f"[Saved] {os.path.join(swap_out, 'swap_stats.json')}")
+        print(f"\n[Done] Swap outputs in: {swap_out}")
+        return
+
+    # ================================================================
+    # Mode B: average weight across many prompts (default)
+    # ================================================================
     prompts = args.prompts if args.prompts else DEFAULT_PROMPTS
     print(f"\n[Analysis] {len(prompts)} prompts")
 
