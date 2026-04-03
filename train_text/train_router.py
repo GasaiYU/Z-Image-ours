@@ -116,11 +116,14 @@ class DynamicTokenRouter(nn.Module):
             nn.Linear(mid_dim, num_layers),
         )
 
-        # Smart initialization: default to deep layer (last layer = index -1)
-        # This ensures at step 0, the router behaves identical to baseline Z-Image.
+        # Smart initialization: default to deep layer
+        # Since we use all_hidden_states[-2] as the target for noun regularization,
+        # we should initialize the prior to point to the EXACT SAME layer to avoid huge initial loss.
+        # layers = all_hidden_states[1 : num_layers + 1]. 
+        # all_hidden_states[-2] corresponds to layers[-2].
         nn.init.zeros_(self.router_mlp[-1].weight)
         nn.init.zeros_(self.router_mlp[-1].bias)
-        self.router_mlp[-1].bias.data[-1] = 5.0   # strong prior towards deepest layer
+        self.router_mlp[-1].bias.data[-2] = 5.0   # point to second-to-last layer
 
     def forward(self, all_hidden_states: tuple, attention_mask: torch.Tensor = None):
         """
@@ -465,15 +468,18 @@ def noun_regularization_loss(
     Force noun token features to stay close to the original deep features.
     Prevents the router from also routing noun tokens to shallow layers.
 
-    Args:
-        fused_embeds: [B, S, D]
-        deep_embeds:  [B, S, D]
-        noun_mask:    [B, S] bool, True for noun positions
+    Uses 1 - Cosine Similarity instead of MSE to avoid massive gradient spikes 
+    from unnormalized LLM hidden states.
     """
     if noun_mask.sum() == 0:
         return fused_embeds.new_tensor(0.0)
-    diff = (fused_embeds - deep_embeds)[noun_mask]   # [N_nouns, D]
-    return (diff ** 2).mean()
+    
+    fused_nouns = fused_embeds[noun_mask]   # [N_nouns, D]
+    deep_nouns  = deep_embeds[noun_mask]    # [N_nouns, D]
+    
+    # Cosine distance: 1 - cos_sim. Range [0, 2]. Much more stable than MSE.
+    cos_sim = F.cosine_similarity(fused_nouns, deep_nouns, dim=-1)
+    return (1.0 - cos_sim).mean()
 
 
 # =============================================================================
