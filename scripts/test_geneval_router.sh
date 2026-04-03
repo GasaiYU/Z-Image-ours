@@ -18,7 +18,7 @@
 set -euo pipefail
 
 # ---------- Arguments ----------
-ROUTER_CKPT="${1:-checkpoints/router/router_best.pt}"
+ROUTER_CKPT="train_text/checkpoints/router/router_best.pt"
 SEED="${2:-42}"
 shift 2 2>/dev/null || true        # consume first two positional args if present
 TAGS=("${@:-counting}")            # remaining args are tags; default to "counting"
