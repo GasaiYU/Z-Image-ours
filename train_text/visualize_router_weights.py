@@ -279,10 +279,12 @@ def get_decision_feat(
     all_hs = outputs.hidden_states   # tuple [num_layers+1] of [1, S, D]
 
     # Replicate exactly what router.forward does for decision_feat
-    scale_feats = [
-        all_hs[idx][0].float().cpu().numpy()   # [S, D]
-        for idx in router.scale_indices
-    ]
+    scale_feats = []
+    for idx in router.scale_indices:
+        f = all_hs[idx][0].float().cpu().numpy()   # [S, D]
+        # Per-scale L2 normalisation (must match train_router.py)
+        norm = np.linalg.norm(f, axis=-1, keepdims=True) + 1e-8
+        scale_feats.append(f / norm)
     decision_feat = np.concatenate(scale_feats, axis=-1)   # [S, 4D]
 
     valid_mask = attention_mask[0].bool().cpu()

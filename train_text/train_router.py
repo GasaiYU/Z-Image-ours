@@ -175,9 +175,13 @@ class DynamicTokenRouter(nn.Module):
 
         # Multi-scale decision signal: concat features from 4 representative layers.
         # Each is detached so no gradient flows back into the frozen LLM.
-        # Cast to float32 because the MLP is always fp32 (LLM may be bf16).
+        # Each scale is L2-normalised independently so that layer_1 (surface/lexical
+        # features, most discriminative for counting words) is not drowned out by the
+        # other three scales whose inter-word similarities are higher (0.93~0.99 vs
+        # layer_1's 0.73~0.84).  After per-scale normalisation all four scales
+        # contribute equally in magnitude to the MLP input.
         scale_feats = [
-            all_hidden_states[idx].detach().float()                   # [B, S, D]
+            F.normalize(all_hidden_states[idx].detach().float(), dim=-1)  # [B, S, D]
             for idx in self.scale_indices
         ]
         decision_feat = torch.cat(scale_feats, dim=-1)                # [B, S, 4*D]
