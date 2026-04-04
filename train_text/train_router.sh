@@ -19,7 +19,7 @@ torchrun \
     --epochs      20 \
     --lambda_reg  0.1 \
     --seed        42 \
-    --lambda_entropy 0.02 \
+    --lambda_entropy 0.005 \
     --use_wandb \
     --wandb_project z-image-router \
     --wandb_run     router_v3_multiscale_entropy
