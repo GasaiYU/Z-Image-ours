@@ -15,11 +15,14 @@ torchrun \
     --output_dir  train_text/checkpoints/router_version3 \
     --loss_type   supcon \
     --temperature 0.07 \
+    --temperature_init 0.2 \
+    --temperature_warmup_steps 200 \
+    --mid_dim     1024 \
     --batch_size  128 \
     --epochs      20 \
     --lambda_reg  0.1 \
-    --seed        42 \
     --lambda_entropy 0.005 \
+    --seed        42 \
     --use_wandb \
     --wandb_project z-image-router \
     --wandb_run     router_v3_multiscale_entropy

@@ -130,9 +130,12 @@ class DynamicTokenRouter(nn.Module):
         in_dim = hidden_size * len(self.SCALE_FRACS)
         self.router_mlp = nn.Sequential(
             nn.Linear(in_dim, mid_dim),
+            nn.LayerNorm(mid_dim),          # stabilise activations after the large concat input
             nn.SiLU(),
             nn.Dropout(0.1),
-            nn.Linear(mid_dim, num_layers),
+            nn.Linear(mid_dim, mid_dim // 2),
+            nn.SiLU(),
+            nn.Linear(mid_dim // 2, num_layers),
         )
         # Default PyTorch Kaiming-uniform init for weights, uniform for biases.
         # We no longer bias toward the deep layer here because:
@@ -754,8 +757,17 @@ def train(args):
                 ea_global    = all_gather_with_grad(ea)
                 ep_global    = all_gather_with_grad(ep)
                 words_global = all_gather_strings(batch_target_words)
+                # Temperature warmup: start from args.temperature_init (warm/easy),
+                # linearly anneal to args.temperature (target/hard) over warmup_steps.
+                # Easier loss landscape early → cleaner gradients → faster escape from plateau.
+                if args.temperature_warmup_steps > 0 and global_step < args.temperature_warmup_steps:
+                    t = global_step / args.temperature_warmup_steps
+                    current_temp = args.temperature_init + t * (args.temperature - args.temperature_init)
+                else:
+                    current_temp = args.temperature
+
                 loss_contrastive = supcon_loss(ea_global, ep_global, words_global,
-                                               temperature=args.temperature)
+                                               temperature=current_temp)
 
             # ---- Step 4b: Noun Regularization Loss (local, no gather needed) ----
             loss_reg = fused_a.new_tensor(0.0)
@@ -893,8 +905,9 @@ def parse_args():
                         help='Which task triplets to use (matches *_triplets.jsonl filenames)')
 
     # Model
-    parser.add_argument('--mid_dim', type=int, default=256,
-                        help='Hidden dimension of Router MLP')
+    parser.add_argument('--mid_dim', type=int, default=1024,
+                        help='Hidden dimension of Router MLP (default raised to 1024 to handle '
+                             '4×hidden_size=14336 input without over-compressing)')
     parser.add_argument('--max_length', type=int, default=128,
                         help='Max tokenizer sequence length')
     parser.add_argument('--use_chat_template', action='store_true',
@@ -906,7 +919,13 @@ def parse_args():
                         help='supcon: supervised contrastive, fixes false negatives (recommended); '
                              'triplet: explicit hard negative, simpler but weaker')
     parser.add_argument('--temperature', type=float, default=0.07,
-                        help='Temperature for InfoNCE loss (smaller = harder, typical: 0.07~0.2)')
+                        help='Target temperature for SupCon loss (final value after warmup)')
+    parser.add_argument('--temperature_init', type=float, default=0.2,
+                        help='Initial temperature for warmup (higher = easier loss landscape early on). '
+                             'Linearly anneals to --temperature over --temperature_warmup_steps steps.')
+    parser.add_argument('--temperature_warmup_steps', type=int, default=200,
+                        help='Number of steps to linearly anneal temperature from temperature_init '
+                             'to temperature. Set 0 to disable warmup.')
     parser.add_argument('--margin',     type=float, default=0.3,
                         help='Margin for triplet loss (higher = harder constraint)')
     parser.add_argument('--lambda_reg', type=float, default=0.1,
