@@ -244,6 +244,137 @@ def get_counting_token_features(
     return results
 
 
+@torch.no_grad()
+def get_decision_feat(
+    prompt: str,
+    text_encoder,
+    tokenizer,
+    router: DynamicTokenRouter,
+    device,
+    max_sequence_length: int = 512,
+) -> list[tuple[str, np.ndarray]]:
+    """
+    Extract the raw decision_feat (MLP input) for every counting token in prompt.
+    Returns list of (token_str, decision_feat_vector [4*D]).
+    """
+    messages  = [{"role": "user", "content": prompt}]
+    formatted = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+    )
+    enc = tokenizer(
+        [formatted],
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids      = enc.input_ids.to(device)
+    attention_mask = enc.attention_mask.to(device)
+
+    outputs = text_encoder(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+    )
+    all_hs = outputs.hidden_states   # tuple [num_layers+1] of [1, S, D]
+
+    # Replicate exactly what router.forward does for decision_feat
+    scale_feats = [
+        all_hs[idx][0].float().cpu().numpy()   # [S, D]
+        for idx in router.scale_indices
+    ]
+    decision_feat = np.concatenate(scale_feats, axis=-1)   # [S, 4D]
+
+    valid_mask = attention_mask[0].bool().cpu()
+    valid_ids  = input_ids[0][valid_mask].tolist()
+    df_valid   = decision_feat[valid_mask.numpy()]          # [T, 4D]
+
+    all_tokens = [tokenizer.decode([tid]) for tid in valid_ids]
+    cs, ce     = find_content_span(all_tokens)
+
+    results = []
+    for i in range(cs, ce):
+        if is_counting_token(all_tokens[i]):
+            results.append((all_tokens[i].strip(), df_valid[i]))
+    return results
+
+
+def plot_decision_feat_similarity(variants_df, base_prompt, out_dir):
+    """
+    For each variant (count word swap), extract decision_feat of the counting
+    token and plot:
+      1. Per-scale-layer cosine similarity heatmap (how similar are decision
+         signals between word pairs, broken down by scale layer).
+      2. Overall (concat) cosine similarity heatmap.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    words  = [v["word"]  for v in variants_df]
+    feats  = np.stack([v["df"] for v in variants_df])   # [N, 4D]
+    D      = feats.shape[1] // 4                         # hidden_size per scale
+
+    # ── 1. Per-scale cosine similarity ─────────────────────────────────────
+    scale_names = ["layer_1 (surface)", "layer_L/4 (early)", "layer_L/2 (mid)", "layer_L-1 (deep)"]
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+
+    for s_idx, (ax, sname) in enumerate(zip(axes, scale_names)):
+        chunk = feats[:, s_idx * D : (s_idx + 1) * D]          # [N, D]
+        norms = chunk / (np.linalg.norm(chunk, axis=1, keepdims=True) + 1e-8)
+        sim   = norms @ norms.T
+
+        vmin = sim[~np.eye(len(words), dtype=bool)].min() - 0.01
+        sns.heatmap(sim, annot=True, fmt=".3f", cmap="coolwarm",
+                    xticklabels=words, yticklabels=words,
+                    vmin=vmin, vmax=1.0, ax=ax,
+                    linewidths=0.4, linecolor="gray", annot_kws={"size": 7})
+        ax.set_title(sname, fontsize=9)
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=8)
+
+    fig.suptitle(
+        f'Decision Feat Similarity per Scale Layer\nbase: "{base_prompt}"',
+        fontsize=11,
+    )
+    plt.tight_layout()
+    p = os.path.join(out_dir, "decision_feat_per_scale.png")
+    plt.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] {p}")
+
+    # ── 2. Full concat cosine similarity ───────────────────────────────────
+    norms_all = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+    sim_all   = norms_all @ norms_all.T
+    vmin_all  = sim_all[~np.eye(len(words), dtype=bool)].min() - 0.01
+
+    fig, ax = plt.subplots(figsize=(max(6, len(words) * 0.8), max(5, len(words) * 0.7)))
+    sns.heatmap(sim_all, annot=True, fmt=".3f", cmap="coolwarm",
+                xticklabels=words, yticklabels=words,
+                vmin=vmin_all, vmax=1.0, ax=ax,
+                linewidths=0.5, linecolor="gray")
+    ax.set_title(
+        f'Full decision_feat Cosine Similarity (concat of 4 scales)\nbase: "{base_prompt}"',
+        fontsize=10,
+    )
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+    plt.tight_layout()
+    p = os.path.join(out_dir, "decision_feat_concat.png")
+    plt.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] {p}")
+
+    # ── 3. Console: min/max off-diagonal sim per scale ─────────────────────
+    print("\n[Decision Feat Similarity Summary]")
+    print(f"  {'Scale':<22}  {'min_off_diag':>12}  {'max_off_diag':>12}  {'mean_off_diag':>13}")
+    mask = ~np.eye(len(words), dtype=bool)
+    for s_idx, sname in enumerate(scale_names):
+        chunk = feats[:, s_idx * D : (s_idx + 1) * D]
+        norms = chunk / (np.linalg.norm(chunk, axis=1, keepdims=True) + 1e-8)
+        sim   = (norms @ norms.T)[mask]
+        print(f"  {sname:<22}  {sim.min():>12.4f}  {sim.max():>12.4f}  {sim.mean():>13.4f}")
+    sim_full = sim_all[mask]
+    print(f"  {'concat (full)':<22}  {sim_full.min():>12.4f}  {sim_full.max():>12.4f}  {sim_full.mean():>13.4f}")
+
+
 def run_swap_analysis(
     base_prompt: str,
     text_encoder,
@@ -541,6 +672,9 @@ def parse_args():
                    help="Base prompt for swap analysis (must contain a counting word)")
     p.add_argument("--swap_targets", type=str, nargs="+", default=None,
                    help="Which counting words to swap in (default: one–ten)")
+    p.add_argument("--diag", action="store_true",
+                   help="Diagnostic mode: visualise the raw decision_feat similarity "
+                        "across counting word swaps (runs alongside --swap automatically)")
     return p.parse_args()
 
 
@@ -599,6 +733,22 @@ def main():
             device, args.max_length, swap_targets,
         )
         plot_swap_results(variants, args.swap_prompt, found_word, num_layers, swap_out)
+
+        # ---- Decision-feat diagnostic (always runs in swap mode) ----------
+        print("\n[Diagnostic] Extracting raw decision_feat for each variant …")
+        diag_out = os.path.join(swap_out, "decision_feat_diag")
+        variants_df = []
+        for target in (args.swap_targets or SWAP_TARGETS):
+            prompt  = replace_counting_word(args.swap_prompt, found_word, target)
+            results = get_decision_feat(
+                prompt, text_encoder, tokenizer, router, device, args.max_length
+            )
+            if results:
+                tok, df = results[0]
+                variants_df.append({"word": target, "df": df})
+                print(f"  '{target}': decision_feat shape={df.shape}")
+        if variants_df:
+            plot_decision_feat_similarity(variants_df, args.swap_prompt, diag_out)
 
         # Save raw data
         raw = [{"word": v["word"], "prompt": v["prompt"],
