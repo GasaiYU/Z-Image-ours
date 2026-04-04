@@ -12,7 +12,7 @@ torchrun \
     train_text/train_router.py \
     --model_dir  ckpts/Z-Image-Turbo \
     --triplet_dir data/train_triplets \
-    --output_dir  train_text/checkpoints/router_version2 \
+    --output_dir  train_text/checkpoints/router_version3 \
     --loss_type   supcon \
     --temperature 0.07 \
     --batch_size  128 \
@@ -22,4 +22,4 @@ torchrun \
     --lambda_entropy 0.02 \
     --use_wandb \
     --wandb_project z-image-router \
-    --wandb_run     router_v2_multiscale_entropy
+    --wandb_run     router_v3_multiscale_entropy
