@@ -134,12 +134,11 @@ class DynamicTokenRouter(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(mid_dim, num_layers),
         )
-
-        # Initialise to route everything to the deep layer (same prior as before,
-        # avoids a huge initial noun-regularisation loss).
-        nn.init.zeros_(self.router_mlp[-1].weight)
-        nn.init.zeros_(self.router_mlp[-1].bias)
-        self.router_mlp[-1].bias.data[-2] = 5.0   # point to second-to-last layer
+        # Default PyTorch Kaiming-uniform init for weights, uniform for biases.
+        # We no longer bias toward the deep layer here because:
+        #   1. entropy loss prevents early collapse to a single layer.
+        #   2. The old bias[-2]=5.0 init made all tokens start with identical
+        #      routing distributions, killing early contrastive gradients.
 
     @classmethod
     def _scale_indices(cls, num_layers: int) -> list[int]:
