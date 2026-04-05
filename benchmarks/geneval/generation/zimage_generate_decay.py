@@ -96,6 +96,18 @@ def parse_args():
         help="exponential decay rate for all-layer fusion",
     )
     parser.add_argument(
+        "--route_start",
+        type=int,
+        default=10,
+        help="first transformer layer index (inclusive) for decay fusion range",
+    )
+    parser.add_argument(
+        "--route_end",
+        type=int,
+        default=21,
+        help="last transformer layer index (exclusive) for decay fusion range",
+    )
+    parser.add_argument(
         "--max_sequence_length",
         type=int,
         default=512,
@@ -123,7 +135,8 @@ def get_target_words(target_type):
     return set(QUANTITY_BANK + COLOR_BANK)
 
 
-def build_decay_mixed_embeds(prompts, text_encoder, tokenizer, device, decay_rate, max_sequence_length, target_words):
+def build_decay_mixed_embeds(prompts, text_encoder, tokenizer, device, decay_rate,
+                             max_sequence_length, target_words, route_start=10, route_end=21):
     messages_batch = [[{"role": "user", "content": p}] for p in prompts]
     formatted_prompts = [
         tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True, enable_thinking=True)
@@ -151,10 +164,15 @@ def build_decay_mixed_embeds(prompts, text_encoder, tokenizer, device, decay_rat
     deep_embeds = hidden_states_tuple[-2].clone()
     mixed_embeds = deep_embeds.clone()
 
-    layers_to_fuse = hidden_states_tuple[1:-1]  # skip token embedding layer and final layer
+    total_hs = len(hidden_states_tuple)
+    rs  = max(1, route_start)
+    re_ = max(rs + 1, min(route_end, total_hs - 1))
+    layers_to_fuse = hidden_states_tuple[rs:re_]
     num_layers = len(layers_to_fuse)
     weights = torch.exp(-decay_rate * torch.arange(num_layers, device=device, dtype=deep_embeds.dtype))
     weights = weights / weights.sum()
+    print(f"[Decay] layers [{rs}, {re_})  n={num_layers}  "
+          f"w[0]={weights[0]:.4f}  w[-1]={weights[-1]:.4f}")
 
     for b_idx in range(text_input_ids.shape[0]):
         valid_input_ids = text_input_ids[b_idx][prompt_masks[b_idx]]
@@ -192,6 +210,8 @@ def generate_with_decay(components, prompts, opt, device, generator, target_word
         opt.decay_rate,
         opt.max_sequence_length,
         target_words,
+        route_start=opt.route_start,
+        route_end=opt.route_end,
     )
 
     original_forward = text_encoder.forward
