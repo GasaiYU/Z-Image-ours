@@ -555,23 +555,6 @@ def routing_entropy_loss(routing_weights: torch.Tensor, attention_mask: torch.Te
     return -entropy
 
 
-def noun_regularization_loss(
-    fused_embeds: torch.Tensor,
-    deep_embeds: torch.Tensor,
-    noun_mask: torch.Tensor,
-):
-    """
-    Force noun token features to stay close to the original deep features.
-    Kept for optional use; in the default setup gradient sparsity handles this.
-    """
-    if noun_mask.sum() == 0:
-        return fused_embeds.new_tensor(0.0)
-    fused_nouns = fused_embeds[noun_mask]
-    deep_nouns  = deep_embeds[noun_mask]
-    cos_sim = F.cosine_similarity(fused_nouns, deep_nouns, dim=-1)
-    return (1.0 - cos_sim).mean()
-
-
 def layer_discriminability_loss(
     routing_weights: torch.Tensor,
     all_hs_a: tuple,
@@ -851,22 +834,18 @@ def train(args):
                 )
 
             # ---- Step 4c: Entropy Regularisation (anti-collapse) ----
-            # Penalise routing weights that are too spiky (routing entirely to
-            # one layer).  Only computed over valid target token positions so it
-            # does not fight the deep-bias on non-attribute tokens.
+            # Only penalise target token positions — avoids fighting the
+            # deep-bias on non-attribute tokens.
             loss_entropy = fused_a.new_tensor(0.0)
             if args.lambda_entropy > 0:
-                # Collect routing weights at valid anchor target positions
                 vi_list, at_list = [], []
                 for i, (vm, tidx) in enumerate(zip(vm_a.tolist(), batch['a_tidx'])):
                     if vm and 0 <= tidx < rw_a.shape[1]:
-                        vi_list.append(i % rw_a.shape[0])
+                        vi_list.append(i)
                         at_list.append(tidx)
                 if vi_list:
                     rw_tok = torch.stack([rw_a[bi, ti] for bi, ti in zip(vi_list, at_list)])
-                    # Maximise entropy  ↔  minimise negative entropy
-                    ent = -(rw_tok * (rw_tok + 1e-8).log()).sum(-1).mean()
-                    loss_entropy = -ent   # minimising this maximises entropy
+                    loss_entropy = routing_entropy_loss(rw_tok.unsqueeze(1))
 
             loss = loss_contrastive + args.lambda_disc * loss_disc + args.lambda_entropy * loss_entropy
 
