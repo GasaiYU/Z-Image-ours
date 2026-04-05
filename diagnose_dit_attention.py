@@ -106,173 +106,276 @@ def _off_diag_mean(sim):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def h1_dit_attention(prompt, count_word, components, device, out_dir,
-                     max_seq_len=512, num_steps=1, seed=42):
+                     max_seq_len=512, seed=42):
     """
-    Run one denoising step and capture cross-attention weights from the DiT.
-    Visualise which text tokens the DiT actually attends to.
+    Capture image→text attention weights from the DiT.
+
+    Architecture notes:
+      ZImageTransformer2DModel concatenates image tokens and caption tokens into
+      a single unified sequence [img_tokens | cap_tokens], then runs full
+      self-attention on it.  There is no separate cross-attention module.
+
+      dispatch_attention() calls F.scaled_dot_product_attention (or Flash
+      Attention) which does not return attention weights.  We temporarily
+      monkey-patch dispatch_attention to use manual softmax so we can capture
+      the attention map, then restore it immediately after one forward pass.
     """
-    print("\n[H1] Capturing DiT cross-attention …")
+    print("\n[H1] Capturing DiT unified-attention (img→text subblock) …")
+
+    import utils.attention as _attn_mod
+    from utils.attention import dispatch_attention as _orig_dispatch
 
     text_encoder = components["text_encoder"]
     tokenizer    = components["tokenizer"]
     transformer  = components["transformer"]
-    vae          = components["vae"]
     scheduler    = components["scheduler"]
 
     # ── Encode text ──────────────────────────────────────────────────────────
     hs, ids, mask, tokens = _encode(prompt, text_encoder, tokenizer, device, max_seq_len)
     deep_embeds = hs[-2].to(dtype=next(transformer.parameters()).dtype)
 
-    # ── Hook setup ───────────────────────────────────────────────────────────
-    attn_maps = []   # list of [heads, img_tokens, text_tokens]
+    # Count valid caption tokens
+    valid_ids   = ids[0][mask[0]]
+    valid_tokens = [tokenizer.decode([t]) for t in valid_ids.tolist()]
+    cap_len = len(valid_ids)   # number of valid caption tokens (padded to max_seq_len)
 
-    def _make_hook(name):
-        def hook(module, input, output):
-            # Most DiT implementations return (out, attn_weight) or just out.
-            # We try to capture the attention weight if present.
-            if isinstance(output, tuple) and len(output) >= 2:
-                w = output[1]
-                if w is not None and w.dim() == 4:
-                    # [B, heads, img_seq, txt_seq]
-                    attn_maps.append(w[0].detach().float().cpu())
-        return hook
+    # Storage for captured attention submatrices [heads, img_tokens, cap_tokens]
+    captured = []
+    _x_len_ref = [None]  # will be filled once we know img token count
 
-    hooks = []
-    for name, module in transformer.named_modules():
-        # look for cross-attention layers (name contains "cross" or module has
-        # both "to_k" and "to_q" child modules and is not a self-attention)
-        if "cross_attn" in name.lower() or "crossattn" in name.lower():
-            if hasattr(module, "forward"):
-                hooks.append(module.register_forward_hook(_make_hook(name)))
+    def _manual_dispatch(query, key, value, attn_mask=None,
+                         dropout_p=0.0, is_causal=False, scale=None, backend=None):
+        """Manual softmax attention that captures the attention map."""
+        # query/key/value: [B_or_seqlen, n_heads, head_dim]  (variable-length batch)
+        # For variable-length (list) input the shapes may differ; handle tensor case only.
+        if not isinstance(query, torch.Tensor):
+            return _orig_dispatch(query, key, value, attn_mask=attn_mask,
+                                  dropout_p=dropout_p, is_causal=is_causal,
+                                  scale=scale, backend=backend)
 
-    if not hooks:
-        # Fallback: hook every Attention module and filter by text-conditioning
-        for name, module in transformer.named_modules():
-            cls_name = type(module).__name__.lower()
-            if "attention" in cls_name and hasattr(module, "to_k"):
-                hooks.append(module.register_forward_hook(_make_hook(name)))
+        # query: [S, H, D]  (packed variable-length) OR [B, S, H, D]
+        # Only capture if we have both img and cap tokens (unified layer call).
+        # Heuristic: total seq len > cap_len  →  unified sequence
+        seq_len = query.shape[-3] if query.dim() == 4 else query.shape[0]
+        if seq_len > cap_len and _x_len_ref[0] is not None:
+            x_len = _x_len_ref[0]
+            # Compute attention map manually using float32
+            q = query.float()
+            k = key.float()
+            v = value.float()
 
-    # ── Single denoising step ─────────────────────────────────────────────────
+            if q.dim() == 3:  # [S, H, D] (packed)
+                # Can't easily extract sub-blocks without knowing batch offsets;
+                # skip this call.
+                pass
+            else:
+                # [B, S, H, D] → transpose to [B, H, S, D]
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                sc = scale if scale is not None else (q.shape[-1] ** -0.5)
+                scores = torch.einsum("bhid,bhjd->bhij", q, k) * sc
+                if attn_mask is not None:
+                    am = attn_mask
+                    if am.dtype == torch.bool:
+                        scores = scores.masked_fill(~am.unsqueeze(1).unsqueeze(1), float("-inf"))
+                    else:
+                        scores = scores + am
+                weights = torch.softmax(scores, dim=-1)   # [B, H, S, S]
+                # Extract img_tokens → cap_tokens subblock
+                # unified order: [img(x_len) | cap(cap_len)]
+                img_to_cap = weights[0, :, :x_len, x_len:x_len + cap_len]  # [H, img_len, cap_len]
+                captured.append(img_to_cap.detach().cpu())
+
+        return _orig_dispatch(query, key, value, attn_mask=attn_mask,
+                              dropout_p=dropout_p, is_causal=is_causal,
+                              scale=scale, backend=backend)
+
+    # ── Prepare minimal latent for one forward step ───────────────────────────
     torch.manual_seed(seed)
-    latent_size = 128  # 1024 / 8
-    latents = torch.randn(1, 16, latent_size, latent_size,
-                          device=device,
-                          dtype=next(transformer.parameters()).dtype)
+    # Use a small latent: 64×64 pix / 8 = 8×8 latent patches
+    # Actual size doesn't matter much — we only want attention statistics.
+    latent_h, latent_w = 128, 128
+    n_latent_ch = 16
+    dtype = next(transformer.parameters()).dtype
+    latents = torch.randn(1, n_latent_ch, latent_h, latent_w,
+                          device=device, dtype=dtype)
 
-    # Prepare text conditioning (monkey-patch to inject our embedding)
-    original_fwd = text_encoder.forward
-    _captured_embed = {"v": deep_embeds, "mask": mask}
+    # Monkey-patch
+    _attn_mod.dispatch_attention = _manual_dispatch
 
-    def patched_fwd(*args, **kwargs):
-        class O:
-            pass
-        o = O()
-        dummy_hs = list(hs)
-        dummy_hs[-2] = _captured_embed["v"]
-        o.hidden_states = tuple(dummy_hs)
-        return o
-
-    text_encoder.forward = patched_fwd
     try:
-        scheduler.set_timesteps(max(num_steps, 20))
-        t = scheduler.timesteps[:1]
+        scheduler.set_timesteps(20)
+        t = scheduler.timesteps[:1].to(device)
+
         with torch.no_grad():
-            _ = transformer(
+            result = transformer(
                 hidden_states=latents,
                 timestep=t,
                 encoder_hidden_states=deep_embeds,
-                encoder_attention_mask=mask.to(deep_embeds.dtype),
+                encoder_attention_mask=mask.to(dtype=dtype),
                 return_dict=False,
             )
-    except Exception as e:
-        print(f"  [warn] DiT forward failed: {e}")
-        print("  Trying alternate call signature …")
+        # After the call we know x_len from the captured data
+        if captured:
+            x_len_inferred = captured[0].shape[1]
+            _x_len_ref[0] = x_len_inferred
+    except TypeError:
+        # Try alternate signature (some pipeline wrappers differ)
         try:
             with torch.no_grad():
-                _ = transformer(
+                prompt_embeds = deep_embeds  # [1, S, D]
+                result = transformer(
                     hidden_states=latents,
-                    timestep=t.float(),
-                    encoder_hidden_states=deep_embeds,
+                    timestep=t,
+                    encoder_hidden_states=prompt_embeds,
                     return_dict=False,
                 )
-        except Exception as e2:
-            print(f"  [warn] Second attempt also failed: {e2}")
+        except Exception as e:
+            print(f"  [warn] DiT forward failed: {e}")
+    except Exception as e:
+        print(f"  [warn] DiT forward failed: {e}")
     finally:
-        text_encoder.forward = original_fwd
-        for h in hooks:
+        _attn_mod.dispatch_attention = _orig_dispatch
+
+    if not captured:
+        # The transformer uses a different internal call path (e.g. variable-length
+        # packing). Fall back: hook ZImageAttention directly.
+        print("  [info] Batch-dispatch path missed; trying ZImageAttention hook …")
+        captured2 = []
+
+        def _attn_hook(module, inp, out):
+            # inp[0]: hidden_states [B or S, seq, dim] or packed
+            # We can't recover Q,K from output alone; skip silently.
+            pass
+
+        hooks2 = []
+        from src.zimage.transformer import ZImageAttention
+        for m in transformer.modules():
+            if isinstance(m, ZImageAttention):
+                hooks2.append(m.register_forward_hook(_attn_hook))
+
+        print("  [warn] Variable-length packing prevents standard batch attention capture.")
+        print("         Writing architecture note instead.")
+        for h in hooks2:
             h.remove()
 
-    if not attn_maps:
-        print("  [warn] No cross-attention maps captured. "
-              "The DiT may not expose attention weights. Skipping H1 plot.")
-        with open(os.path.join(out_dir, "h1_note.txt"), "w") as f:
-            f.write("Cross-attention maps not accessible via hooks in this DiT implementation.\n"
-                    "H1 cannot be directly visualised.\n")
-        return
+        with open(os.path.join(out_dir, "h1_architecture_note.txt"), "w") as f:
+            f.write(
+                "ZImageTransformer2DModel Architecture Note\n"
+                "===========================================\n\n"
+                "This DiT does NOT use cross-attention.\n"
+                "Instead, image tokens and caption tokens are concatenated into\n"
+                "a unified sequence: [img_tokens | cap_tokens].\n"
+                "Full bidirectional self-attention is applied on this unified seq.\n\n"
+                "Attention weights are not returned by dispatch_attention.\n"
+                "Flash Attention / SDPA backends discard the weight matrix.\n\n"
+                "To capture attention weights, the architecture needs to be run\n"
+                "with NATIVE_MATH backend (no Flash), using packed variable-length\n"
+                "sequences. This requires patching at the varlen attention level.\n\n"
+                "Key implication for the counting problem:\n"
+                "  The text tokens live in the same sequence as image tokens.\n"
+                "  'four' token participates in self-attention with every image patch.\n"
+                "  Whether 'four' is influential depends on whether the Q/K dot\n"
+                "  products between image patches and 'four' are large.\n"
+                "  This is determined by the deep text feature (hidden_states[-2])\n"
+                "  that goes into the unified sequence.\n"
+            )
+        print(f"  [saved] {os.path.join(out_dir, 'h1_architecture_note.txt')}")
+        return None, valid_tokens
 
-    # ── Aggregate maps ────────────────────────────────────────────────────────
-    # Stack: [num_layers, heads, img_tokens, txt_tokens]
+    # ── Aggregate captured maps ───────────────────────────────────────────────
+    # captured: list of [H, img_len, cap_len] per unified layer
     try:
-        stacked = torch.stack(attn_maps, dim=0)   # [L, H, I, T]
+        stacked = torch.stack(captured, dim=0)   # [L, H, img_len, cap_len]
     except RuntimeError:
-        # different shapes across layers – average each separately
-        txt_len = attn_maps[0].shape[-1]
-        stacked = torch.stack([a for a in attn_maps if a.shape[-1] == txt_len])
+        min_cap = min(c.shape[-1] for c in captured)
+        min_img = min(c.shape[-2] for c in captured)
+        stacked = torch.stack([c[:, :min_img, :min_cap] for c in captured], dim=0)
 
-    # Mean over layers and heads → [img_tokens, txt_tokens]
-    mean_attn = stacked.mean(dim=(0, 1)).numpy()   # [I, T]
-    # Mean over image tokens → [txt_tokens]
-    per_token_attn = mean_attn.mean(axis=0)        # [T]
+    # Mean over layers and heads → [img_len, cap_len]
+    mean_attn = stacked.mean(dim=(0, 1)).numpy()
+    # Mean over image positions → [cap_len]: how much each cap token is attended to
+    per_cap_attn = mean_attn.mean(axis=0)   # [cap_len]
 
-    # Decode valid text tokens
-    valid_tokens = tokens  # already valid only
+    # Align with valid_tokens
+    n = min(len(per_cap_attn), len(valid_tokens))
+    per_cap_attn  = per_cap_attn[:n]
+    valid_tokens  = valid_tokens[:n]
 
-    # Align txt dim
-    txt_len = min(per_token_attn.shape[0], len(valid_tokens))
-    per_token_attn = per_token_attn[:txt_len]
-    valid_tokens   = valid_tokens[:txt_len]
-    token_labels   = [t.replace("▁", "").strip() or f"[{i}]"
-                      for i, t in enumerate(valid_tokens)]
-
-    # Bar chart: per-token attention
     cs, ce = _content_span(valid_tokens)
-    content_labels = token_labels[cs:ce]
-    content_attn   = per_token_attn[cs:ce]
+    content_tokens = valid_tokens[cs:ce]
+    content_attn   = per_cap_attn[cs:ce]
+    token_labels   = [t.replace("▁", "").strip() or f"[{i}]"
+                      for i, t in enumerate(content_tokens)]
 
-    count_tidx = _find_idx(valid_tokens[cs:ce], count_word)
+    count_tidx = _find_idx(content_tokens, count_word)
 
-    fig, ax = plt.subplots(figsize=(max(10, len(content_labels) * 0.45), 5))
+    # Bar chart
+    fig, ax = plt.subplots(figsize=(max(10, len(token_labels) * 0.5), 5))
     colors = ["#e74c3c" if i == count_tidx else "#3498db"
-              for i in range(len(content_labels))]
-    ax.bar(range(len(content_labels)), content_attn, color=colors)
-    ax.set_xticks(range(len(content_labels)))
-    ax.set_xticklabels(content_labels, rotation=45, ha="right", fontsize=9)
-    ax.set_ylabel("Mean Cross-Attention Weight")
+              for i in range(len(token_labels))]
+    ax.bar(range(len(token_labels)), content_attn, color=colors)
+    ax.set_xticks(range(len(token_labels)))
+    ax.set_xticklabels(token_labels, rotation=45, ha="right", fontsize=9)
+    ax.set_ylabel("Mean Attention Weight (img patches → this token, avg over layers & heads)")
     ax.set_title(
-        f"DiT Cross-Attention per Token (averaged over layers & heads)\n"
+        f"DiT Unified Self-Attention: Image Patches → Caption Token\n"
         f"prompt: \"{prompt}\"  |  red = \"{count_word}\"")
     ax.grid(axis="y", alpha=0.3)
     if count_tidx >= 0:
-        ax.annotate(f"↑ {count_word}\n({content_attn[count_tidx]:.4f})",
-                    xy=(count_tidx, content_attn[count_tidx]),
-                    xytext=(count_tidx + 1, content_attn[count_tidx] * 1.1),
-                    arrowprops=dict(arrowstyle="->"),
-                    fontsize=9, color="#c0392b")
+        ax.annotate(
+            f"↑ \"{count_word}\"\n({content_attn[count_tidx]:.4f})",
+            xy=(count_tidx, content_attn[count_tidx]),
+            xytext=(count_tidx + max(1, len(token_labels)//8),
+                    content_attn[count_tidx] * 1.15),
+            arrowprops=dict(arrowstyle="->"), fontsize=9, color="#c0392b")
     plt.tight_layout()
     p = os.path.join(out_dir, "h1_token_attention_bar.png")
     plt.savefig(p, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  [saved] {p}")
 
-    # Summary print
+    # Heatmap: [img_patches × cap_tokens] (average over heads, first layer)
+    first_layer_map = stacked[0].mean(dim=0).numpy()  # [img_len, cap_len]
+    fig2, ax2 = plt.subplots(figsize=(max(8, n * 0.5), 5))
+    im = ax2.imshow(first_layer_map[:, :n], aspect="auto", cmap="viridis")
+    ax2.set_yticks([])
+    ax2.set_xticks(range(n))
+    ax2.set_xticklabels(
+        [t.replace("▁","").strip() or f"[{i}]" for i, t in enumerate(valid_tokens[:n])],
+        rotation=45, ha="right", fontsize=7)
+    ax2.set_xlabel("Caption Token")
+    ax2.set_ylabel("Image Patch (flattened)")
+    ax2.set_title(f"Attention map — layer 0, avg over heads\n\"{prompt}\"")
     if count_tidx >= 0:
+        full_count_idx = cs + count_tidx
+        ax2.axvline(full_count_idx, color="red", linewidth=2, alpha=0.7,
+                    label=f'"{count_word}"')
+        ax2.legend(fontsize=8)
+    plt.colorbar(im, ax=ax2)
+    plt.tight_layout()
+    p2 = os.path.join(out_dir, "h1_attention_heatmap.png")
+    plt.savefig(p2, dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"  [saved] {p2}")
+
+    # Print summary
+    if count_tidx >= 0 and len(content_attn) > 0:
         rank = sorted(range(len(content_attn)),
                       key=lambda i: content_attn[i], reverse=True).index(count_tidx) + 1
-        total_mass = content_attn[count_tidx] / content_attn.sum()
-        print(f"  '{count_word}' attention: {content_attn[count_tidx]:.4f}  "
-              f"(rank {rank}/{len(content_attn)},  "
-              f"{total_mass*100:.1f}% of total content attention)")
-    return per_token_attn, token_labels
+        mass = content_attn[count_tidx] / (content_attn.sum() + 1e-8)
+        print(f"\n  *** \"{count_word}\" attention summary ***")
+        print(f"      mean weight : {content_attn[count_tidx]:.5f}")
+        print(f"      rank        : {rank} / {len(content_attn)} content tokens")
+        print(f"      % of mass   : {mass*100:.1f}%")
+        if rank > len(content_attn) // 2:
+            print("  ⚠  LOW attention rank — image patches barely look at this token.")
+            print("     Text-embedding modification alone is unlikely to fix counting.")
+        else:
+            print("  ✓  Reasonable attention rank — counting token is noticed by DiT.")
+
+    return per_cap_attn, valid_tokens
 
 
 # ──────────────────────────────────────────────────────────────────────────────
