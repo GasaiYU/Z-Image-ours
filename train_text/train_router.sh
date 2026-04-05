@@ -10,7 +10,7 @@ torchrun \
     train_text/train_router.py \
     --model_dir  ckpts/Z-Image-Turbo \
     --triplet_dir data/train_triplets \
-    --output_dir  train_text/checkpoints/router_v4_0405 \
+    --output_dir  train_text/checkpoints/router_v5_entropy \
     --loss_type   supcon \
     --temperature 0.07 \
     --temperature_init 0.2 \
@@ -18,9 +18,10 @@ torchrun \
     --mid_dim     1024 \
     --batch_size  128 \
     --epochs      20 \
-    --lambda_disc 0.0 \
+    --lambda_disc    0.0 \
     --disc_temperature 1.0 \
+    --lambda_entropy 0.02 \
     --seed        42 \
     --use_wandb \
     --wandb_project z-image-router \
-    --wandb_run     router_v4_0405
+    --wandb_run     router_v5_entropy

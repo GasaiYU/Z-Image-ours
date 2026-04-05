@@ -777,6 +777,7 @@ def train(args):
         router.train()
         epoch_loss_contrastive = 0.0
         epoch_loss_disc        = 0.0
+        epoch_loss_entropy     = 0.0
         n_batches = 0
         skipped   = 0
 
@@ -849,7 +850,25 @@ def train(args):
                     temperature=args.disc_temperature,
                 )
 
-            loss = loss_contrastive + args.lambda_disc * loss_disc
+            # ---- Step 4c: Entropy Regularisation (anti-collapse) ----
+            # Penalise routing weights that are too spiky (routing entirely to
+            # one layer).  Only computed over valid target token positions so it
+            # does not fight the deep-bias on non-attribute tokens.
+            loss_entropy = fused_a.new_tensor(0.0)
+            if args.lambda_entropy > 0:
+                # Collect routing weights at valid anchor target positions
+                vi_list, at_list = [], []
+                for i, (vm, tidx) in enumerate(zip(vm_a.tolist(), batch['a_tidx'])):
+                    if vm and 0 <= tidx < rw_a.shape[1]:
+                        vi_list.append(i % rw_a.shape[0])
+                        at_list.append(tidx)
+                if vi_list:
+                    rw_tok = torch.stack([rw_a[bi, ti] for bi, ti in zip(vi_list, at_list)])
+                    # Maximise entropy  ↔  minimise negative entropy
+                    ent = -(rw_tok * (rw_tok + 1e-8).log()).sum(-1).mean()
+                    loss_entropy = -ent   # minimising this maximises entropy
+
+            loss = loss_contrastive + args.lambda_disc * loss_disc + args.lambda_entropy * loss_entropy
 
             # ---- Step 5: Backward ----
             optimizer.zero_grad()
@@ -860,6 +879,7 @@ def train(args):
 
             epoch_loss_contrastive += loss_contrastive.item()
             epoch_loss_disc        += loss_disc.item() if args.lambda_disc > 0 else 0.0
+            epoch_loss_entropy     += loss_entropy.item() if args.lambda_entropy > 0 else 0.0
             n_batches  += 1
             global_step += 1
 
@@ -867,6 +887,7 @@ def train(args):
                 pbar.set_postfix({
                     'L_contra': f'{loss_contrastive.item():.4f}',
                     'L_disc':   f'{loss_disc.item():.4f}' if args.lambda_disc > 0 else '—',
+                    'L_ent':    f'{loss_entropy.item():.4f}' if args.lambda_entropy > 0 else '—',
                     'lr':       f'{scheduler.get_last_lr()[0]:.2e}',
                     'skipped':  skipped,
                 })
@@ -874,6 +895,7 @@ def train(args):
                     wandb.log({
                         'train/loss_contrastive': loss_contrastive.item(),
                         'train/loss_disc':        loss_disc.item() if args.lambda_disc > 0 else 0.0,
+                        'train/loss_entropy':     loss_entropy.item() if args.lambda_entropy > 0 else 0.0,
                         'train/loss_total':       loss.item(),
                         'train/lr':               scheduler.get_last_lr()[0],
                         'train/skipped':          skipped,
@@ -894,14 +916,16 @@ def train(args):
 
         # ---- End of epoch stats (rank 0 only) ----
         if is_main:
-            avg_contra = epoch_loss_contrastive / max(n_batches, 1)
-            avg_disc   = epoch_loss_disc         / max(n_batches, 1)
+            avg_contra  = epoch_loss_contrastive / max(n_batches, 1)
+            avg_disc    = epoch_loss_disc         / max(n_batches, 1)
+            avg_entropy = epoch_loss_entropy      / max(n_batches, 1)
             print(f"\n[Epoch {epoch}] avg_contrastive={avg_contra:.4f}  "
-                  f"avg_disc={avg_disc:.4f}  skipped={skipped}")
+                  f"avg_disc={avg_disc:.4f}  avg_entropy={avg_entropy:.4f}  skipped={skipped}")
             if use_wandb:
                 wandb.log({
                     'epoch/loss_contrastive': avg_contra,
                     'epoch/loss_disc':        avg_disc,
+                    'epoch/loss_entropy':     avg_entropy,
                     'epoch/epoch':            epoch,
                 }, step=global_step)
 
@@ -981,10 +1005,15 @@ def parse_args():
     parser.add_argument('--lambda_disc', type=float, default=0.1,
                         help='Weight of layer discriminability loss L_disc. '
                              'Directly supervises routing weights to concentrate on '
-                             'the most discriminative scale layer. (0 to disable)')
+                             'the most discriminative layer. (0 to disable)')
     parser.add_argument('--disc_temperature', type=float, default=1.0,
                         help='Softmax temperature for disc→target distribution '
                              '(lower = sharper target; default 1.0)')
+    parser.add_argument('--lambda_entropy', type=float, default=0.01,
+                        help='Weight of entropy regularisation on routing weights. '
+                             'Prevents routing from collapsing to a single layer '
+                             '(e.g. layer 1). Only applied to target token positions. '
+                             '(0 to disable, recommended 0.005–0.05)')
 
     # Training
     parser.add_argument('--epochs',      type=int,   default=10)
