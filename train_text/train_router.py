@@ -776,8 +776,7 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         router.train()
         epoch_loss_contrastive = 0.0
-        epoch_loss_reg         = 0.0
-        epoch_loss_entropy     = 0.0
+        epoch_loss_disc        = 0.0
         n_batches = 0
         skipped   = 0
 

@@ -18,7 +18,7 @@ torchrun \
     --mid_dim     1024 \
     --batch_size  128 \
     --epochs      20 \
-    --lambda_disc 0.1 \
+    --lambda_disc 0.0 \
     --disc_temperature 1.0 \
     --seed        42 \
     --use_wandb \
