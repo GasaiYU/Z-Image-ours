@@ -3,6 +3,11 @@ import os
 import sys
 import re
 
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from pytorch_lightning import seed_everything
@@ -197,6 +202,18 @@ def main():
     parser.add_argument("--num_seeds", type=int, default=4, help="Number of different random seeds to test")
     parser.add_argument("--start_seed", type=int, default=42, help="Starting random seed")
     parser.add_argument("--out_dir", type=str, default="routing_test_results", help="Output directory")
+    # ---- Swap similarity visualisation ----
+    parser.add_argument("--visualize_swap", action="store_true",
+                        help="Instead of generating images, plot the cosine similarity "
+                             "heatmap of counting-token fused embeddings across swap variants "
+                             "(mirrors the router swap analysis for direct comparison)")
+    parser.add_argument("--swap_prompt", type=str,
+                        default="two cats sitting on a sofa",
+                        help="Base prompt for swap analysis (must contain a counting word)")
+    parser.add_argument("--swap_targets", type=str, nargs="+",
+                        default=["one","two","three","four","five",
+                                 "six","seven","eight","nine","ten"],
+                        help="Counting words to swap in")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -210,6 +227,18 @@ def main():
     model_path = ensure_model_weights("ckpts/Z-Image-Turbo", verify=False)
     print("Loading models (this might take a moment)...")
     components = load_from_local_dir(model_path, device=device, dtype=torch.bfloat16)
+
+    # ================================================================
+    # Swap similarity visualisation mode
+    # ================================================================
+    if args.visualize_swap:
+        _run_swap_similarity(
+            args.swap_prompt, args.swap_targets, args.decay_rate,
+            args.mode, args.shallow_layer, args.alpha,
+            components["text_encoder"], components["tokenizer"],
+            device, args.out_dir,
+        )
+        return
     
     print(f"\nPreparing embeddings for prompt: '{args.prompt}'")
     mixed_embeds, baseline_embeds, _, _ = get_mixed_prompt_embeds(
@@ -321,6 +350,129 @@ def main():
     grid.save(grid_path)
     print(f"\nSaved comparison grid to: {grid_path}")
     print("Done!")
+
+def _find_counting_token_idx(tokens, counting_word):
+    """Return the first token index whose decoded text matches counting_word."""
+    for i, tok in enumerate(tokens):
+        clean = tok.lower().strip().replace(" ", "")
+        if clean == counting_word.lower() or counting_word.lower() in clean:
+            return i
+    return -1
+
+
+def _run_swap_similarity(
+    base_prompt, swap_targets, decay_rate, fusion_mode, shallow_layer, alpha,
+    text_encoder, tokenizer, device, out_dir,
+):
+    """
+    For each word in swap_targets:
+      1. Replace the detected counting word in base_prompt.
+      2. Compute fused embedding (decay / blend / scale).
+      3. Extract the fused embedding of the counting token.
+    Then plot a cosine-similarity heatmap across all variants —
+    directly comparable to the router's swap_embed_similarity.png.
+    """
+    import re as _re
+
+    # Detect which counting word is in the base prompt
+    found_word = None
+    for w in swap_targets:
+        if _re.search(r'(?<!\w)' + _re.escape(w) + r'(?!\w)', base_prompt, _re.IGNORECASE):
+            found_word = w
+            break
+    if found_word is None:
+        print(f"[Warning] No counting word found in '{base_prompt}'. Aborting.")
+        return
+    print(f"[Swap] Base counting word: '{found_word}'")
+
+    feats  = []
+    words  = []
+
+    for target in swap_targets:
+        # Replace counting word
+        prompt = _re.sub(
+            r'(?<!\w)' + _re.escape(found_word) + r'(?!\w)',
+            target, base_prompt, count=1, flags=_re.IGNORECASE,
+        )
+
+        mixed_embeds, _, input_ids, prompt_masks = get_mixed_prompt_embeds(
+            prompt, text_encoder, tokenizer, device,
+            fusion_mode=fusion_mode,
+            shallow_layer_idx=shallow_layer,
+            alpha=alpha,
+            decay_rate=decay_rate,
+        )
+        # mixed_embeds: [1, S, D]
+
+        # Decode tokens to find the counting token position
+        valid_ids  = input_ids[0][prompt_masks[0]]
+        all_tokens = [tokenizer.decode([tid]) for tid in valid_ids.tolist()]
+
+        # Find content span
+        cs, ce = 0, len(all_tokens)
+        for i, t in enumerate(all_tokens):
+            if "user" in t.lower():
+                cs = i + 1
+            elif "<|im_end|>" in t and i > cs:
+                ce = i
+                break
+
+        content_tokens = all_tokens[cs:ce]
+        tidx = _find_counting_token_idx(content_tokens, target)
+
+        if tidx == -1:
+            print(f"  [skip] counting token '{target}' not found in tokenized sequence")
+            continue
+
+        full_idx = cs + tidx
+        feat = mixed_embeds[0, full_idx, :].float().cpu().numpy()   # [D]
+        feats.append(feat)
+        words.append(target)
+        print(f"  '{target}': token_idx={full_idx}  |feat|={np.linalg.norm(feat):.2f}")
+
+    if len(feats) < 2:
+        print("[Warning] Not enough variants to plot. Aborting.")
+        return
+
+    feats = np.stack(feats)                                          # [N, D]
+    norms = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+    sim   = norms @ norms.T                                          # [N, N]
+
+    vmin = sim[~np.eye(len(words), dtype=bool)].min() - 0.01
+    fig, ax = plt.subplots(figsize=(max(6, len(words) * 0.85), max(5, len(words) * 0.75)))
+    sns.heatmap(
+        sim, annot=True, fmt=".3f", cmap="coolwarm",
+        xticklabels=words, yticklabels=words,
+        vmin=vmin, vmax=1.0, ax=ax,
+        linewidths=0.5, linecolor="gray",
+    )
+    orig_idx = words.index(found_word) if found_word in words else 0
+    ax.add_patch(plt.Rectangle((0, orig_idx), len(words), 1,
+                                fill=False, edgecolor="lime", lw=3))
+    ax.add_patch(plt.Rectangle((orig_idx, 0), 1, len(words),
+                                fill=False, edgecolor="lime", lw=3))
+    ax.set_title(
+        f"Decay Fused Embedding Cosine Similarity — Counting Token\n"
+        f'base: "{base_prompt}"  '
+        f'(mode={fusion_mode}, decay_rate={decay_rate})',
+        fontsize=10,
+    )
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+    plt.tight_layout()
+
+    os.makedirs(out_dir, exist_ok=True)
+    save_path = os.path.join(out_dir, "decay_swap_embed_similarity.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n[Saved] {save_path}")
+
+    # Console summary
+    mask = ~np.eye(len(words), dtype=bool)
+    print(f"\n  off-diagonal similarity:  "
+          f"min={sim[mask].min():.4f}  "
+          f"max={sim[mask].max():.4f}  "
+          f"mean={sim[mask].mean():.4f}")
+
 
 if __name__ == "__main__":
     main()
