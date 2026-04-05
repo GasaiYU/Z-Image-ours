@@ -175,7 +175,7 @@ def build_router_embeds(
         all_hidden_states = outputs.hidden_states   # tuple, len = num_layers + 1
 
         # Router: learned weighted sum across all transformer layers
-        fused_embeds, _routing_weights = router(
+        fused_embeds, _routing_weights, _ = router(
             all_hidden_states, attention_mask=attention_mask.bool()
         )
         # fused_embeds: [B, S, D], same dtype as LLM output (bfloat16)
