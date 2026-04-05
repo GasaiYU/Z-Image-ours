@@ -33,6 +33,14 @@ For the noun token at position p in prompt "a photo of {count} {noun}":
 We sweep α ∈ {0.1, 0.3, 0.5, 0.7, 1.0} and layer_src ∈ {8, 10, 12}
 and generate images for each setting.
 
+  Method D – Decay (weighted average over a layer range):
+    weights[i] = exp(-decay_rate * i) / Z   (i=0 is route_start, highest weight)
+    fused[p]   = Σ_i weights[i] * hidden_states[route_start+i][p]
+    final_embeds[p] = fused[p]              (hard replace with the fused vector)
+
+  Method E – Decay + Blend (softer variant):
+    final_embeds[p] = (1-α) * hidden_states[-2][p] + α * fused[p]
+
 Output
 ------
   <out_dir>/
@@ -114,24 +122,45 @@ def find_noun_indices(tokens, nouns, cs, ce):
 
 # ── embedding modification ────────────────────────────────────────────────────
 
-def build_modified_embeds(hs, noun_indices, method, layer_src, alpha):
+def build_modified_embeds(hs, noun_indices, method, layer_src, alpha,
+                          route_start=8, route_end=13, decay_rate=0.3):
     """
     Returns modified deep embeds (hidden_states[-2]).
 
-    method : "baseline" | "hard" | "blend" | "inject"
-    layer_src : int  – which layer to take noun feature from
-    alpha : float    – blend/inject strength (0=no change, 1=full replace)
+    method      : "baseline" | "hard" | "blend" | "inject" | "decay" | "decay_blend"
+    layer_src   : int   – source layer for hard/blend/inject
+    alpha       : float – blend/inject/decay_blend strength (0=no change, 1=full replace)
+    route_start : int   – first layer (inclusive) for decay range
+    route_end   : int   – last  layer (exclusive) for decay range
+    decay_rate  : float – exponential decay rate (higher = more weight on route_start)
     """
-    deep = hs[-2].clone()          # [1, S, D]
+    deep   = hs[-2].clone()          # [1, S, D]
+    device = deep.device
 
     if method == "baseline":
         return deep
 
-    src_feat = hs[layer_src]       # [1, S, D]
+    # Pre-compute decayed fused feature if needed
+    def _decay_fused(full_idx):
+        rs = max(0, route_start)
+        re = min(route_end, len(hs) - 1)
+        layers = hs[rs:re]
+        n = len(layers)
+        w = torch.exp(-decay_rate * torch.arange(n, device=device,
+                                                  dtype=torch.float32))
+        w = w / w.sum()
+        fused = torch.zeros_like(deep[0, full_idx, :], dtype=torch.float32)
+        for i, lyr in enumerate(layers):
+            fused += w[i] * lyr[0, full_idx, :].float()
+        return fused.to(deep.dtype)
 
     for full_idx, _ in noun_indices:
-        d = deep[0, full_idx, :]           # [D]
-        s = src_feat[0, full_idx, :].to(d.dtype)  # [D]
+        d = deep[0, full_idx, :]                          # [D]
+
+        if method in ("decay", "decay_blend"):
+            s = _decay_fused(full_idx)                    # weighted avg over range
+        else:
+            s = hs[layer_src][0, full_idx, :].to(d.dtype)
 
         if method == "hard":
             deep[0, full_idx, :] = s
@@ -140,10 +169,16 @@ def build_modified_embeds(hs, noun_indices, method, layer_src, alpha):
             deep[0, full_idx, :] = (1 - alpha) * d + alpha * s
 
         elif method == "inject":
-            # Preserve the deep norm; inject the direction from shallow layer
             s_norm = s / (s.norm() + 1e-8)
-            d_norm = d.norm()
-            deep[0, full_idx, :] = d + alpha * s_norm * d_norm
+            deep[0, full_idx, :] = d + alpha * s_norm * d.norm()
+
+        elif method == "decay":
+            # Hard-replace with the decayed weighted average
+            deep[0, full_idx, :] = s
+
+        elif method == "decay_blend":
+            # Softly blend decayed feature into the deep embedding
+            deep[0, full_idx, :] = (1 - alpha) * d + alpha * s
 
     return deep
 
@@ -258,15 +293,23 @@ def run(args):
     print(f"Total LLM layers (including embedding): {len(hs)}")
 
     # ── define experiment configs ──────────────────────────────────────────
-    configs = [("baseline", 0, 0.0)]  # (method, layer_src, alpha)
+    # Each entry: (method, layer_src, alpha, route_start, route_end, decay_rate)
+    # layer_src / route_start / route_end / decay_rate only used by relevant methods
+    configs = [("baseline", 0, 0.0, 0, 0, 0.0)]
 
     for lyr in args.src_layers:
-        configs.append(("hard", lyr, 1.0))
+        configs.append(("hard", lyr, 1.0, 0, 0, 0.0))
 
     for lyr in args.src_layers:
         for a in args.alphas:
-            configs.append(("blend",  lyr, a))
-            configs.append(("inject", lyr, a))
+            configs.append(("blend",  lyr, a, 0, 0, 0.0))
+            configs.append(("inject", lyr, a, 0, 0, 0.0))
+
+    # Decay configs: sweep decay_rate over fixed route range
+    for dr in args.decay_rates:
+        configs.append(("decay",       0, 1.0, args.route_start, args.route_end, dr))
+        for a in args.alphas:
+            configs.append(("decay_blend", 0, a,   args.route_start, args.route_end, dr))
 
     print(f"\n{len(configs)} configurations × {args.num_seeds} seeds "
           f"= {len(configs) * args.num_seeds} images\n")
@@ -274,20 +317,26 @@ def run(args):
     # ── generate ───────────────────────────────────────────────────────────
     all_images = []   # (label, seed, pil_image)
 
-    for method, lyr, alpha in configs:
+    for method, lyr, alpha, rs, re, dr in configs:
         if method == "baseline":
             label = "baseline"
         elif method == "hard":
             label = f"hard_L{lyr}"
         elif method == "blend":
             label = f"blend_L{lyr}_a{alpha:.1f}"
-        else:
+        elif method == "inject":
             label = f"inject_L{lyr}_a{alpha:.1f}"
+        elif method == "decay":
+            label = f"decay_L{rs}-{re}_dr{dr}"
+        else:  # decay_blend
+            label = f"decayblend_L{rs}-{re}_dr{dr}_a{alpha:.1f}"
 
         sub_dir = os.path.join(args.out_dir, label)
         os.makedirs(sub_dir, exist_ok=True)
 
-        embeds = build_modified_embeds(hs, noun_indices, method, lyr, alpha)
+        embeds = build_modified_embeds(hs, noun_indices, method, lyr, alpha,
+                                       route_start=rs, route_end=re,
+                                       decay_rate=dr)
 
         for seed in range(args.start_seed, args.start_seed + args.num_seeds):
             print(f"  [{label}] seed={seed} …", end=" ", flush=True)
@@ -333,7 +382,7 @@ def run(args):
 
     # Row labels + images
     img_idx = 0
-    for i, (method, lyr, alpha) in enumerate(configs):
+    for i, (method, lyr, alpha, rs, re, dr) in enumerate(configs):
         if method == "baseline":
             row_lbl = "BASELINE"
             row_color = (100, 200, 100)
@@ -343,9 +392,15 @@ def run(args):
         elif method == "blend":
             row_lbl = f"blend L{lyr} α={alpha:.1f}"
             row_color = (100, 150, 220)
-        else:
+        elif method == "inject":
             row_lbl = f"inject L{lyr} α={alpha:.1f}"
             row_color = (220, 160, 60)
+        elif method == "decay":
+            row_lbl = f"decay [{rs},{re}) dr={dr}"
+            row_color = (180, 100, 220)
+        else:  # decay_blend
+            row_lbl = f"decay_blend [{rs},{re}) dr={dr} α={alpha:.1f}"
+            row_color = (220, 180, 100)
 
         y_top = header + pad + i * (cell + pad)
         draw.text((pad, y_top + cell // 2 - 8), row_lbl,
@@ -361,56 +416,32 @@ def run(args):
     grid.save(grid_path)
     print(f"[saved] {grid_path}")
 
-    # ── per-seed spotlight (baseline vs best configs) ───────────────────────
-    spot_configs = [c for c in configs if c[0] == "baseline"]
-    for lyr in args.src_layers:
-        spot_configs.append(("hard",   lyr, 1.0))
-        spot_configs.append(("blend",  lyr, 0.5))
-        spot_configs.append(("inject", lyr, 0.5))
-
-    spot_images = []
-    spot_labels = []
-    for seed in range(args.start_seed, args.start_seed + args.num_seeds):
-        for method, lyr, alpha in spot_configs:
-            if method == "baseline":
-                lbl = "baseline"
-            elif method == "hard":
-                lbl = f"hard L{lyr}"
-            elif method == "blend":
-                lbl = f"blend L{lyr} a0.5"
-            else:
-                lbl = f"inject L{lyr} a0.5"
-            # Find matching image
-            for label, s, img in all_images:
-                if s == seed and label.startswith(
-                        lbl.replace(" ", "_").replace(".", "").replace("a0.5", "a0.5")):
-                    spot_images.append(img); spot_labels.append(f"{lbl}\ns={seed}"); break
-            else:
-                # re-generate if not found
-                for label, s, img in all_images:
-                    if s == seed and method in label and (
-                            method == "baseline" or f"L{lyr}" in label):
-                        spot_images.append(img)
-                        spot_labels.append(f"{lbl}\ns={seed}")
-                        break
-
     print(f"All outputs in: {args.out_dir}/")
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--prompt",      default="a photo of four computer keyboards")
-    p.add_argument("--nouns",       nargs="+", default=["computer", "keyboards"],
+    p.add_argument("--prompt",       default="a photo of four computer keyboards")
+    p.add_argument("--nouns",        nargs="+", default=["computer", "keyboards"],
                    help="Words whose tokens will be modified (supports multiple)")
-    p.add_argument("--model_dir",   default="ckpts/Z-Image-Turbo")
-    p.add_argument("--out_dir",     default="noun_injection_results")
-    p.add_argument("--src_layers",  type=int, nargs="+", default=[8, 10, 12],
-                   help="Which LLM layers to take the noun feature from")
-    p.add_argument("--alphas",      type=float, nargs="+", default=[0.3, 0.5, 0.7],
-                   help="Blend / inject strengths")
-    p.add_argument("--num_seeds",   type=int, default=4)
-    p.add_argument("--start_seed",  type=int, default=42)
-    p.add_argument("--max_seq_len", type=int, default=512)
+    p.add_argument("--model_dir",    default="ckpts/Z-Image-Turbo")
+    p.add_argument("--out_dir",      default="noun_injection_results")
+    # single-layer methods
+    p.add_argument("--src_layers",   type=int, nargs="+", default=[8, 10, 12],
+                   help="Source layers for hard/blend/inject methods")
+    p.add_argument("--alphas",       type=float, nargs="+", default=[0.3, 0.5, 0.7],
+                   help="Blend / inject / decay_blend strengths")
+    # decay method
+    p.add_argument("--route_start",  type=int, default=8,
+                   help="First layer (inclusive) for decay range")
+    p.add_argument("--route_end",    type=int, default=13,
+                   help="Last layer (exclusive) for decay range, e.g. 13 = layers 8-12")
+    p.add_argument("--decay_rates",  type=float, nargs="+", default=[0.1, 0.3, 0.5],
+                   help="Exponential decay rates for decay/decay_blend methods")
+    # generation
+    p.add_argument("--num_seeds",    type=int, default=4)
+    p.add_argument("--start_seed",   type=int, default=42)
+    p.add_argument("--max_seq_len",  type=int, default=512)
     return p.parse_args()
 
 
