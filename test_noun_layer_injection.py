@@ -92,21 +92,24 @@ def content_span(tokens):
     return cs, ce
 
 
-def find_noun_indices(tokens, noun, cs, ce):
+def find_noun_indices(tokens, nouns, cs, ce):
     """
-    Find the full-sequence indices of all sub-tokens that belong to `noun`.
-    Returns list of (full_idx, sub_token).
+    Find the full-sequence indices of all sub-tokens that belong to ANY word in
+    `nouns` (a list of strings, e.g. ["computer", "keyboards"]).
+    Returns list of (full_idx, sub_token), deduplicated and sorted.
     """
     content = tokens[cs:ce]
-    hits = []
-    for i, t in enumerate(content):
-        clean = t.lower().strip().replace(" ", "").replace("▁", "")
-        if clean and (clean in noun.lower() or noun.lower() in clean):
-            hits.append((cs + i, t))
+    hits = {}
+    for noun in nouns:
+        for i, t in enumerate(content):
+            clean = t.lower().strip().replace(" ", "").replace("▁", "")
+            if clean and (clean in noun.lower() or noun.lower() in clean):
+                full_idx = cs + i
+                hits[full_idx] = t   # deduplicate by index
     if not hits:
         # Fallback: last content token
-        hits = [(ce - 1, tokens[ce - 1])]
-    return hits
+        hits = {ce - 1: tokens[ce - 1]}
+    return sorted(hits.items())   # [(full_idx, sub_token), ...]
 
 
 # ── embedding modification ────────────────────────────────────────────────────
@@ -248,9 +251,9 @@ def run(args):
     hs, tokens, ids, mask = encode_all_layers(
         args.prompt, te, tk, device, args.max_seq_len)
     cs, ce = content_span(tokens)
-    noun_indices = find_noun_indices(tokens, args.noun, cs, ce)
+    noun_indices = find_noun_indices(tokens, args.nouns, cs, ce)
 
-    print(f"Noun '{args.noun}' found at full-sequence positions: "
+    print(f"Target nouns {args.nouns} found at full-sequence positions: "
           f"{[f'{idx}({t.strip()!r})' for idx, t in noun_indices]}")
     print(f"Total LLM layers (including embedding): {len(hs)}")
 
@@ -318,7 +321,7 @@ def run(args):
         font_big = font_small = ImageFont.load_default()
 
     # Title
-    draw.text((pad, 8), f"Noun Layer Injection: '{args.prompt}'  noun='{args.noun}'",
+    draw.text((pad, 8), f"Noun Layer Injection: '{args.prompt}'  nouns={args.nouns}",
               fill=(220, 220, 220), font=font_big)
 
     # Column headers (seeds)
@@ -397,8 +400,8 @@ def run(args):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--prompt",      default="a photo of four computer keyboards")
-    p.add_argument("--noun",        default="keyboards",
-                   help="The noun whose token will be modified")
+    p.add_argument("--nouns",       nargs="+", default=["computer", "keyboards"],
+                   help="Words whose tokens will be modified (supports multiple)")
     p.add_argument("--model_dir",   default="ckpts/Z-Image-Turbo")
     p.add_argument("--out_dir",     default="noun_injection_results")
     p.add_argument("--src_layers",  type=int, nargs="+", default=[8, 10, 12],
