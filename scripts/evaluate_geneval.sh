@@ -1,8 +1,8 @@
 #!/bin/bash
 export CUDA_LAUNCH_BLOCKING=1
 # Define directories
-IMAGEDIR="outputs/geneval_router_counting_seed_42"
-OUTFILE="outputs/geneval_router_counting_seed_42/evaluation_results.jsonl"
+IMAGEDIR="outputs/geneval_layer_avg_all_seed42"
+OUTFILE="outputs/geneval_layer_avg_all_seed42/evaluation_results.jsonl"
 MODEL_PATH="/mmu-vcg/gaomingju/workspace/T2I/Z-Image-ours/benchmarks/geneval/pretrained"
 # Use Mask2Former on GPU
 DETECTOR_MODEL="mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco"
