@@ -277,11 +277,17 @@ def part3_decay_weight_curves(decay_configs, out_dir):
     cmap = plt.get_cmap("tab10")
 
     for i, (rs, re_, dr) in enumerate(decay_configs):
-        n = re_ - rs
-        w = np.exp(-dr * np.arange(n))
-        w = w / w.sum()
-        x = np.arange(rs, re_)
-        label = f"L[{rs},{re_}) rate={dr}  (peak→layer {rs}, tail→{re_-1})"
+        if dr is None:
+            # Hard-replace: all weight on rs
+            x = np.array([rs])
+            w = np.array([1.0])
+            label = f"hard-replace layer {rs}"
+        else:
+            n = re_ - rs
+            w = np.exp(-dr * np.arange(n))
+            w = w / w.sum()
+            x = np.arange(rs, re_)
+            label = f"L[{rs},{re_}) rate={dr}  (peak→layer {rs}, tail→{re_-1})"
         ax.plot(x, w, marker="o", markersize=4, linewidth=1.8,
                 color=cmap(i % 10), label=label)
 
@@ -302,10 +308,15 @@ def part3_decay_weight_curves(decay_configs, out_dir):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_fused(hs, token_idx, route_start, route_end, decay_rate, device):
-    """Compute decay-fused feature for one token."""
+    """Compute decay-fused feature for one token.
+    decay_rate=None means hard-replace with the shallowest layer in range.
+    """
     total = len(hs)
     rs  = max(1, route_start)
     re_ = max(rs + 1, min(route_end, total - 1))
+    if decay_rate is None:
+        # Hard-replace: use only route_start layer
+        return hs[rs][0, token_idx, :].float().cpu().numpy()
     layers = hs[rs:re_]
     n = len(layers)
     w = torch.exp(-decay_rate * torch.arange(n, dtype=torch.float32, device=device))
@@ -339,8 +350,9 @@ def part4_fused_confusion(count_word, text_encoder, tokenizer, device,
     words = list(all_hs.keys())
 
     # One subplot per decay config + one for the deep baseline
-    configs_with_baseline = [("baseline", None, None, None)] + \
-                            [(f"L[{rs},{re_})\nrate={dr}", rs, re_, dr)
+    configs_with_baseline = [("baseline\n(layer -2)", None, None, None)] + \
+                            [(f"hard-replace\nlayer {rs}" if dr is None
+                              else f"L[{rs},{re_})\nrate={dr}", rs, re_, dr)
                              for rs, re_, dr in decay_configs]
     n_plots = len(configs_with_baseline)
     ncols   = min(3, n_plots)
@@ -436,7 +448,7 @@ def part5_fusion_delta(count_word, text_encoder, tokenizer, device,
             base  = all_deep[w]
             l2_dists.append(np.linalg.norm(fused - base))
             cos_sims.append(_cosine(fused, base))
-        label = f"L[{rs},{re_}) rate={dr}"
+        label = f"hard-replace L{rs}" if dr is None else f"L[{rs},{re_}) rate={dr}"
         x = np.arange(len(words))
         ax_l2.bar(x + i * 0.15, l2_dists, width=0.13,
                   color=cmap(i % 10), label=label, alpha=0.8)
@@ -526,7 +538,8 @@ def part6_summary_table(count_word, text_encoder, tokenizer, device,
             for w in words
         ])
         mn, mi, mx = sim_stats(feats)
-        rows.append((f"decay L[{rs},{re_}) rate={dr}", rs, re_, dr, f"{mn:.4f}", f"{mi:.4f}", f"{mx:.4f}"))
+        cfg_name = f"hard-replace layer {rs}" if dr is None else f"decay L[{rs},{re_}) rate={dr}"
+        rows.append((cfg_name, rs, re_, str(dr), f"{mn:.4f}", f"{mi:.4f}", f"{mx:.4f}"))
 
     header = f"{'Config':<40} {'rs':>4} {'re':>4} {'dr':>6}  {'mean':>8} {'min':>8} {'max':>8}"
     lines  = [header, "-" * len(header)]
@@ -588,8 +601,11 @@ def main():
         (10, 21, 0.05),  # mid-range, nearly uniform
         (10, 21, 0.2),   # mid-range, moderate
         (10, 21, 0.5),   # mid-range, strong (biased toward layer 10)
+        (10, 21, 1.0),   # very strong → almost hard-select layer 10
+        (10, 21, 2.0),   # extreme → effectively layer 10 only
         ( 8, 20, 0.2),   # slightly wider mid-range
         ( 5, 15, 0.2),   # shallower mid-range
+        (10, 11, None),  # hard-replace layer 10 (upper bound of any decay)
     ]
 
     # ── Run all parts ──────────────────────────────────────────────────────

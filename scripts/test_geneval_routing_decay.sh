@@ -4,6 +4,6 @@ python benchmarks/geneval/generation/zimage_generate_decay.py \
   --tags counting \
   --decay_rate 0.2 \
   --route_start 10 \
-  --route_end 21 \
+  --route_end 11 \
   --target_type quantity \
   --seed 42
