@@ -10,7 +10,7 @@ torchrun \
     train_text/train_router.py \
     --model_dir  ckpts/Z-Image-Turbo \
     --triplet_dir data/train_triplets \
-    --output_dir  train_text/checkpoints/router_v4 \
+    --output_dir  train_text/checkpoints/router_v4_0405 \
     --loss_type   supcon \
     --temperature 0.07 \
     --temperature_init 0.2 \
@@ -23,4 +23,4 @@ torchrun \
     --seed        42 \
     --use_wandb \
     --wandb_project z-image-router \
-    --wandb_run     router_v4_deep_init
+    --wandb_run     router_v4_0405
