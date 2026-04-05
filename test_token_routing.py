@@ -40,7 +40,9 @@ def find_target_token_indices(tokens, target_words):
                 break
     return indices
 
-def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode="blend", shallow_layer_idx=12, alpha=0.3, decay_rate=0.1, scale_factor=2.0, max_sequence_length=512):
+def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode="blend",
+                            shallow_layer_idx=12, alpha=0.3, decay_rate=0.1, scale_factor=2.0,
+                            max_sequence_length=512, route_start=1, route_end=None):
     """
     Extract token embeddings, blending specific tokens (colors/quantities) 
     with features from a shallow layer, using a weighted sum of all layers,
@@ -118,23 +120,25 @@ def get_mixed_prompt_embeds(prompt, text_encoder, tokenizer, device, fusion_mode
             mixed_embeds[0, idx, :] = (1 - alpha) * deep_embeds[0, idx, :] + alpha * shallow_embeds[0, idx, :]
             
     elif fusion_mode == "decay":
-        # All-layer Weighted Sum: Exponential decay weights (shallow gets more, deep gets less)
-        # We use layers 1 to -2 (skipping layer 0 which is raw embeddings)
-        layers_to_fuse = hidden_states_tuple[1:-1]
-        num_layers = len(layers_to_fuse)
-        
-        # Calculate weights: w_i = exp(-decay_rate * i)
-        # i=0 (layer 1) gets highest weight, i=30 (layer -2) gets lowest weight
-        weights = torch.exp(-decay_rate * torch.arange(num_layers, device=device, dtype=deep_embeds.dtype))
-        weights = weights / weights.sum() # Normalize so they sum to 1
-        
-        print(f"  [Debug] Applying All-Layer Decay (rate={decay_rate}).")
-        print(f"          Weight for Layer 1: {weights[0]:.4f}, Layer {num_layers}: {weights[-1]:.4f}")
-        
+        # Weighted Sum with exponential decay over [route_start, route_end).
+        # i=0 (shallowest in range) gets highest weight; last gets lowest.
+        total_hs = len(hidden_states_tuple)  # num_layers + 1
+        rs = max(1, route_start)
+        re_ = min(route_end if route_end is not None else total_hs - 1, total_hs - 1)
+        layers_to_fuse = hidden_states_tuple[rs:re_]
+        num_fuse = len(layers_to_fuse)
+
+        weights = torch.exp(-decay_rate * torch.arange(num_fuse, device=device, dtype=deep_embeds.dtype))
+        weights = weights / weights.sum()
+
+        print(f"  [Debug] Applying Decay over layers [{rs}, {re_}) (n={num_fuse}, rate={decay_rate}).")
+        print(f"          Weight for Layer {rs}: {weights[0]:.4f},  Layer {re_-1}: {weights[-1]:.4f}")
+
         for idx in target_indices_in_full:
             token_fused = torch.zeros_like(deep_embeds[0, idx, :])
             for i, layer_embeds in enumerate(layers_to_fuse):
                 token_fused += weights[i] * layer_embeds[0, idx, :]
+            mixed_embeds[0, idx, :] = token_fused
     elif fusion_mode == "scale":
         # Scale Up Deep Features: Just multiply the target tokens' deep features by a scalar
         print(f"  [Debug] Applying Feature Scaling (factor={scale_factor}) to target tokens.")
@@ -198,6 +202,10 @@ def main():
     parser.add_argument("--shallow_layer", type=int, default=4, help="Which shallow layer to use (for 'blend' mode)")
     parser.add_argument("--alpha", type=float, default=0.7, help="Soft blending alpha (for 'blend' mode)")
     parser.add_argument("--decay_rate", type=float, default=0.1, help="Exponential decay rate (for 'decay' mode)")
+    parser.add_argument("--route_start", type=int, default=10,
+                        help="First layer index (inclusive) to include in decay range (default: 10)")
+    parser.add_argument("--route_end", type=int, default=21,
+                        help="Last layer index (exclusive) to include in decay range (default: 21, i.e. layers 10-20)")
     parser.add_argument("--scale_factor", type=float, default=2.0, help="Multiplier for target tokens (for 'scale' mode)")
     parser.add_argument("--num_seeds", type=int, default=4, help="Number of different random seeds to test")
     parser.add_argument("--start_seed", type=int, default=42, help="Starting random seed")
@@ -237,6 +245,7 @@ def main():
             args.mode, args.shallow_layer, args.alpha,
             components["text_encoder"], components["tokenizer"],
             device, args.out_dir,
+            route_start=args.route_start, route_end=args.route_end,
         )
         return
     
@@ -250,7 +259,9 @@ def main():
         shallow_layer_idx=args.shallow_layer,
         alpha=args.alpha,
         decay_rate=args.decay_rate,
-        scale_factor=args.scale_factor
+        scale_factor=args.scale_factor,
+        route_start=args.route_start,
+        route_end=args.route_end,
     )
     
     baseline_images = []
@@ -312,8 +323,8 @@ def main():
         ours_label = f"Ours (Blend Layer {args.shallow_layer}, alpha {args.alpha})"
         out_name = f"comparison_blend_layer{args.shallow_layer}_alpha{args.alpha}.png"
     elif args.mode == "decay":
-        ours_label = f"Ours (All-Layer Decay, rate {args.decay_rate})"
-        out_name = f"comparison_decay_rate{args.decay_rate}.png"
+        ours_label = f"Ours (Decay layers {args.route_start}-{args.route_end-1}, rate {args.decay_rate})"
+        out_name = f"comparison_decay_L{args.route_start}-{args.route_end-1}_rate{args.decay_rate}.png"
     else:
         ours_label = f"Ours (Scale Deep Features, factor {args.scale_factor})"
         out_name = f"comparison_scale_factor{args.scale_factor}.png"
@@ -363,6 +374,7 @@ def _find_counting_token_idx(tokens, counting_word):
 def _run_swap_similarity(
     base_prompt, swap_targets, decay_rate, fusion_mode, shallow_layer, alpha,
     text_encoder, tokenizer, device, out_dir,
+    route_start=1, route_end=None,
 ):
     """
     For each word in swap_targets:
@@ -401,6 +413,8 @@ def _run_swap_similarity(
             shallow_layer_idx=shallow_layer,
             alpha=alpha,
             decay_rate=decay_rate,
+            route_start=route_start,
+            route_end=route_end,
         )
         # mixed_embeds: [1, S, D]
 

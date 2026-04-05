@@ -97,47 +97,49 @@ def all_gather_strings(str_list: list) -> list:
 class DynamicTokenRouter(nn.Module):
     """
     Lightweight MLP: takes h_1 (shallowest transformer layer) as input and
-    outputs routing weights over ALL transformer layers hidden_states[1:-1].
+    outputs routing weights over a restricted mid-layer range [route_start, route_end).
 
     Design rationale
     ----------------
     Input — h_1 only:
       h_1 carries the strongest *lexical identity* signal.  For counting words
       (two/three/four…), h_1 similarities are ~0.84, far more discriminative
-      than deeper layers (0.93~0.99).  Using fewer, more discriminative input
-      features also makes the MLP easier to train (D vs 4D input).
+      than deeper layers (0.93~0.99).
 
-    Output — all transformer layers hidden_states[1:-1]:
-      Routing over all layers gives maximum expressiveness for the fused
-      embedding.  The fused embedding is still a convex combination of real LLM
-      features, so it stays in-distribution for the DiT.
+    Output — layers [route_start, route_end):
+      Restricting to mid-layers (default 10–20) avoids two failure modes:
+        • Layer 1 collapse: layer 1 is most discriminative but too raw for DiT
+          (DiT was trained on hidden_states[-2], i.e. a deep layer).
+        • Deep-layer saturation: layers 25+ are nearly identical for counting
+          words (cos_sim ~0.99) and carry no discriminative signal.
+      Layers 10–20 have good discriminability (~0.90–0.95) while remaining
+      semantically rich enough for the DiT to interpret correctly.
+      This physical constraint replaces entropy regularisation entirely.
 
-    Initialisation — deep-biased:
-      The output layer bias is set so that the softmax initially puts all weight
-      on hidden_states[-2] (the layer the pipeline uses by default).  At t=0,
-      fused_embeds == hidden_states[-2] for every token — zero change from
-      baseline.  The contrastive loss then shifts routing only for the target
-      token positions it supervises; all other positions receive no gradient and
-      stay at the deep initialisation.  No explicit noun-regularisation needed.
-
-    E2E inference:
-      Wrap the frozen LLM + this router in RouterTextEncoder (below) and use
-      it as the text_encoder in the pipeline.  No monkey-patching.
+    Initialisation — deep-biased within the range:
+      bias[-1] = +5 → softmax ≈ 1 on hidden_states[route_end-1] (deepest in
+      range). At t=0, fused ≈ hidden_states[route_end-1] for every token.
+      SupCon shifts routing only for target-token positions; all other tokens
+      receive no gradient and stay at the deep-within-range initialisation.
     """
 
-    def __init__(self, hidden_size: int, num_layers: int, mid_dim: int = 1024):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_layers: int,
+        mid_dim: int = 1024,
+        route_start: int = 10,
+        route_end: int = 21,
+    ):
         super().__init__()
         self.num_layers  = num_layers
         self.hidden_size = hidden_size
 
-        # Route over hidden_states[1 : num_layers]  (= [1:-1] of the full tuple)
-        # That is every transformer layer EXCEPT the raw embedding (index 0)
-        # and the very last layer (index num_layers, not used by the pipeline).
-        # n_route == num_layers - 1
-        # routing_weights[..., -1] maps to hidden_states[num_layers - 1] == hidden_states[-2]
-        self.n_route = num_layers - 1
+        # Clamp range to valid transformer layer indices [1, num_layers-1]
+        self.route_start = max(1, min(route_start, num_layers - 2))
+        self.route_end   = max(self.route_start + 1, min(route_end, num_layers))
+        self.n_route     = self.route_end - self.route_start  # e.g. 11 for [10,21)
 
-        # Input: h_1 (hidden_states[1]), L2-normalised → shape [B, S, D]
         in_dim = hidden_size
         self.router_mlp = nn.Sequential(
             nn.Linear(in_dim, mid_dim),
@@ -149,10 +151,8 @@ class DynamicTokenRouter(nn.Module):
             nn.Linear(mid_dim // 2, self.n_route),
         )
 
-        # Deep-biased init:
-        #   bias[-1] = +5  →  softmax → weight ≈ 1 on hidden_states[-2]
-        #   all other biases = 0  →  weight ≈ 0
-        # Last-layer weight is near-zero so the bias dominates at init.
+        # Deep-biased init within the routing range:
+        #   bias[-1] = +5  →  weight ≈ 1 on hidden_states[route_end-1]
         nn.init.zeros_(self.router_mlp[-1].bias)
         self.router_mlp[-1].bias.data[-1] = 5.0
         nn.init.normal_(self.router_mlp[-1].weight, std=0.01)
@@ -166,20 +166,16 @@ class DynamicTokenRouter(nn.Module):
         Returns:
             fused_embeds    : [B, S, D]           weighted sum over routing layers
             routing_weights : [B, S, n_route]     softmax weights
-            h1              : [B, S, D]            raw h_1 features (for L_disc)
+            h1              : [B, S, D]            raw h_1 features
         """
         h1 = all_hidden_states[1].float()                    # [B, S, D]
-
-        # L2-normalise: removes magnitude differences between contexts so
-        # the MLP sees pure directional (lexical) information from layer 1.
         decision_feat   = F.normalize(h1.detach(), dim=-1)  # [B, S, D]
 
         routing_logits  = self.router_mlp(decision_feat)    # [B, S, n_route]
         routing_weights = F.softmax(routing_logits, dim=-1) # [B, S, n_route]
 
-        # Weighted sum over hidden_states[1 : num_layers]
-        # (= hidden_states[1:-1] of the full (num_layers+1)-tuple)
-        route_layers = all_hidden_states[1 : self.num_layers]  # length = n_route
+        # Weighted sum over hidden_states[route_start : route_end]
+        route_layers = all_hidden_states[self.route_start : self.route_end]
         stacked = torch.stack([l.float() for l in route_layers], dim=2)  # [B,S,n_route,D]
         rw = routing_weights.to(stacked.dtype).unsqueeze(-1)              # [B,S,n_route,1]
         fused_embeds = (stacked * rw).sum(dim=2)                          # [B, S, D]
@@ -715,7 +711,10 @@ def train(args):
     del dummy_out
 
     # ---- Build router ----
-    router = DynamicTokenRouter(hidden_size=hidden_size, num_layers=num_layers, mid_dim=args.mid_dim).to(device)
+    router = DynamicTokenRouter(
+        hidden_size=hidden_size, num_layers=num_layers, mid_dim=args.mid_dim,
+        route_start=args.route_start, route_end=args.route_end,
+    ).to(device)
     if world_size > 1:
         router = DDP(router, device_ids=[local_rank])
     n_params = sum(p.numel() for p in router.parameters())
@@ -890,6 +889,8 @@ def train(args):
                     'hidden_size': hidden_size,
                     'num_layers': num_layers,
                     'mid_dim': args.mid_dim,
+                    'route_start': args.route_start,
+                    'route_end': args.route_end,
                 }, ckpt_path)
                 print(f"\n[Checkpoint] Saved -> {ckpt_path}")
 
@@ -920,6 +921,8 @@ def train(args):
                     'hidden_size': hidden_size,
                     'num_layers': num_layers,
                     'mid_dim': args.mid_dim,
+                    'route_start': args.route_start,
+                    'route_end': args.route_end,
                     'best_loss': best_loss,
                 }, best_path)
                 print(f"[Best] New best loss={best_loss:.4f} -> {best_path}")
@@ -935,6 +938,8 @@ def train(args):
             'hidden_size': hidden_size,
             'num_layers': num_layers,
             'mid_dim': args.mid_dim,
+            'route_start': args.route_start,
+            'route_end': args.route_end,
         }, final_path)
         print(f"\n[Done] Final checkpoint saved -> {final_path}")
         if use_wandb:
@@ -965,6 +970,10 @@ def parse_args():
     parser.add_argument('--mid_dim', type=int, default=1024,
                         help='Hidden dimension of Router MLP (default raised to 1024 to handle '
                              '4×hidden_size=14336 input without over-compressing)')
+    parser.add_argument('--route_start', type=int, default=10,
+                        help='First transformer layer index included in routing range (inclusive)')
+    parser.add_argument('--route_end', type=int, default=21,
+                        help='Last transformer layer index included in routing range (exclusive)')
     parser.add_argument('--max_length', type=int, default=128,
                         help='Max tokenizer sequence length')
     parser.add_argument('--use_chat_template', action='store_true',

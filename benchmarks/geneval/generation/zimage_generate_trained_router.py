@@ -103,8 +103,13 @@ def load_router(ckpt_path: str, device) -> DynamicTokenRouter:
     hidden_size = ckpt["hidden_size"]
     num_layers  = ckpt["num_layers"]
     mid_dim     = ckpt["mid_dim"]
+    route_start = ckpt.get("route_start", 1)    # backwards-compat: old ckpts routed from layer 1
+    route_end   = ckpt.get("route_end", num_layers)
 
-    router = DynamicTokenRouter(hidden_size=hidden_size, num_layers=num_layers, mid_dim=mid_dim)
+    router = DynamicTokenRouter(
+        hidden_size=hidden_size, num_layers=num_layers, mid_dim=mid_dim,
+        route_start=route_start, route_end=route_end,
+    )
 
     # Handle checkpoints saved from DDP (keys may have "module." prefix)
     state_dict = ckpt["router_state_dict"]

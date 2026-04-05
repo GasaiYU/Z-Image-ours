@@ -388,7 +388,8 @@ def run_swap_analysis(
     return variants, found_word
 
 
-def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir):
+def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir,
+                      route_start=1, route_end=None):
     """
     Three figures:
     1. Routing-weight curves per variant (one line per count word).
@@ -396,12 +397,14 @@ def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir):
     3. Peak-layer bar chart per variant.
     """
     os.makedirs(out_dir, exist_ok=True)
+    if route_end is None:
+        route_end = num_layers
     words  = [v["word"]  for v in variants]
     rws    = np.stack([v["rw"] for v in variants])   # [N, L]
     fes    = np.stack([v["fe"] for v in variants])   # [N, D]
-    x      = np.arange(1, num_layers)   # n_route = num_layers - 1
+    x      = np.arange(route_start, route_end)   # actual layer indices
     cmap   = plt.get_cmap("tab10")
-    deep_layer = num_layers - 1
+    deep_layer = route_end - 1
 
     # ── 1. Routing weight curves ────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(14, 5))
@@ -426,7 +429,7 @@ def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir):
     ax.grid(axis="x", which="major", linestyle="--", alpha=0.35)
     ax.grid(axis="y", linestyle=":", alpha=0.3)
     ax.legend(fontsize=9, ncol=2)
-    ax.set_xlim(0.5, num_layers - 0.5)
+    ax.set_xlim(route_start - 0.5, route_end - 0.5)
     plt.tight_layout()
     p = os.path.join(out_dir, "swap_routing_curves.png")
     plt.savefig(p, dpi=150, bbox_inches="tight")
@@ -497,7 +500,8 @@ def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir):
 # ---------------------------------------------------------------------------
 # Plot
 # ---------------------------------------------------------------------------
-def plot_counting_by_word(all_token_weights, num_layers, save_path):
+def plot_counting_by_word(all_token_weights, num_layers, save_path,
+                          route_start=1, route_end=None):
     """
     One curve per distinct counting word (one / two / three / …).
     Shows how routing preferences differ across different counting words.
@@ -517,7 +521,9 @@ def plot_counting_by_word(all_token_weights, num_layers, save_path):
     )
 
     cmap = plt.get_cmap("tab10")
-    x    = np.arange(1, num_layers)   # n_route = num_layers - 1
+    if route_end is None:
+        route_end = num_layers
+    x    = np.arange(route_start, route_end)
 
     fig, ax = plt.subplots(figsize=(14, 5))
     for idx, word in enumerate(words_sorted):
@@ -529,7 +535,7 @@ def plot_counting_by_word(all_token_weights, num_layers, save_path):
                 label=f'"{word}"  (n={len(rows)})')
         ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.12)
 
-    deep_layer = num_layers - 1
+    deep_layer = route_end - 1
     ax.axvline(deep_layer, color="#2c3e50", linestyle="--", linewidth=1.2,
                label=f"default deep layer ({deep_layer})")
 
@@ -541,12 +547,13 @@ def plot_counting_by_word(all_token_weights, num_layers, save_path):
     ax.grid(axis="x", which="major", linestyle="--", alpha=0.35)
     ax.grid(axis="y", linestyle=":", alpha=0.3)
     ax.legend(fontsize=9, ncol=2)
-    ax.set_xlim(0.5, num_layers - 0.5)
+    ax.set_xlim(route_start - 0.5, route_end - 0.5)
     plt.close(fig)
     print(f"[Saved] {save_path}")
 
 
-def plot_counting_avg(all_token_weights, num_layers, save_path):
+def plot_counting_avg(all_token_weights, num_layers, save_path,
+                      route_start=1, route_end=None):
     """
     Bar + error-bar chart: average softmax weight per LLM layer for all
     collected counting tokens.  Mean ± std shown as error bars.
@@ -558,7 +565,9 @@ def plot_counting_avg(all_token_weights, num_layers, save_path):
     mat  = np.stack([w for _, w in all_token_weights], axis=0)   # [N, L]
     mean = mat.mean(axis=0)   # [L]
     std  = mat.std(axis=0)    # [L]
-    x    = np.arange(1, num_layers)   # n_route = num_layers - 1
+    if route_end is None:
+        route_end = num_layers
+    x    = np.arange(route_start, route_end)
 
     fig, ax = plt.subplots(figsize=(14, 5))
 
@@ -577,17 +586,18 @@ def plot_counting_avg(all_token_weights, num_layers, save_path):
         fontsize=11,
     )
 
-    # Mark default deep layer (hidden_states[-2] = layer num_layers - 1, 1-indexed)
-    deep_layer = num_layers - 1
+    # Mark the deepest layer in the routing range
+    deep_layer = route_end - 1
     ax.axvline(deep_layer, color="#2c3e50", linestyle="--", linewidth=1.5,
-               label=f"default deep layer ({deep_layer})")
+               label=f"deepest routing layer ({deep_layer})")
 
-    # Annotate peak layer
-    peak = int(mean.argmax()) + 1
+    # Annotate peak layer (argmax is offset by route_start)
+    peak_idx = int(mean.argmax())
+    peak = peak_idx + route_start
     ax.annotate(
-        f"peak: layer {peak}\n(w={mean[peak-1]:.3f})",
-        xy=(peak, mean[peak - 1]),
-        xytext=(peak + max(1, num_layers // 10), mean[peak - 1] * 0.85),
+        f"peak: layer {peak}\n(w={mean[peak_idx]:.3f})",
+        xy=(peak, mean[peak_idx]),
+        xytext=(peak + max(1, (route_end - route_start) // 5), mean[peak_idx] * 0.85),
         arrowprops=dict(arrowstyle="->", color="#7f8c8d"),
         fontsize=10, color="#c0392b",
     )
@@ -597,7 +607,7 @@ def plot_counting_avg(all_token_weights, num_layers, save_path):
     ax.grid(axis="x", which="major", linestyle="--", alpha=0.35)
     ax.grid(axis="y", linestyle=":", alpha=0.3)
     ax.legend(fontsize=10)
-    ax.set_xlim(0.5, num_layers - 0.5)
+    ax.set_xlim(route_start - 0.5, route_end - 0.5)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -660,9 +670,12 @@ def main():
     ckpt       = torch.load(args.router_ckpt, map_location="cpu", weights_only=False)
     num_layers = ckpt["num_layers"]
     mid_dim    = ckpt["mid_dim"]
+    route_start = ckpt.get("route_start", 1)
+    route_end   = ckpt.get("route_end", num_layers)
 
     router = DynamicTokenRouter(
-        hidden_size=ckpt["hidden_size"], num_layers=num_layers, mid_dim=mid_dim
+        hidden_size=ckpt["hidden_size"], num_layers=num_layers, mid_dim=mid_dim,
+        route_start=route_start, route_end=route_end,
     )
     state_dict = ckpt["router_state_dict"]
     if any(k.startswith("module.") for k in state_dict):
@@ -689,7 +702,8 @@ def main():
             args.swap_prompt, text_encoder, tokenizer, router,
             device, args.max_length, swap_targets,
         )
-        plot_swap_results(variants, args.swap_prompt, found_word, num_layers, swap_out)
+        plot_swap_results(variants, args.swap_prompt, found_word, num_layers, swap_out,
+                          route_start=route_start, route_end=route_end)
 
         # ---- Decision-feat diagnostic (always runs in swap mode) ----------
         print("\n[Diagnostic] Extracting raw decision_feat for each variant …")
@@ -740,12 +754,14 @@ def main():
     plot_counting_avg(
         all_token_weights, num_layers,
         os.path.join(args.out_dir, "counting_avg_weight.png"),
+        route_start=route_start, route_end=route_end,
     )
 
     print("[Plotting] Per-word breakdown …")
     plot_counting_by_word(
         all_token_weights, num_layers,
         os.path.join(args.out_dir, "counting_by_word.png"),
+        route_start=route_start, route_end=route_end,
     )
 
     # ---- Save raw data ----

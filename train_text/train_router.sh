@@ -10,17 +10,19 @@ torchrun \
     train_text/train_router.py \
     --model_dir  ckpts/Z-Image-Turbo \
     --triplet_dir data/train_triplets \
-    --output_dir  train_text/checkpoints/router_v5_nodisc \
+    --output_dir  train_text/checkpoints/router_v7_midlayer \
     --loss_type   supcon \
     --temperature 0.07 \
     --temperature_init 0.2 \
     --temperature_warmup_steps 200 \
     --mid_dim     1024 \
+    --route_start 10 \
+    --route_end   21 \
     --batch_size  128 \
     --epochs      20 \
     --lambda_disc    0.0 \
-    --lambda_entropy 0.04 \
+    --lambda_entropy 0.0 \
     --seed        42 \
     --use_wandb \
     --wandb_project z-image-router \
-    --wandb_run     router_v5_nodisc
+    --wandb_run     router_v7_midlayer
