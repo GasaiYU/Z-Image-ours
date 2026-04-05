@@ -167,7 +167,7 @@ def build_avg_embeds(
 # ---------------------------------------------------------------------------
 # Generation with patched text encoder
 # ---------------------------------------------------------------------------
-def generate_with_avg(components, prompts, opt, device):
+def generate_with_avg(components, prompts, opt, device, sample_offset: int = 0):
     text_encoder = components["text_encoder"]
 
     avg_embeds, expected_ids, _, n_total_hs = build_avg_embeds(
@@ -204,7 +204,7 @@ def generate_with_avg(components, prompts, opt, device):
             width=opt.W,
             num_inference_steps=opt.steps,
             guidance_scale=opt.scale,
-            generator=torch.Generator(device).manual_seed(opt.seed),
+            generator=torch.Generator(device).manual_seed(opt.seed + sample_offset),
             max_sequence_length=opt.max_sequence_length,
         )
     finally:
@@ -274,7 +274,7 @@ def main(opt):
             current_bs = min(batch_size, opt.n_samples - sample_count)
             prompts    = [prompt] * current_bs
 
-            images = generate_with_avg(components, prompts, opt, device)
+            images = generate_with_avg(components, prompts, opt, device, sample_count)
 
             for img in images:
                 img.save(os.path.join(sample_path, f"{sample_count:05}.png"))
