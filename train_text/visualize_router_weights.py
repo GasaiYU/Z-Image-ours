@@ -427,6 +427,8 @@ def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir):
     ax.grid(axis="y", linestyle=":", alpha=0.3)
     ax.legend(fontsize=9, ncol=2)
     ax.set_xlim(0.5, num_layers - 0.5)
+    plt.tight_layout()
+    p = os.path.join(out_dir, "swap_routing_curves.png")
     plt.savefig(p, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[Saved] {p}")
