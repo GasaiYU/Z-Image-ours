@@ -19,7 +19,7 @@ torchrun \
     --batch_size  128 \
     --epochs      20 \
     --lambda_disc    0.0 \
-    --lambda_entropy 0.1 \
+    --lambda_entropy 0.04 \
     --seed        42 \
     --use_wandb \
     --wandb_project z-image-router \
