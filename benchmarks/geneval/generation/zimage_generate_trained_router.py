@@ -178,7 +178,7 @@ def build_router_embeds(
         fused_embeds, _routing_weights, _ = router(
             all_hidden_states, attention_mask=attention_mask.bool()
         )
-        # fused_embeds: [B, S, D], same dtype as LLM output (bfloat16)
+        fused_embeds = fused_embeds.to(all_hidden_states[-1].dtype)
 
     n_total_hs = len(all_hidden_states)   # e.g. 33 for a 32-layer LLM
     return fused_embeds, input_ids, attention_mask, n_total_hs
