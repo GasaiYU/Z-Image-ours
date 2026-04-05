@@ -162,7 +162,7 @@ def get_counting_weights(
         attention_mask=attention_mask,
         output_hidden_states=True,
     )
-    _, routing_weights = router(outputs.hidden_states, attention_mask=attention_mask.bool())
+    _, routing_weights, _ = router(outputs.hidden_states, attention_mask=attention_mask.bool())
     # routing_weights: [1, S, L]
 
     valid_mask = attention_mask[0].bool()
@@ -224,7 +224,7 @@ def get_counting_token_features(
         attention_mask=attention_mask,
         output_hidden_states=True,
     )
-    fused_embeds, routing_weights = router(
+    fused_embeds, routing_weights, _ = router(
         outputs.hidden_states, attention_mask=attention_mask.bool()
     )
     # routing_weights: [1, S, L]   fused_embeds: [1, S, D]
@@ -254,8 +254,8 @@ def get_decision_feat(
     max_sequence_length: int = 512,
 ) -> list[tuple[str, np.ndarray]]:
     """
-    Extract the raw decision_feat (MLP input) for every counting token in prompt.
-    Returns list of (token_str, decision_feat_vector [4*D]).
+    Extract the raw decision_feat (MLP input = L2-normalised h_1) for every
+    counting token in prompt.  Returns list of (token_str, feat [D]).
     """
     messages  = [{"role": "user", "content": prompt}]
     formatted = tokenizer.apply_chat_template(
@@ -278,18 +278,14 @@ def get_decision_feat(
     )
     all_hs = outputs.hidden_states   # tuple [num_layers+1] of [1, S, D]
 
-    # Replicate exactly what router.forward does for decision_feat
-    scale_feats = []
-    for idx in router.scale_indices:
-        f = all_hs[idx][0].float().cpu().numpy()   # [S, D]
-        # Per-scale L2 normalisation (must match train_router.py)
-        norm = np.linalg.norm(f, axis=-1, keepdims=True) + 1e-8
-        scale_feats.append(f / norm)
-    decision_feat = np.concatenate(scale_feats, axis=-1)   # [S, 4D]
+    # decision_feat = L2-normalised h_1  (mirrors train_router.py router.forward)
+    h1 = all_hs[1][0].float().cpu().numpy()           # [S, D]
+    norm = np.linalg.norm(h1, axis=-1, keepdims=True) + 1e-8
+    decision_feat = h1 / norm                          # [S, D]
 
     valid_mask = attention_mask[0].bool().cpu()
     valid_ids  = input_ids[0][valid_mask].tolist()
-    df_valid   = decision_feat[valid_mask.numpy()]          # [T, 4D]
+    df_valid   = decision_feat[valid_mask.numpy()]     # [T, D]
 
     all_tokens = [tokenizer.decode([tid]) for tid in valid_ids]
     cs, ce     = find_content_span(all_tokens)
@@ -303,78 +299,40 @@ def get_decision_feat(
 
 def plot_decision_feat_similarity(variants_df, base_prompt, out_dir):
     """
-    For each variant (count word swap), extract decision_feat of the counting
-    token and plot:
-      1. Per-scale-layer cosine similarity heatmap (how similar are decision
-         signals between word pairs, broken down by scale layer).
-      2. Overall (concat) cosine similarity heatmap.
+    For each variant (count word swap), extract decision_feat (L2-normalised h_1)
+    and plot a cosine-similarity heatmap across all count-word variants.
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    words  = [v["word"]  for v in variants_df]
-    feats  = np.stack([v["df"] for v in variants_df])   # [N, 4D]
-    D      = feats.shape[1] // 4                         # hidden_size per scale
+    words = [v["word"] for v in variants_df]
+    feats = np.stack([v["df"] for v in variants_df])   # [N, D]
 
-    # ── 1. Per-scale cosine similarity ─────────────────────────────────────
-    scale_names = ["layer_1 (surface)", "layer_L/4 (early)", "layer_L/2 (mid)", "layer_L-1 (deep)"]
-    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    norms = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+    sim   = norms @ norms.T   # [N, N]
 
-    for s_idx, (ax, sname) in enumerate(zip(axes, scale_names)):
-        chunk = feats[:, s_idx * D : (s_idx + 1) * D]          # [N, D]
-        norms = chunk / (np.linalg.norm(chunk, axis=1, keepdims=True) + 1e-8)
-        sim   = norms @ norms.T
-
-        vmin = sim[~np.eye(len(words), dtype=bool)].min() - 0.01
-        sns.heatmap(sim, annot=True, fmt=".3f", cmap="coolwarm",
-                    xticklabels=words, yticklabels=words,
-                    vmin=vmin, vmax=1.0, ax=ax,
-                    linewidths=0.4, linecolor="gray", annot_kws={"size": 7})
-        ax.set_title(sname, fontsize=9)
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
-        ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=8)
-
-    fig.suptitle(
-        f'Decision Feat Similarity per Scale Layer\nbase: "{base_prompt}"',
-        fontsize=11,
-    )
-    plt.tight_layout()
-    p = os.path.join(out_dir, "decision_feat_per_scale.png")
-    plt.savefig(p, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"[Saved] {p}")
-
-    # ── 2. Full concat cosine similarity ───────────────────────────────────
-    norms_all = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
-    sim_all   = norms_all @ norms_all.T
-    vmin_all  = sim_all[~np.eye(len(words), dtype=bool)].min() - 0.01
+    vmin = sim[~np.eye(len(words), dtype=bool)].min() - 0.01
 
     fig, ax = plt.subplots(figsize=(max(6, len(words) * 0.8), max(5, len(words) * 0.7)))
-    sns.heatmap(sim_all, annot=True, fmt=".3f", cmap="coolwarm",
+    sns.heatmap(sim, annot=True, fmt=".3f", cmap="coolwarm",
                 xticklabels=words, yticklabels=words,
-                vmin=vmin_all, vmax=1.0, ax=ax,
+                vmin=vmin, vmax=1.0, ax=ax,
                 linewidths=0.5, linecolor="gray")
     ax.set_title(
-        f'Full decision_feat Cosine Similarity (concat of 4 scales)\nbase: "{base_prompt}"',
+        f'decision_feat (L2-norm h₁) Cosine Similarity\nbase: "{base_prompt}"',
         fontsize=10,
     )
     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
     plt.tight_layout()
-    p = os.path.join(out_dir, "decision_feat_concat.png")
+    p = os.path.join(out_dir, "decision_feat_similarity.png")
     plt.savefig(p, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[Saved] {p}")
 
-    # ── 3. Console: min/max off-diagonal sim per scale ─────────────────────
-    print("\n[Decision Feat Similarity Summary]")
-    print(f"  {'Scale':<22}  {'min_off_diag':>12}  {'max_off_diag':>12}  {'mean_off_diag':>13}")
+    # Console summary
     mask = ~np.eye(len(words), dtype=bool)
-    for s_idx, sname in enumerate(scale_names):
-        chunk = feats[:, s_idx * D : (s_idx + 1) * D]
-        norms = chunk / (np.linalg.norm(chunk, axis=1, keepdims=True) + 1e-8)
-        sim   = (norms @ norms.T)[mask]
-        print(f"  {sname:<22}  {sim.min():>12.4f}  {sim.max():>12.4f}  {sim.mean():>13.4f}")
-    sim_full = sim_all[mask]
-    print(f"  {'concat (full)':<22}  {sim_full.min():>12.4f}  {sim_full.max():>12.4f}  {sim_full.mean():>13.4f}")
+    off  = sim[mask]
+    print(f"\n[Decision Feat h₁ Similarity]  "
+          f"min={off.min():.4f}  max={off.max():.4f}  mean={off.mean():.4f}")
 
 
 def run_swap_analysis(
