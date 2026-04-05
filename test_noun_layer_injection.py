@@ -1,65 +1,22 @@
 """
 test_noun_layer_injection.py
 ============================
-Experiment: inject Layer-10 (count-aware) noun embedding into the deep embedding.
+Apply exponential-decay layer fusion to target tokens (count words and/or nouns)
+and compare against baseline generation.
 
-Motivation
-----------
-Causal attention means the COUNT token's embedding is context-independent.
-But the NOUN token CAN see the count word on its left, so at intermediate
-layers (e.g. Layer 10) the noun embedding IS count-aware.
+For each target token, replace its deep embedding (hidden_states[-2]) with a
+weighted average over a range of intermediate layers:
 
-For "easy" nouns (cups, dogs) this happens naturally because the LLM has
-seen many "N cups / N dogs" patterns in training.
-For "hard" nouns (keyboards, monitors) the LLM has seen very few such
-patterns, so the noun's deep embedding ignores the count word.
+    weights[i] = exp(-decay_rate * i) / Z   (i=0 → route_start, highest weight)
+    fused[p]   = Σ_i  weights[i] * hidden_states[route_start + i][p]
 
-Strategy
---------
-For the noun token at position p in prompt "a photo of {count} {noun}":
-
-  Method A – Hard Replace:
-    final_embeds[p] = hidden_states[layer_src][p]
-
-  Method B – Blend (interpolation):
-    final_embeds[p] = (1-α) * hidden_states[-2][p]
-                    + α    * hidden_states[layer_src][p]
-
-  Method C – Direction Injection (norm-preserving):
-    dir  = normalize(hidden_states[layer_src][p])
-    norm = ||hidden_states[-2][p]||
-    final_embeds[p] = hidden_states[-2][p] + α * dir * norm
-
-We sweep α ∈ {0.1, 0.3, 0.5, 0.7, 1.0} and layer_src ∈ {8, 10, 12}
-and generate images for each setting.
-
-  Method D – Decay (weighted average over a layer range):
-    weights[i] = exp(-decay_rate * i) / Z   (i=0 is route_start, highest weight)
-    fused[p]   = Σ_i weights[i] * hidden_states[route_start+i][p]
-    final_embeds[p] = fused[p]              (hard replace with the fused vector)
-
-  Method E – Decay + Blend (softer variant):
-    final_embeds[p] = (1-α) * hidden_states[-2][p] + α * fused[p]
-
-Output
-------
-  <out_dir>/
-    baseline/                   # no modification
-    hard_L{layer}/              # hard replace with layer L
-    blend_L{layer}_a{alpha}/    # blend
-    inject_L{layer}_a{alpha}/   # direction injection
-    summary_grid.png            # big comparison grid
+Count words and nouns can use independent layer ranges and decay rates.
 """
 
 import argparse
 import os
-import re
 import sys
 
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from pytorch_lightning import seed_everything
@@ -68,18 +25,21 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 from utils import ensure_model_weights, load_from_local_dir
 from zimage.pipeline import generate
 
+QUANTITY_BANK = [
+    "one", "two", "three", "four", "five",
+    "six", "seven", "eight", "nine", "ten",
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+]
 
-# ── text encoding helpers ─────────────────────────────────────────────────────
+
+# ── text encoding ─────────────────────────────────────────────────────────────
 
 def encode_all_layers(prompt, text_encoder, tokenizer, device, max_seq_len=512):
-    """Encode prompt; return all hidden states + token list."""
     messages  = [{"role": "user", "content": prompt}]
     formatted = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-    enc = tokenizer(
-        [formatted], padding="max_length", max_length=max_seq_len,
-        truncation=True, return_tensors="pt",
-    )
+    enc = tokenizer([formatted], padding="max_length", max_length=max_seq_len,
+                    truncation=True, return_tensors="pt")
     ids  = enc.input_ids.to(device)
     mask = enc.attention_mask.to(device).bool()
     with torch.no_grad():
@@ -100,107 +60,73 @@ def content_span(tokens):
     return cs, ce
 
 
-def find_noun_indices(tokens, nouns, cs, ce):
-    """
-    Find the full-sequence indices of all sub-tokens that belong to ANY word in
-    `nouns` (a list of strings, e.g. ["computer", "keyboards"]).
-    Returns list of (full_idx, sub_token), deduplicated and sorted.
-    """
+def find_token_indices(tokens, words, cs, ce):
+    """Return sorted list of (full_seq_idx, token_str) for tokens matching any word."""
     content = tokens[cs:ce]
     hits = {}
-    for noun in nouns:
+    for word in words:
         for i, t in enumerate(content):
             clean = t.lower().strip().replace(" ", "").replace("▁", "")
-            if clean and (clean in noun.lower() or noun.lower() in clean):
-                full_idx = cs + i
-                hits[full_idx] = t   # deduplicate by index
-    if not hits:
-        # Fallback: last content token
-        hits = {ce - 1: tokens[ce - 1]}
-    return sorted(hits.items())   # [(full_idx, sub_token), ...]
+            if clean and (clean in word.lower() or word.lower() in clean):
+                hits[cs + i] = t
+    return sorted(hits.items())
 
 
-# ── embedding modification ────────────────────────────────────────────────────
+# ── decay fusion ──────────────────────────────────────────────────────────────
 
-def build_modified_embeds(hs, noun_indices, method, layer_src, alpha,
-                          route_start=8, route_end=13, decay_rate=0.3):
+def decay_fuse(hs, full_idx, route_start, route_end, decay_rate, device, ref_dtype):
+    """Compute decay-weighted average of hs[route_start:route_end] at full_idx."""
+    rs = max(0, route_start)
+    re = min(route_end, len(hs) - 1)
+    layers = hs[rs:re]
+    n = len(layers)
+    w = torch.exp(-decay_rate * torch.arange(n, device=device, dtype=torch.float32))
+    w = w / w.sum()
+    fused = torch.zeros_like(hs[-2][0, full_idx, :], dtype=torch.float32)
+    for i, lyr in enumerate(layers):
+        fused += w[i] * lyr[0, full_idx, :].float()
+    return fused.to(ref_dtype)
+
+
+def build_decay_embeds(hs, count_indices, noun_indices,
+                       count_rs, count_re, count_dr,
+                       noun_rs, noun_re, noun_dr):
     """
-    Returns modified deep embeds (hidden_states[-2]).
-
-    method      : "baseline" | "hard" | "blend" | "inject" | "decay" | "decay_blend"
-    layer_src   : int   – source layer for hard/blend/inject
-    alpha       : float – blend/inject/decay_blend strength (0=no change, 1=full replace)
-    route_start : int   – first layer (inclusive) for decay range
-    route_end   : int   – last  layer (exclusive) for decay range
-    decay_rate  : float – exponential decay rate (higher = more weight on route_start)
+    Apply decay fusion to count tokens and/or noun tokens.
+    Pass empty list to skip a group.
     """
-    deep   = hs[-2].clone()          # [1, S, D]
+    deep   = hs[-2].clone()
     device = deep.device
+    dtype  = deep.dtype
 
-    if method == "baseline":
-        return deep
-
-    # Pre-compute decayed fused feature if needed
-    def _decay_fused(full_idx):
-        rs = max(0, route_start)
-        re = min(route_end, len(hs) - 1)
-        layers = hs[rs:re]
-        n = len(layers)
-        w = torch.exp(-decay_rate * torch.arange(n, device=device,
-                                                  dtype=torch.float32))
-        w = w / w.sum()
-        fused = torch.zeros_like(deep[0, full_idx, :], dtype=torch.float32)
-        for i, lyr in enumerate(layers):
-            fused += w[i] * lyr[0, full_idx, :].float()
-        return fused.to(deep.dtype)
+    for full_idx, _ in count_indices:
+        deep[0, full_idx, :] = decay_fuse(
+            hs, full_idx, count_rs, count_re, count_dr, device, dtype)
 
     for full_idx, _ in noun_indices:
-        d = deep[0, full_idx, :]                          # [D]
-
-        if method in ("decay", "decay_blend"):
-            s = _decay_fused(full_idx)                    # weighted avg over range
-        else:
-            s = hs[layer_src][0, full_idx, :].to(d.dtype)
-
-        if method == "hard":
-            deep[0, full_idx, :] = s
-
-        elif method == "blend":
-            deep[0, full_idx, :] = (1 - alpha) * d + alpha * s
-
-        elif method == "inject":
-            s_norm = s / (s.norm() + 1e-8)
-            deep[0, full_idx, :] = d + alpha * s_norm * d.norm()
-
-        elif method == "decay":
-            # Hard-replace with the decayed weighted average
-            deep[0, full_idx, :] = s
-
-        elif method == "decay_blend":
-            # Softly blend decayed feature into the deep embedding
-            deep[0, full_idx, :] = (1 - alpha) * d + alpha * s
+        deep[0, full_idx, :] = decay_fuse(
+            hs, full_idx, noun_rs, noun_re, noun_dr, device, dtype)
 
     return deep
 
 
 # ── generation ────────────────────────────────────────────────────────────────
 
-def gen_image(components, prompt, modified_embeds, seed, device):
-    """Generate one image with monkey-patched text encoder."""
+def gen_image(components, prompt, embeds, seed, device):
     seed_everything(seed)
     generator = torch.Generator(device=device).manual_seed(seed)
 
-    original_fwd = components["text_encoder"].forward
+    orig = components["text_encoder"].forward
 
-    def patched_fwd(input_ids, attention_mask, **kwargs):
+    def patched(input_ids, attention_mask, **kwargs):
         class O: pass
         o = O()
         o.hidden_states = [None] * 40
-        o.hidden_states[-2] = modified_embeds.to(
+        o.hidden_states[-2] = embeds.to(
             next(components["text_encoder"].parameters()).dtype)
         return o
 
-    components["text_encoder"].forward = patched_fwd
+    components["text_encoder"].forward = patched
     try:
         imgs = generate(
             transformer=components["transformer"],
@@ -215,55 +141,60 @@ def gen_image(components, prompt, modified_embeds, seed, device):
             generator=generator,
         )
     finally:
-        components["text_encoder"].forward = original_fwd
+        components["text_encoder"].forward = orig
 
     return imgs[0]
 
 
-# ── image helpers ─────────────────────────────────────────────────────────────
+# ── grid builder ──────────────────────────────────────────────────────────────
 
-def add_label(img, text, font_size=22):
-    """Overlay a text label on a PIL image (top-left corner)."""
-    out = img.copy().convert("RGB")
-    draw = ImageDraw.Draw(out)
+def build_grid(all_images, configs, args):
+    """
+    all_images: list of (label, seed, pil_image) in order
+    configs   : list of (label, ...) matching all_images order
+    """
+    n_cfg  = len(configs)
+    n_seed = args.num_seeds
+    cell   = 192
+    pad    = 3
+    lbl_w  = 260
+    header = 60
+
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                                  font_size)
+        font_big   = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 15)
+        font_small = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
     except Exception:
-        font = ImageFont.load_default()
-    margin = 6
-    bbox = draw.textbbox((margin, margin), text, font=font)
-    draw.rectangle([bbox[0]-2, bbox[1]-2, bbox[2]+2, bbox[3]+2],
-                   fill=(0, 0, 0, 180))
-    draw.text((margin, margin), text, fill=(255, 255, 255), font=font)
-    return out
+        font_big = font_small = ImageFont.load_default()
 
+    W = lbl_w + n_seed * (cell + pad) + pad
+    H = header + n_cfg * (cell + pad) + pad
+    grid = Image.new("RGB", (W, H), (20, 20, 20))
+    draw = ImageDraw.Draw(grid)
 
-def make_grid(images, labels, ncols=6, cell=256, title=""):
-    """Build a flat image grid from a list of PIL images."""
-    assert len(images) == len(labels)
-    n     = len(images)
-    nrows = (n + ncols - 1) // ncols
-    pad   = 4
-    header = 40 if title else 0
-    W = ncols * (cell + pad) + pad
-    H = header + nrows * (cell + pad) + pad
-    grid = Image.new("RGB", (W, H), color=(30, 30, 30))
-    if title:
-        draw = ImageDraw.Draw(grid)
-        try:
-            font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
-        except Exception:
-            font = ImageFont.load_default()
-        draw.text((pad, 6), title, fill=(220, 220, 220), font=font)
-    for i, (img, lbl) in enumerate(zip(images, labels)):
-        r, c = divmod(i, ncols)
-        x = pad + c * (cell + pad)
-        y = header + pad + r * (cell + pad)
-        thumb = img.resize((cell, cell), Image.LANCZOS)
-        thumb = add_label(thumb, lbl, font_size=14)
-        grid.paste(thumb, (x, y))
+    title = (f"Decay fusion — '{args.prompt}'\n"
+             f"count={args.count_words or '(none)'}  "
+             f"nouns={args.nouns or '(none)'}")
+    draw.text((pad, 6), title, fill=(220, 220, 220), font=font_big)
+
+    for j in range(n_seed):
+        x = lbl_w + pad + j * (cell + pad) + cell // 2 - 25
+        draw.text((x, header - 16), f"seed {args.start_seed + j}",
+                  fill=(160, 160, 160), font=font_small)
+
+    img_idx = 0
+    for i, cfg in enumerate(configs):
+        label = cfg["label"]
+        color = (100, 220, 100) if label == "baseline" else (180, 140, 220)
+        y_top = header + pad + i * (cell + pad)
+        draw.text((pad, y_top + cell // 2 - 8), label,
+                  fill=color, font=font_small)
+        for j in range(n_seed):
+            _, _, img = all_images[img_idx]; img_idx += 1
+            x = lbl_w + pad + j * (cell + pad)
+            grid.paste(img.resize((cell, cell), Image.LANCZOS), (x, y_top))
+
     return grid
 
 
@@ -274,148 +205,92 @@ def run(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    print("Loading models …")
     model_path = ensure_model_weights(args.model_dir, verify=False)
-    components = load_from_local_dir(model_path, device=device,
-                                     dtype=torch.bfloat16)
-    te = components["text_encoder"]
-    tk = components["tokenizer"]
+    components = load_from_local_dir(model_path, device=device, dtype=torch.bfloat16)
 
-    # ── encode prompt once, get all hidden states ──────────────────────────
     print(f"\nEncoding: '{args.prompt}'")
     hs, tokens, ids, mask = encode_all_layers(
-        args.prompt, te, tk, device, args.max_seq_len)
+        args.prompt, components["text_encoder"], components["tokenizer"],
+        device, args.max_seq_len)
     cs, ce = content_span(tokens)
-    noun_indices = find_noun_indices(tokens, args.nouns, cs, ce)
 
-    print(f"Target nouns {args.nouns} found at full-sequence positions: "
-          f"{[f'{idx}({t.strip()!r})' for idx, t in noun_indices]}")
-    print(f"Total LLM layers (including embedding): {len(hs)}")
+    # Find count-word token indices
+    count_words = args.count_words if args.count_words else []
+    count_indices = find_token_indices(tokens, count_words, cs, ce)
 
-    # ── define experiment configs ──────────────────────────────────────────
-    # Each entry: (method, layer_src, alpha, route_start, route_end, decay_rate)
-    # layer_src / route_start / route_end / decay_rate only used by relevant methods
-    configs = [("baseline", 0, 0.0, 0, 0, 0.0)]
+    # Find noun token indices
+    noun_words = args.nouns if args.nouns else []
+    noun_indices = find_token_indices(tokens, noun_words, cs, ce)
 
-    for lyr in args.src_layers:
-        configs.append(("hard", lyr, 1.0, 0, 0, 0.0))
+    print(f"Count tokens : {[(i, t.strip()) for i, t in count_indices]}")
+    print(f"Noun  tokens : {[(i, t.strip()) for i, t in noun_indices]}")
+    print(f"Total layers : {len(hs)}")
 
-    for lyr in args.src_layers:
-        for a in args.alphas:
-            configs.append(("blend",  lyr, a, 0, 0, 0.0))
-            configs.append(("inject", lyr, a, 0, 0, 0.0))
+    # ── build experiment configs ───────────────────────────────────────────
+    configs = [{"label": "baseline"}]
 
-    # Decay configs: sweep decay_rate over fixed route range
-    for dr in args.decay_rates:
-        configs.append(("decay",       0, 1.0, args.route_start, args.route_end, dr))
-        for a in args.alphas:
-            configs.append(("decay_blend", 0, a,   args.route_start, args.route_end, dr))
+    # Sweep: noun decay only
+    for dr in args.noun_decay_rates:
+        configs.append({
+            "label":    f"noun_decay  [{args.noun_rs},{args.noun_re}) dr={dr}",
+            "noun_dr":  dr,
+            "count_dr": None,
+        })
 
-    print(f"\n{len(configs)} configurations × {args.num_seeds} seeds "
-          f"= {len(configs) * args.num_seeds} images\n")
+    # Sweep: count decay only
+    for dr in args.count_decay_rates:
+        configs.append({
+            "label":    f"count_decay [{args.count_rs},{args.count_re}) dr={dr}",
+            "noun_dr":  None,
+            "count_dr": dr,
+        })
 
-    # ── generate ───────────────────────────────────────────────────────────
-    all_images = []   # (label, seed, pil_image)
+    # Sweep: both
+    for n_dr in args.noun_decay_rates:
+        for c_dr in args.count_decay_rates:
+            configs.append({
+                "label":    (f"both  noun[{args.noun_rs},{args.noun_re})dr={n_dr}"
+                             f" cnt[{args.count_rs},{args.count_re})dr={c_dr}"),
+                "noun_dr":  n_dr,
+                "count_dr": c_dr,
+            })
 
-    for method, lyr, alpha, rs, re, dr in configs:
-        if method == "baseline":
-            label = "baseline"
-        elif method == "hard":
-            label = f"hard_L{lyr}"
-        elif method == "blend":
-            label = f"blend_L{lyr}_a{alpha:.1f}"
-        elif method == "inject":
-            label = f"inject_L{lyr}_a{alpha:.1f}"
-        elif method == "decay":
-            label = f"decay_L{rs}-{re}_dr{dr}"
-        else:  # decay_blend
-            label = f"decayblend_L{rs}-{re}_dr{dr}_a{alpha:.1f}"
+    print(f"\n{len(configs)} configs × {args.num_seeds} seeds = "
+          f"{len(configs) * args.num_seeds} images\n")
 
-        sub_dir = os.path.join(args.out_dir, label)
-        os.makedirs(sub_dir, exist_ok=True)
+    # ── generate ──────────────────────────────────────────────────────────
+    all_images = []
 
-        embeds = build_modified_embeds(hs, noun_indices, method, lyr, alpha,
-                                       route_start=rs, route_end=re,
-                                       decay_rate=dr)
+    for cfg in configs:
+        label = cfg["label"]
+        sub   = os.path.join(args.out_dir, label.replace(" ", "_").replace("/", "-"))
+        os.makedirs(sub, exist_ok=True)
+
+        if label == "baseline":
+            embeds = hs[-2].clone()
+        else:
+            n_dr = cfg["noun_dr"]
+            c_dr = cfg["count_dr"]
+            embeds = build_decay_embeds(
+                hs,
+                count_indices if c_dr is not None else [],
+                noun_indices  if n_dr is not None else [],
+                args.count_rs, args.count_re, c_dr if c_dr is not None else 0.0,
+                args.noun_rs,  args.noun_re,  n_dr if n_dr is not None else 0.0,
+            )
 
         for seed in range(args.start_seed, args.start_seed + args.num_seeds):
             print(f"  [{label}] seed={seed} …", end=" ", flush=True)
             img = gen_image(components, args.prompt, embeds, seed, device)
-            img_path = os.path.join(sub_dir, f"seed{seed}.png")
-            img.save(img_path)
+            img.save(os.path.join(sub, f"seed{seed}.png"))
             all_images.append((label, seed, img))
             print("done")
 
-    # ── build summary grid ─────────────────────────────────────────────────
-    # Layout: rows = configs, columns = seeds
-    print("\nBuilding summary grid …")
-    n_cfg  = len(configs)
-    n_seed = args.num_seeds
-    cell   = 192
-    pad    = 3
-    lbl_w  = 200
-    header = 50
-
-    W = lbl_w + n_seed * (cell + pad) + pad
-    H = header + n_cfg * (cell + pad) + pad
-    grid = Image.new("RGB", (W, H), color=(20, 20, 20))
-
-    draw = ImageDraw.Draw(grid)
-    try:
-        font_big  = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
-        font_small = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-    except Exception:
-        font_big = font_small = ImageFont.load_default()
-
-    # Title
-    draw.text((pad, 8), f"Noun Layer Injection: '{args.prompt}'  nouns={args.nouns}",
-              fill=(220, 220, 220), font=font_big)
-
-    # Column headers (seeds)
-    for j, seed in enumerate(range(args.start_seed,
-                                   args.start_seed + args.num_seeds)):
-        x = lbl_w + pad + j * (cell + pad) + cell // 2 - 20
-        draw.text((x, header - 18), f"seed={seed}", fill=(180, 180, 180),
-                  font=font_small)
-
-    # Row labels + images
-    img_idx = 0
-    for i, (method, lyr, alpha, rs, re, dr) in enumerate(configs):
-        if method == "baseline":
-            row_lbl = "BASELINE"
-            row_color = (100, 200, 100)
-        elif method == "hard":
-            row_lbl = f"hard L{lyr}"
-            row_color = (200, 100, 100)
-        elif method == "blend":
-            row_lbl = f"blend L{lyr} α={alpha:.1f}"
-            row_color = (100, 150, 220)
-        elif method == "inject":
-            row_lbl = f"inject L{lyr} α={alpha:.1f}"
-            row_color = (220, 160, 60)
-        elif method == "decay":
-            row_lbl = f"decay [{rs},{re}) dr={dr}"
-            row_color = (180, 100, 220)
-        else:  # decay_blend
-            row_lbl = f"decay_blend [{rs},{re}) dr={dr} α={alpha:.1f}"
-            row_color = (220, 180, 100)
-
-        y_top = header + pad + i * (cell + pad)
-        draw.text((pad, y_top + cell // 2 - 8), row_lbl,
-                  fill=row_color, font=font_small)
-
-        for j in range(n_seed):
-            _, _, img = all_images[img_idx]; img_idx += 1
-            x = lbl_w + pad + j * (cell + pad)
-            thumb = img.resize((cell, cell), Image.LANCZOS)
-            grid.paste(thumb, (x, y_top))
-
+    # ── summary grid ──────────────────────────────────────────────────────
+    grid = build_grid(all_images, configs, args)
     grid_path = os.path.join(args.out_dir, "summary_grid.png")
     grid.save(grid_path)
-    print(f"[saved] {grid_path}")
-
+    print(f"\n[saved] {grid_path}")
     print(f"All outputs in: {args.out_dir}/")
 
 
@@ -423,22 +298,28 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--prompt",       default="a photo of four computer keyboards")
     p.add_argument("--nouns",        nargs="+", default=["computer", "keyboards"],
-                   help="Words whose tokens will be modified (supports multiple)")
+                   help="Noun tokens to apply decay to")
+    p.add_argument("--count_words",  nargs="+", default=["four"],
+                   help="Count-word tokens to apply decay to")
     p.add_argument("--model_dir",    default="ckpts/Z-Image-Turbo")
     p.add_argument("--out_dir",      default="noun_injection_results")
-    # single-layer methods
-    p.add_argument("--src_layers",   type=int, nargs="+", default=[8, 10, 12],
-                   help="Source layers for hard/blend/inject methods")
-    p.add_argument("--alphas",       type=float, nargs="+", default=[0.3, 0.5, 0.7],
-                   help="Blend / inject / decay_blend strengths")
-    # decay method
-    p.add_argument("--route_start",  type=int, default=8,
-                   help="First layer (inclusive) for decay range")
-    p.add_argument("--route_end",    type=int, default=13,
-                   help="Last layer (exclusive) for decay range, e.g. 13 = layers 8-12")
-    p.add_argument("--decay_rates",  type=float, nargs="+", default=[0.1, 0.3, 0.5],
-                   help="Exponential decay rates for decay/decay_blend methods")
-    # generation
+
+    # Noun decay range
+    p.add_argument("--noun_rs",          type=int,   default=8,
+                   help="Noun decay: first layer (inclusive)")
+    p.add_argument("--noun_re",          type=int,   default=13,
+                   help="Noun decay: last layer (exclusive)")
+    p.add_argument("--noun_decay_rates", type=float, nargs="+", default=[0.1, 0.3, 0.5],
+                   help="Decay rates to sweep for noun tokens")
+
+    # Count-word decay range
+    p.add_argument("--count_rs",          type=int,   default=8,
+                   help="Count decay: first layer (inclusive)")
+    p.add_argument("--count_re",          type=int,   default=13,
+                   help="Count decay: last layer (exclusive)")
+    p.add_argument("--count_decay_rates", type=float, nargs="+", default=[0.1, 0.3, 0.5],
+                   help="Decay rates to sweep for count-word tokens")
+
     p.add_argument("--num_seeds",    type=int, default=4)
     p.add_argument("--start_seed",   type=int, default=42)
     p.add_argument("--max_seq_len",  type=int, default=512)
