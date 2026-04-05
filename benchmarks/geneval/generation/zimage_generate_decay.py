@@ -72,6 +72,8 @@ def parse_args():
     parser.add_argument("--H", type=int, default=1024, help="image height")
     parser.add_argument("--W", type=int, default=1024, help="image width")
     parser.add_argument("--scale", type=float, default=0.0, help="CFG scale")
+    parser.add_argument("--negative_prompt", type=str, default=None,
+                        help="Negative prompt for CFG (only used when --scale > 1.0)")
     parser.add_argument("--seed", type=int, default=42, help="seed")
     parser.add_argument("--batch_size", type=int, default=1, help="batch size")
     parser.add_argument("--skip_grid", action="store_true", help="skip saving grid")
