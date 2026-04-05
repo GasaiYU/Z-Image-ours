@@ -399,7 +399,7 @@ def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir):
     words  = [v["word"]  for v in variants]
     rws    = np.stack([v["rw"] for v in variants])   # [N, L]
     fes    = np.stack([v["fe"] for v in variants])   # [N, D]
-    x      = np.arange(1, num_layers + 1)
+    x      = np.arange(1, num_layers)   # n_route = num_layers - 1
     cmap   = plt.get_cmap("tab10")
     deep_layer = num_layers - 1
 
@@ -426,9 +426,7 @@ def plot_swap_results(variants, base_prompt, found_word, num_layers, out_dir):
     ax.grid(axis="x", which="major", linestyle="--", alpha=0.35)
     ax.grid(axis="y", linestyle=":", alpha=0.3)
     ax.legend(fontsize=9, ncol=2)
-    ax.set_xlim(0.5, num_layers + 0.5)
-    plt.tight_layout()
-    p = os.path.join(out_dir, "swap_routing_curves.png")
+    ax.set_xlim(0.5, num_layers - 0.5)
     plt.savefig(p, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[Saved] {p}")
@@ -517,7 +515,7 @@ def plot_counting_by_word(all_token_weights, num_layers, save_path):
     )
 
     cmap = plt.get_cmap("tab10")
-    x    = np.arange(1, num_layers + 1)
+    x    = np.arange(1, num_layers)   # n_route = num_layers - 1
 
     fig, ax = plt.subplots(figsize=(14, 5))
     for idx, word in enumerate(words_sorted):
@@ -541,10 +539,7 @@ def plot_counting_by_word(all_token_weights, num_layers, save_path):
     ax.grid(axis="x", which="major", linestyle="--", alpha=0.35)
     ax.grid(axis="y", linestyle=":", alpha=0.3)
     ax.legend(fontsize=9, ncol=2)
-    ax.set_xlim(0.5, num_layers + 0.5)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    ax.set_xlim(0.5, num_layers - 0.5)
     plt.close(fig)
     print(f"[Saved] {save_path}")
 
@@ -561,7 +556,7 @@ def plot_counting_avg(all_token_weights, num_layers, save_path):
     mat  = np.stack([w for _, w in all_token_weights], axis=0)   # [N, L]
     mean = mat.mean(axis=0)   # [L]
     std  = mat.std(axis=0)    # [L]
-    x    = np.arange(1, num_layers + 1)
+    x    = np.arange(1, num_layers)   # n_route = num_layers - 1
 
     fig, ax = plt.subplots(figsize=(14, 5))
 
@@ -600,7 +595,7 @@ def plot_counting_avg(all_token_weights, num_layers, save_path):
     ax.grid(axis="x", which="major", linestyle="--", alpha=0.35)
     ax.grid(axis="y", linestyle=":", alpha=0.3)
     ax.legend(fontsize=10)
-    ax.set_xlim(0.5, num_layers + 0.5)
+    ax.set_xlim(0.5, num_layers - 0.5)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
