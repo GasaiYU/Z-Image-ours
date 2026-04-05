@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Single-GPU:
-#   bash train_text/train_router.sh
-# Multi-GPU (e.g. 4 GPUs):
-#   NPROC=4 bash train_text/train_router.sh
+# Single-GPU:  bash train_text/train_router.sh
+# Multi-GPU:   NPROC=8 bash train_text/train_router.sh
 
 NPROC=${NPROC:-1}
 
@@ -12,7 +10,7 @@ torchrun \
     train_text/train_router.py \
     --model_dir  ckpts/Z-Image-Turbo \
     --triplet_dir data/train_triplets \
-    --output_dir  train_text/checkpoints/router_version3 \
+    --output_dir  train_text/checkpoints/router_v4 \
     --loss_type   supcon \
     --temperature 0.07 \
     --temperature_init 0.2 \
@@ -20,9 +18,9 @@ torchrun \
     --mid_dim     1024 \
     --batch_size  128 \
     --epochs      20 \
-    --lambda_reg  0.1 \
-    --lambda_entropy 0.005 \
+    --lambda_disc 0.1 \
+    --disc_temperature 1.0 \
     --seed        42 \
     --use_wandb \
     --wandb_project z-image-router \
-    --wandb_run     router_v3_multiscale_entropy
+    --wandb_run     router_v4_deep_init

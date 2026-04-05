@@ -96,114 +96,134 @@ def all_gather_strings(str_list: list) -> list:
 # =============================================================================
 class DynamicTokenRouter(nn.Module):
     """
-    A lightweight MLP that takes multi-scale LLM features as input and outputs
-    per-layer routing weights (Softmax over all LLM layers).
+    Lightweight MLP: takes h_1 (shallowest transformer layer) as input and
+    outputs routing weights over ALL transformer layers hidden_states[1:-1].
 
-    Decision signal: concatenation of features from 4 representative layers
-      - layer 1           (surface / lexical form)
-      - layer num_layers//4   (early context)
-      - layer num_layers//2   (mid context)
-      - layer -2          (deep / final context)
+    Design rationale
+    ----------------
+    Input — h_1 only:
+      h_1 carries the strongest *lexical identity* signal.  For counting words
+      (two/three/four…), h_1 similarities are ~0.84, far more discriminative
+      than deeper layers (0.93~0.99).  Using fewer, more discriminative input
+      features also makes the MLP easier to train (D vs 4D input).
 
-    This multi-scale signal lets the router distinguish counting words (e.g.
-    "two" vs "three") that are near-identical in deep features alone, because
-    their shallow-layer representations still carry strong lexical identity.
+    Output — all transformer layers hidden_states[1:-1]:
+      Routing over all layers gives maximum expressiveness for the fused
+      embedding.  The fused embedding is still a convex combination of real LLM
+      features, so it stays in-distribution for the DiT.
 
-    The final fused embedding is a weighted sum of all LLM layers' features.
-    Only this MLP is trained; the LLM itself is frozen.
+    Initialisation — deep-biased:
+      The output layer bias is set so that the softmax initially puts all weight
+      on hidden_states[-2] (the layer the pipeline uses by default).  At t=0,
+      fused_embeds == hidden_states[-2] for every token — zero change from
+      baseline.  The contrastive loss then shifts routing only for the target
+      token positions it supervises; all other positions receive no gradient and
+      stay at the deep initialisation.  No explicit noun-regularisation needed.
 
-    Params: ~2M (hidden_size=3584, scale_layers=4, mid_dim=256, num_layers=32)
+    E2E inference:
+      Wrap the frozen LLM + this router in RouterTextEncoder (below) and use
+      it as the text_encoder in the pipeline.  No monkey-patching.
     """
-    # Indices into all_hidden_states (as fractions of num_layers) used as
-    # decision signal. Index 0 = token embedding, 1..L = transformer layers.
-    SCALE_FRACS = (0.0, 0.25, 0.5, 1.0)   # maps to layers 1, L//4, L//2, L-1 (≈ -2)
 
-    def __init__(self, hidden_size: int, num_layers: int, mid_dim: int = 256):
+    def __init__(self, hidden_size: int, num_layers: int, mid_dim: int = 1024):
         super().__init__()
         self.num_layers  = num_layers
         self.hidden_size = hidden_size
 
-        # Compute the 4 representative layer indices (1-indexed into transformer layers)
-        self.scale_indices: list[int] = self._scale_indices(num_layers)
+        # Route over hidden_states[1 : num_layers]  (= [1:-1] of the full tuple)
+        # That is every transformer layer EXCEPT the raw embedding (index 0)
+        # and the very last layer (index num_layers, not used by the pipeline).
+        # n_route == num_layers - 1
+        # routing_weights[..., -1] maps to hidden_states[num_layers - 1] == hidden_states[-2]
+        self.n_route = num_layers - 1
 
-        # MLP input = concat of len(SCALE_FRACS) layer features
-        in_dim = hidden_size * len(self.SCALE_FRACS)
+        # Input: h_1 (hidden_states[1]), L2-normalised → shape [B, S, D]
+        in_dim = hidden_size
         self.router_mlp = nn.Sequential(
             nn.Linear(in_dim, mid_dim),
-            nn.LayerNorm(mid_dim),          # stabilise activations after the large concat input
+            nn.LayerNorm(mid_dim),
             nn.SiLU(),
             nn.Dropout(0.1),
             nn.Linear(mid_dim, mid_dim // 2),
             nn.SiLU(),
-            nn.Linear(mid_dim // 2, num_layers),
+            nn.Linear(mid_dim // 2, self.n_route),
         )
-        # Default PyTorch Kaiming-uniform init for weights, uniform for biases.
-        # We no longer bias toward the deep layer here because:
-        #   1. entropy loss prevents early collapse to a single layer.
-        #   2. The old bias[-2]=5.0 init made all tokens start with identical
-        #      routing distributions, killing early contrastive gradients.
 
-    @classmethod
-    def _scale_indices(cls, num_layers: int) -> list[int]:
-        """
-        Map SCALE_FRACS to actual all_hidden_states indices.
-        all_hidden_states[0] = token embedding, [1..num_layers] = transformer layers.
-        frac=0.0 → layer 1 (shallowest transformer layer)
-        frac=1.0 → layer num_layers - 1  (= hidden_states[-2])
-        """
-        indices = []
-        for frac in cls.SCALE_FRACS:
-            # transformer layer index (1-based): clamp to [1, num_layers-1]
-            layer_idx = max(1, min(num_layers - 1, round(frac * (num_layers - 1)) + 1))
-            # frac=0.0 → round(0)+1=1, frac=1.0 → round(num_layers-1)+1 → clamped to num_layers-1
-            indices.append(layer_idx)
-        # Ensure frac=1.0 really lands on hidden_states[-2]
-        indices[-1] = num_layers - 1   # = all_hidden_states[-2] for a (num_layers+1)-tuple
-        return indices
+        # Deep-biased init:
+        #   bias[-1] = +5  →  softmax → weight ≈ 1 on hidden_states[-2]
+        #   all other biases = 0  →  weight ≈ 0
+        # Last-layer weight is near-zero so the bias dominates at init.
+        nn.init.zeros_(self.router_mlp[-1].bias)
+        self.router_mlp[-1].bias.data[-1] = 5.0
+        nn.init.normal_(self.router_mlp[-1].weight, std=0.01)
 
     def forward(self, all_hidden_states: tuple, attention_mask: torch.Tensor = None):
         """
         Args:
-            all_hidden_states: tuple of (num_layers+1) tensors, each [B, S, D].
-                               Index 0 is the raw embedding layer; 1..num_layers are transformer layers.
-            attention_mask: [B, S] bool mask (True = valid token).
+            all_hidden_states : tuple of (num_layers+1) tensors, each [B, S, D].
+                                [0]=embedding, [1..num_layers]=transformer layers.
+            attention_mask    : [B, S] bool/int mask (True = valid token).
         Returns:
-            fused_embeds:    [B, S, D]            weighted sum across layers
-            routing_weights: [B, S, num_layers]   softmax weights
+            fused_embeds    : [B, S, D]           weighted sum over routing layers
+            routing_weights : [B, S, n_route]     softmax weights
+            h1              : [B, S, D]            raw h_1 features (for L_disc)
         """
-        # Stack transformer output layers (skip embedding layer at index 0)
-        layers  = all_hidden_states[1 : self.num_layers + 1]
-        stacked = torch.stack(layers, dim=2)                          # [B, S, L, D]
+        h1 = all_hidden_states[1].float()                    # [B, S, D]
 
-        # Multi-scale decision signal: concat features from 4 representative layers.
-        # Each is detached so no gradient flows back into the frozen LLM.
-        # Each scale is L2-normalised independently so that layer_1 (surface/lexical
-        # features, most discriminative for counting words) is not drowned out by the
-        # other three scales whose inter-word similarities are higher (0.93~0.99 vs
-        # layer_1's 0.73~0.84).  After per-scale normalisation all four scales
-        # contribute equally in magnitude to the MLP input.
-        scale_feats = [
-            F.normalize(all_hidden_states[idx].detach().float(), dim=-1)  # [B, S, D]
-            for idx in self.scale_indices
-        ]
-        decision_feat = torch.cat(scale_feats, dim=-1)                # [B, S, 4*D]
+        # L2-normalise: removes magnitude differences between contexts so
+        # the MLP sees pure directional (lexical) information from layer 1.
+        decision_feat   = F.normalize(h1.detach(), dim=-1)  # [B, S, D]
 
-        # Routing logits → softmax weights
-        routing_logits  = self.router_mlp(decision_feat)              # [B, S, L]
-        routing_weights = F.softmax(routing_logits, dim=-1)           # [B, S, L]
+        routing_logits  = self.router_mlp(decision_feat)    # [B, S, n_route]
+        routing_weights = F.softmax(routing_logits, dim=-1) # [B, S, n_route]
 
-        # Cast back to LLM dtype before weighted sum
-        routing_weights = routing_weights.to(stacked.dtype)
+        # Weighted sum over hidden_states[1 : num_layers]
+        # (= hidden_states[1:-1] of the full (num_layers+1)-tuple)
+        route_layers = all_hidden_states[1 : self.num_layers]  # length = n_route
+        stacked = torch.stack([l.float() for l in route_layers], dim=2)  # [B,S,n_route,D]
+        rw = routing_weights.to(stacked.dtype).unsqueeze(-1)              # [B,S,n_route,1]
+        fused_embeds = (stacked * rw).sum(dim=2)                          # [B, S, D]
 
-        # Weighted sum across layers
-        fused_embeds = (stacked * routing_weights.unsqueeze(-1)).sum(dim=2)  # [B, S, D]
-
-        # Zero out pad tokens
         if attention_mask is not None:
             mask = attention_mask.unsqueeze(-1).to(fused_embeds.dtype)
             fused_embeds = fused_embeds * mask
 
-        return fused_embeds, routing_weights
+        return fused_embeds, routing_weights, h1
+
+
+# =============================================================================
+# 1b. RouterTextEncoder — E2E wrapper for inference
+# =============================================================================
+class RouterTextEncoder(nn.Module):
+    """
+    Wraps a frozen LLM text encoder + a trained DynamicTokenRouter so that
+    the pipeline can call text_encoder(input_ids, ...) and transparently
+    receive router-fused embeddings in hidden_states[-2].
+
+    Usage:
+        router = DynamicTokenRouter(...)
+        router.load_state_dict(ckpt["router_state_dict"])
+        components["text_encoder"] = RouterTextEncoder(
+            components["text_encoder"], router
+        )
+        # Now just call generate() normally — no monkey-patching needed.
+    """
+    def __init__(self, base_encoder: nn.Module, router: "DynamicTokenRouter"):
+        super().__init__()
+        self.base   = base_encoder
+        self.router = router
+
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=True, **kwargs):
+        outputs = self.base(
+            input_ids, attention_mask=attention_mask,
+            output_hidden_states=True, **kwargs
+        )
+        with torch.no_grad() if not self.training else torch.enable_grad():
+            fused, _, _ = self.router(outputs.hidden_states, attention_mask)
+        new_hs = list(outputs.hidden_states)
+        new_hs[-2] = fused
+        outputs.hidden_states = tuple(new_hs)
+        return outputs
 
 
 # =============================================================================
@@ -542,20 +562,79 @@ def noun_regularization_loss(
 ):
     """
     Force noun token features to stay close to the original deep features.
-    Prevents the router from also routing noun tokens to shallow layers.
-
-    Uses 1 - Cosine Similarity instead of MSE to avoid massive gradient spikes 
-    from unnormalized LLM hidden states.
+    Kept for optional use; in the default setup gradient sparsity handles this.
     """
     if noun_mask.sum() == 0:
         return fused_embeds.new_tensor(0.0)
-    
-    fused_nouns = fused_embeds[noun_mask]   # [N_nouns, D]
-    deep_nouns  = deep_embeds[noun_mask]    # [N_nouns, D]
-    
-    # Cosine distance: 1 - cos_sim. Range [0, 2]. Much more stable than MSE.
+    fused_nouns = fused_embeds[noun_mask]
+    deep_nouns  = deep_embeds[noun_mask]
     cos_sim = F.cosine_similarity(fused_nouns, deep_nouns, dim=-1)
     return (1.0 - cos_sim).mean()
+
+
+def layer_discriminability_loss(
+    routing_weights: torch.Tensor,
+    all_hs_a: tuple,
+    all_hs_p: tuple,
+    token_indices_a: list,
+    token_indices_p: list,
+    valid_mask: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Layer Discriminability Loss (L_disc) for all-layer routing.
+
+    For each valid (anchor, positive) token pair, compute how discriminative
+    each routing layer l ∈ hidden_states[1 : num_layers] is:
+
+        disc_l = cos_sim( h_l^anchor[target], h_l^positive[target] )
+
+    Lower disc_l  →  same word has more diverse context-dependent representations
+                  →  layer l carries more fine-grained information
+                  →  routing should give it higher weight.
+
+    Target distribution: softmax(-disc / tau)  (lower sim = higher weight).
+    Loss: KL(target || routing_weights) — direct gradient to routing_weights.
+    """
+    S       = routing_weights.shape[1]
+    n_route = routing_weights.shape[2]
+    # routing covers all_hs[1 : n_route+1] = all_hs[1:-1]
+    route_layers_a = all_hs_a[1 : n_route + 1]
+    route_layers_p = all_hs_p[1 : n_route + 1]
+
+    valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+    if valid_idx.numel() == 0:
+        return routing_weights.new_tensor(0.0)
+
+    vi_list, at_list, pt_list = [], [], []
+    for i in valid_idx.tolist():
+        a_t, p_t = token_indices_a[i], token_indices_p[i]
+        if 0 <= a_t < S and 0 <= p_t < S:
+            vi_list.append(i); at_list.append(a_t); pt_list.append(p_t)
+
+    if not vi_list:
+        return routing_weights.new_tensor(0.0)
+
+    # Vectorised: build [N_valid, n_route, D] tensors
+    ha_layers = torch.stack(
+        [torch.stack([route_layers_a[l][i, at].float()
+                      for l in range(n_route)])
+         for i, at in zip(vi_list, at_list)]
+    )  # [N, n_route, D]
+    hp_layers = torch.stack(
+        [torch.stack([route_layers_p[l][i, pt].float()
+                      for l in range(n_route)])
+         for i, pt in zip(vi_list, pt_list)]
+    )  # [N, n_route, D]
+
+    ha_n = F.normalize(ha_layers, dim=-1)
+    hp_n = F.normalize(hp_layers, dim=-1)
+    disc_scores = (ha_n * hp_n).sum(-1)               # [N, n_route]
+
+    target  = F.softmax(-disc_scores / temperature, dim=-1).detach()
+    rw_tok  = torch.stack([routing_weights[i, at] for i, at in zip(vi_list, at_list)])
+
+    return F.kl_div((rw_tok + 1e-8).log(), target, reduction='batchmean')
 
 
 # =============================================================================
@@ -704,7 +783,6 @@ def train(args):
 
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         for batch in pbar:
-            # Move ids/masks to device
             a_ids  = batch['a_ids'].to(device)
             a_mask = batch['a_mask'].to(device)
             p_ids  = batch['p_ids'].to(device)
@@ -712,18 +790,15 @@ def train(args):
             n_ids  = batch['n_ids'].to(device)
             n_mask = batch['n_mask'].to(device)
 
-            # ---- Step 1: Run frozen LLM on all three ----
+            # ---- Step 1: Run frozen LLM ----
             hs_a = encode_batch(text_encoder, a_ids, a_mask)
             hs_p = encode_batch(text_encoder, p_ids, p_mask)
             hs_n = encode_batch(text_encoder, n_ids, n_mask)
 
-            # Deep features for regularization (before routing, no grad)
-            deep_a = hs_a[-2].detach()   # [B, S, D]
-
             # ---- Step 2: Route through DynamicTokenRouter ----
-            fused_a, rw_a = router(hs_a, attention_mask=a_mask)
-            fused_p, _    = router(hs_p, attention_mask=p_mask)
-            fused_n, _    = router(hs_n, attention_mask=n_mask)
+            fused_a, rw_a, _ = router(hs_a, attention_mask=a_mask)
+            fused_p, _,    _ = router(hs_p, attention_mask=p_mask)
+            fused_n, _,    _ = router(hs_n, attention_mask=n_mask)
 
             # ---- Step 3: Extract target token features ----
             ea, vm_a = extract_token_features(fused_a, batch['a_tidx'])
@@ -746,51 +821,36 @@ def train(args):
             batch_target_words = [batch['target_word'][i] for i in valid_idx]
 
             # ---- Step 4a: Contrastive Loss ----
+            # Gradient ONLY flows through target token positions (ea, ep).
+            # All other token positions receive zero gradient → their routing
+            # weights stay at the deep-biased initialisation → fused ≈ deep.
+            # No noun_reg needed; gradient sparsity handles it by design.
             if args.loss_type == 'triplet':
                 loss_contrastive = triplet_margin_loss(ea, ep, en, margin=args.margin)
             else:
-                # SupCon with DDP all-gather:
-                #   - Each GPU has local ea/ep of shape [N_local, D]
-                #   - all_gather_with_grad() concatenates across all GPUs → [N_global, D]
-                #   - Gradients only flow through the local slice (standard contrastive DDP trick)
-                #   - Effective batch for similarity matrix = world_size × batch_size
                 ea_global    = all_gather_with_grad(ea)
                 ep_global    = all_gather_with_grad(ep)
                 words_global = all_gather_strings(batch_target_words)
-                # Temperature warmup: start from args.temperature_init (warm/easy),
-                # linearly anneal to args.temperature (target/hard) over warmup_steps.
-                # Easier loss landscape early → cleaner gradients → faster escape from plateau.
                 if args.temperature_warmup_steps > 0 and global_step < args.temperature_warmup_steps:
                     t = global_step / args.temperature_warmup_steps
                     current_temp = args.temperature_init + t * (args.temperature - args.temperature_init)
                 else:
                     current_temp = args.temperature
-
                 loss_contrastive = supcon_loss(ea_global, ep_global, words_global,
                                                temperature=current_temp)
 
-            # ---- Step 4b: Noun Regularization Loss (local, no gather needed) ----
-            loss_reg = fused_a.new_tensor(0.0)
-            if args.lambda_reg > 0:
-                B, S, D = fused_a.shape
-                noun_mask = a_mask.bool().clone()
-                for i, tidx in enumerate(batch['a_tidx']):
-                    if 0 <= tidx < S:
-                        noun_mask[i, tidx] = False
-                loss_reg = noun_regularization_loss(fused_a, deep_a, noun_mask)
+            # ---- Step 4b: Layer Discriminability Loss ----
+            loss_disc = fused_a.new_tensor(0.0)
+            if args.lambda_disc > 0:
+                disc_valid = vm_a & vm_p
+                loss_disc = layer_discriminability_loss(
+                    rw_a, hs_a, hs_p,
+                    batch['a_tidx'], batch['p_tidx'],
+                    disc_valid,
+                    temperature=args.disc_temperature,
+                )
 
-            # ---- Step 4c: Entropy Regularization Loss ----
-            # Maximise routing entropy so the router doesn't collapse to one layer.
-            # This keeps gradients flowing to shallow layers, allowing contrastive
-            # loss to separate counting words (two/three/four) that are near-identical
-            # in deep features.
-            loss_entropy = fused_a.new_tensor(0.0)
-            if args.lambda_entropy > 0:
-                loss_entropy = routing_entropy_loss(rw_a.float(), attention_mask=a_mask)
-
-            loss = (loss_contrastive
-                    + args.lambda_reg     * loss_reg
-                    + args.lambda_entropy * loss_entropy)
+            loss = loss_contrastive + args.lambda_disc * loss_disc
 
             # ---- Step 5: Backward ----
             optimizer.zero_grad()
@@ -800,24 +860,21 @@ def train(args):
             scheduler.step()
 
             epoch_loss_contrastive += loss_contrastive.item()
-            epoch_loss_reg         += loss_reg.item() if args.lambda_reg > 0 else 0.0
-            epoch_loss_entropy     += loss_entropy.item() if args.lambda_entropy > 0 else 0.0
-            n_batches += 1
+            epoch_loss_disc        += loss_disc.item() if args.lambda_disc > 0 else 0.0
+            n_batches  += 1
             global_step += 1
 
             if is_main:
                 pbar.set_postfix({
-                    'L_contra':  f'{loss_contrastive.item():.4f}',
-                    'L_reg':     f'{loss_reg.item():.4f}' if args.lambda_reg > 0 else '—',
-                    'L_entropy': f'{loss_entropy.item():.4f}' if args.lambda_entropy > 0 else '—',
-                    'lr':        f'{scheduler.get_last_lr()[0]:.2e}',
-                    'skipped':   skipped,
+                    'L_contra': f'{loss_contrastive.item():.4f}',
+                    'L_disc':   f'{loss_disc.item():.4f}' if args.lambda_disc > 0 else '—',
+                    'lr':       f'{scheduler.get_last_lr()[0]:.2e}',
+                    'skipped':  skipped,
                 })
                 if use_wandb:
                     wandb.log({
                         'train/loss_contrastive': loss_contrastive.item(),
-                        'train/loss_reg':         loss_reg.item() if args.lambda_reg > 0 else 0.0,
-                        'train/loss_entropy':     loss_entropy.item() if args.lambda_entropy > 0 else 0.0,
+                        'train/loss_disc':        loss_disc.item() if args.lambda_disc > 0 else 0.0,
                         'train/loss_total':       loss.item(),
                         'train/lr':               scheduler.get_last_lr()[0],
                         'train/skipped':          skipped,
@@ -838,16 +895,14 @@ def train(args):
 
         # ---- End of epoch stats (rank 0 only) ----
         if is_main:
-            avg_contra   = epoch_loss_contrastive / max(n_batches, 1)
-            avg_reg      = epoch_loss_reg          / max(n_batches, 1)
-            avg_entropy  = epoch_loss_entropy      / max(n_batches, 1)
+            avg_contra = epoch_loss_contrastive / max(n_batches, 1)
+            avg_disc   = epoch_loss_disc         / max(n_batches, 1)
             print(f"\n[Epoch {epoch}] avg_contrastive={avg_contra:.4f}  "
-                  f"avg_reg={avg_reg:.4f}  avg_entropy={avg_entropy:.4f}  skipped={skipped}")
+                  f"avg_disc={avg_disc:.4f}  skipped={skipped}")
             if use_wandb:
                 wandb.log({
                     'epoch/loss_contrastive': avg_contra,
-                    'epoch/loss_reg':         avg_reg,
-                    'epoch/loss_entropy':     avg_entropy,
+                    'epoch/loss_disc':        avg_disc,
                     'epoch/epoch':            epoch,
                 }, step=global_step)
 
@@ -915,25 +970,22 @@ def parse_args():
 
     # Loss
     parser.add_argument('--loss_type',   type=str,   default='supcon',
-                        choices=['supcon', 'triplet'],
-                        help='supcon: supervised contrastive, fixes false negatives (recommended); '
-                             'triplet: explicit hard negative, simpler but weaker')
+                        choices=['supcon', 'triplet'])
     parser.add_argument('--temperature', type=float, default=0.07,
-                        help='Target temperature for SupCon loss (final value after warmup)')
+                        help='Target SupCon temperature (final value after warmup)')
     parser.add_argument('--temperature_init', type=float, default=0.2,
-                        help='Initial temperature for warmup (higher = easier loss landscape early on). '
-                             'Linearly anneals to --temperature over --temperature_warmup_steps steps.')
+                        help='Initial temperature for warmup')
     parser.add_argument('--temperature_warmup_steps', type=int, default=200,
-                        help='Number of steps to linearly anneal temperature from temperature_init '
-                             'to temperature. Set 0 to disable warmup.')
-    parser.add_argument('--margin',     type=float, default=0.3,
-                        help='Margin for triplet loss (higher = harder constraint)')
-    parser.add_argument('--lambda_reg', type=float, default=0.1,
-                        help='Weight of noun regularization loss (0 to disable)')
-    parser.add_argument('--lambda_entropy', type=float, default=0.01,
-                        help='Weight of routing entropy loss (0 to disable). '
-                             'Maximises routing distribution entropy so the router '
-                             'does not collapse to a single layer. Recommended: 0.005~0.05.')
+                        help='Steps to anneal temperature_init → temperature (0 = off)')
+    parser.add_argument('--margin',      type=float, default=0.3,
+                        help='Margin for triplet loss')
+    parser.add_argument('--lambda_disc', type=float, default=0.1,
+                        help='Weight of layer discriminability loss L_disc. '
+                             'Directly supervises routing weights to concentrate on '
+                             'the most discriminative scale layer. (0 to disable)')
+    parser.add_argument('--disc_temperature', type=float, default=1.0,
+                        help='Softmax temperature for disc→target distribution '
+                             '(lower = sharper target; default 1.0)')
 
     # Training
     parser.add_argument('--epochs',      type=int,   default=10)
