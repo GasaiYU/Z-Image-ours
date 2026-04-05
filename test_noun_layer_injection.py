@@ -227,33 +227,14 @@ def run(args):
     print(f"Total layers : {len(hs)}")
 
     # ── build experiment configs ───────────────────────────────────────────
-    configs = [{"label": "baseline"}]
+    configs = [{"label": "baseline", "noun_dr": None, "count_dr": None}]
 
-    # Sweep: noun decay only
-    for dr in args.noun_decay_rates:
+    for dr in args.decay_rates:
         configs.append({
-            "label":    f"noun_decay  [{args.noun_rs},{args.noun_re}) dr={dr}",
+            "label":    f"decay dr={dr}",
             "noun_dr":  dr,
-            "count_dr": None,
-        })
-
-    # Sweep: count decay only
-    for dr in args.count_decay_rates:
-        configs.append({
-            "label":    f"count_decay [{args.count_rs},{args.count_re}) dr={dr}",
-            "noun_dr":  None,
             "count_dr": dr,
         })
-
-    # Sweep: both
-    for n_dr in args.noun_decay_rates:
-        for c_dr in args.count_decay_rates:
-            configs.append({
-                "label":    (f"both  noun[{args.noun_rs},{args.noun_re})dr={n_dr}"
-                             f" cnt[{args.count_rs},{args.count_re})dr={c_dr}"),
-                "noun_dr":  n_dr,
-                "count_dr": c_dr,
-            })
 
     print(f"\n{len(configs)} configs × {args.num_seeds} seeds = "
           f"{len(configs) * args.num_seeds} images\n")
@@ -304,21 +285,13 @@ def parse_args():
     p.add_argument("--model_dir",    default="ckpts/Z-Image-Turbo")
     p.add_argument("--out_dir",      default="noun_injection_results")
 
-    # Noun decay range
-    p.add_argument("--noun_rs",          type=int,   default=8,
-                   help="Noun decay: first layer (inclusive)")
-    p.add_argument("--noun_re",          type=int,   default=13,
-                   help="Noun decay: last layer (exclusive)")
-    p.add_argument("--noun_decay_rates", type=float, nargs="+", default=[0.1, 0.3, 0.5],
-                   help="Decay rates to sweep for noun tokens")
-
-    # Count-word decay range
-    p.add_argument("--count_rs",          type=int,   default=8,
-                   help="Count decay: first layer (inclusive)")
-    p.add_argument("--count_re",          type=int,   default=13,
-                   help="Count decay: last layer (exclusive)")
-    p.add_argument("--count_decay_rates", type=float, nargs="+", default=[0.1, 0.3, 0.5],
-                   help="Decay rates to sweep for count-word tokens")
+    # Shared decay range (applied to both nouns and count words)
+    p.add_argument("--noun_rs",      type=int,   default=8)
+    p.add_argument("--noun_re",      type=int,   default=13)
+    p.add_argument("--count_rs",     type=int,   default=8)
+    p.add_argument("--count_re",     type=int,   default=13)
+    p.add_argument("--decay_rates",  type=float, nargs="+", default=[0.1, 0.3, 0.5],
+                   help="Decay rates to sweep (applied to both nouns and count words)")
 
     p.add_argument("--num_seeds",    type=int, default=4)
     p.add_argument("--start_seed",   type=int, default=42)
