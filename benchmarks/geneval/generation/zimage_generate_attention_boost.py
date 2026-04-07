@@ -145,38 +145,102 @@ def remove_attention_boost(layers, original_forwards):
         layers[layer_idx].forward = orig_fwd
 
 
+# ── Count Token Decay Fusion（与 noun_count_decay.py 保持一致）────────────────
+
+def decay_weights(n, decay_rate, device, dtype):
+    w = torch.exp(-decay_rate * torch.arange(n, device=device, dtype=torch.float32))
+    return (w / w.sum()).to(dtype)
+
+
+def build_count_decay_embeds(prompts, text_encoder, tokenizer, device,
+                             count_rs, count_re, count_dr,
+                             max_sequence_length=512):
+    """对 count token 做 Decay Fusion，同时返回 token indices 供 Attention Boost 使用。"""
+    messages_batch = [[{"role": "user", "content": p}] for p in prompts]
+    formatted = [
+        tokenizer.apply_chat_template(
+            m, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+        for m in messages_batch
+    ]
+    enc = tokenizer(formatted, padding="max_length", max_length=max_sequence_length,
+                    truncation=True, return_tensors="pt")
+    ids  = enc.input_ids.to(device)
+    mask = enc.attention_mask.to(device).bool()
+
+    with torch.no_grad():
+        out = text_encoder(input_ids=ids, attention_mask=mask,
+                           output_hidden_states=True)
+
+    hs    = out.hidden_states   # tuple of [B, S, D]
+    total = len(hs)
+    mixed = hs[-2].clone()
+
+    c_rs = max(1, count_rs)
+    c_re = max(c_rs + 1, min(count_re, total - 1))
+    c_layers = hs[c_rs:c_re]
+    c_w = decay_weights(len(c_layers), count_dr, device, mixed.dtype)
+
+    batch_count_indices = []
+    batch_noun_indices  = []
+
+    for b in range(ids.shape[0]):
+        valid_ids = ids[b][mask[b]]
+        tokens    = [tokenizer.decode([t]) for t in valid_ids.tolist()]
+        cs, ce    = content_span(tokens)
+        content   = tokens[cs:ce]
+
+        c_idx = find_count_indices(content)
+        n_idx = find_noun_indices(content, set(c_idx))
+
+        batch_count_indices.append([cs + i for i in c_idx])
+        batch_noun_indices.append( [cs + i for i in n_idx])
+
+        # count token: Decay Fusion
+        for ci in c_idx:
+            fi    = cs + ci
+            fused = torch.zeros_like(mixed[b, fi, :], dtype=torch.float32)
+            for i, lyr in enumerate(c_layers):
+                fused += c_w[i].float() * lyr[b, fi, :].float()
+            mixed[b, fi, :] = fused.to(mixed.dtype)
+
+    print(f"  [count decay] layers [{c_rs},{c_re})  n={len(c_layers)}  "
+          f"rate={count_dr}  w[0]={c_w[0]:.4f}")
+    return mixed, ids, mask, batch_count_indices, batch_noun_indices
+
+
 # ── Generation Wrapper ────────────────────────────────────────────────────────
 
 def generate_with_attention_boost(components, prompts, opt, device, generator):
     text_encoder = components["text_encoder"]
-    tokenizer = components["tokenizer"]
+    tokenizer    = components["tokenizer"]
 
-    messages_batch = [[{"role": "user", "content": p}] for p in prompts]
-    formatted = [
-        tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-        for m in messages_batch
-    ]
-    enc = tokenizer(formatted, padding="max_length", max_length=opt.max_sequence_length, truncation=True, return_tensors="pt")
-    ids = enc.input_ids.to(device)
-    mask = enc.attention_mask.to(device).bool()
+    # Step 1: Count token Decay Fusion（提取浅层精确数字特征）
+    mixed_embeds, expected_ids, _, batch_count_indices, batch_noun_indices = \
+        build_count_decay_embeds(
+            prompts, text_encoder, tokenizer, device,
+            count_rs=opt.count_rs, count_re=opt.count_re, count_dr=opt.count_dr,
+            max_sequence_length=opt.max_sequence_length,
+        )
 
-    # 找出每个 batch 的 token indices
-    batch_count_indices = []
-    batch_noun_indices = []
-    for b in range(ids.shape[0]):
-        valid_ids = ids[b][mask[b]]
-        tokens = [tokenizer.decode([t]) for t in valid_ids.tolist()]
-        cs, ce = content_span(tokens)
-        content = tokens[cs:ce]
-        c_idx = find_count_indices(content)
-        n_idx = find_noun_indices(content, set(c_idx))
-        batch_count_indices.append([cs + i for i in c_idx])
-        batch_noun_indices.append([cs + i for i in n_idx])
+    # Step 2: 注入 count token 的 mixed_embeds（Monkey patch text_encoder.forward）
+    original_te_fwd = text_encoder.forward
 
-    # 应用 Monkey Patch（修改 4D Attention Mask，模型无关）
+    def patched_te_fwd(input_ids, attention_mask, **kwargs):
+        class O: pass
+        o = O()
+        if input_ids.shape == expected_ids.shape and torch.equal(input_ids, expected_ids):
+            o.hidden_states = [None] * 40
+            o.hidden_states[-2] = mixed_embeds
+            return o
+        return original_te_fwd(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+    text_encoder.forward = patched_te_fwd
+
+    # Step 3: Noun token Attention Boosting（强迫深层名词重新关注数量词）
+    print(f"  [attn boost]  start_layer={opt.start_layer}  boost_value={opt.boost_value}")
     orig_fwds, layers = apply_attention_boost(
         text_encoder, batch_count_indices, batch_noun_indices,
-        boost_value=opt.boost_value, start_layer=opt.start_layer
+        boost_value=opt.boost_value, start_layer=opt.start_layer,
     )
 
     try:
@@ -192,6 +256,7 @@ def generate_with_attention_boost(components, prompts, opt, device, generator):
         )
     finally:
         remove_attention_boost(layers, orig_fwds)
+        text_encoder.forward = original_te_fwd
 
     return images
 
@@ -212,7 +277,8 @@ def main(opt):
     components = load_from_local_dir(model_path, device=device, dtype=torch.bfloat16, compile=False)
     set_attention_backend(os.environ.get("ZIMAGE_ATTENTION", "_native_flash"))
 
-    print(f"Attention Boost: +{opt.boost_value} starting from layer {opt.start_layer}")
+    print(f"count decay:  layers [{opt.count_rs},{opt.count_re})  rate={opt.count_dr}")
+    print(f"attn boost:   +{opt.boost_value} from layer {opt.start_layer}")
 
     for index, metadata in enumerate(metadatas):
         seed_everything(opt.seed)
@@ -260,11 +326,20 @@ def parse_args():
     p.add_argument("--tags", type=str, nargs="+", default=None)
     p.add_argument("--max_sequence_length", type=int, default=512)
 
-    # Attention Boost 参数
-    p.add_argument("--boost_value", type=float, default=10.0, 
-                   help="加在 Attention Score 上的 Bias 值（Softmax之前）。10.0 几乎能保证注意力权重接近 1.0。")
-    p.add_argument("--start_layer", type=int, default=20, 
-                   help="从哪一层开始干预。建议从深层（特征开始坍缩的地方）开始，比如 20。")
+    # Count token: Decay Fusion（浅层精确数字特征）
+    p.add_argument("--count_rs",  type=int,   default=8,
+                   help="Count decay 起始层 (inclusive)")
+    p.add_argument("--count_re",  type=int,   default=13,
+                   help="Count decay 结束层 (exclusive)")
+    p.add_argument("--count_dr",  type=float, default=0.3,
+                   help="Count decay rate")
+
+    # Noun token: Attention Boosting（强迫深层名词关注数量词）
+    p.add_argument("--boost_value", type=float, default=10.0,
+                   help="加在 Attention Score 上的 Bias 值（Softmax 之前）。"
+                        "10.0 几乎能保证注意力权重接近 1.0。")
+    p.add_argument("--start_layer", type=int, default=20,
+                   help="从哪一层开始 Attention Boost 干预（建议从特征坍缩处开始，如 20）。")
 
     return p.parse_args()
 
