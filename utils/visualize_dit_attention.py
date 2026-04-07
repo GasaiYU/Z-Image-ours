@@ -222,10 +222,11 @@ def install_hooks(
 
                 if capture.should_capture(layer_id):
                     with torch.no_grad():
-                        # Re-compute Q, K with RoPE in float32
-                        hs = hidden_states.float()
-                        q = attn_module.to_q(hs)
-                        k = attn_module.to_k(hs)
+                        # Project in the module's native dtype, then upcast to float32
+                        weight_dtype = attn_module.to_q.weight.dtype
+                        hs = hidden_states.to(weight_dtype)
+                        q = attn_module.to_q(hs).float()
+                        k = attn_module.to_k(hs).float()
 
                         q = q.unflatten(-1, (attn_module.n_heads,    attn_module.head_dim))
                         k = k.unflatten(-1, (attn_module.n_kv_heads, attn_module.head_dim))
