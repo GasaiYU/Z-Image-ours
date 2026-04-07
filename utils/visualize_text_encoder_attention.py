@@ -51,6 +51,7 @@ import argparse
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib
@@ -61,6 +62,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from pytorch_lightning import seed_everything
+from transformers import AutoModel, AutoTokenizer
 
 # ── path setup ────────────────────────────────────────────────────────────────
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -69,7 +71,7 @@ for _p in (_ROOT, _SRC):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from utils import ensure_model_weights, load_from_local_dir
+from utils import ensure_model_weights
 
 torch.set_grad_enabled(False)
 
@@ -444,16 +446,45 @@ def experiment_C(
 
 # ── 主函数 ────────────────────────────────────────────────────────────────────
 
+def load_text_encoder(opt: argparse.Namespace, device: str):
+    """
+    只加载 Text Encoder 和 Tokenizer（跳过 DiT/VAE，节省内存），
+    并强制使用 eager attention，以支持 output_attentions=True。
+    """
+    model_path = ensure_model_weights("ckpts/Z-Image-Turbo", verify=False)
+    model_path = Path(model_path)
+
+    text_encoder_dir = model_path / "text_encoder"
+    tokenizer_dir    = model_path / "tokenizer"
+
+    print(f"Loading text encoder from: {text_encoder_dir}")
+    print("  (attn_implementation=eager to enable output_attentions)")
+
+    text_encoder = AutoModel.from_pretrained(
+        str(text_encoder_dir),
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation="eager",   # ← 必须！sdpa 不支持 output_attentions
+    ).to(device)
+    text_encoder.eval()
+
+    tokenizer_path = str(tokenizer_dir) if tokenizer_dir.exists() \
+                     else str(text_encoder_dir)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path, trust_remote_code=True
+    )
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    print("  Text encoder loaded.")
+    return text_encoder, tokenizer
+
+
 def main(opt: argparse.Namespace) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     seed_everything(opt.seed)
 
-    model_path  = ensure_model_weights("ckpts/Z-Image-Turbo", verify=False)
-    components  = load_from_local_dir(model_path, device=device,
-                                      dtype=torch.bfloat16, compile=False)
-    tokenizer    = components["tokenizer"]
-    text_encoder = components["text_encoder"]
+    text_encoder, tokenizer = load_text_encoder(opt, device)
 
     slug   = re.sub(r"[^a-z0-9]+", "_", opt.prompt.lower())[:50].strip("_")
     outdir = os.path.join(opt.outdir, slug)
