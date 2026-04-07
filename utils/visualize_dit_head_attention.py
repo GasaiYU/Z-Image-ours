@@ -429,8 +429,11 @@ def visualize(
 
                 attn_1d = torch.stack(cols).mean(0).numpy()[:grid_h * grid_w]
                 spatial = attn_1d.reshape(grid_h, grid_w)
-                lo, hi  = spatial.min(), spatial.max()
-                spatial = (spatial - lo) / (hi - lo + 1e-8)
+                
+                # Use percentile clipping to enhance contrast and remove extreme outliers
+                lo = np.percentile(spatial, 5)
+                hi = np.percentile(spatial, 99)
+                spatial = np.clip((spatial - lo) / (hi - lo + 1e-8), 0, 1)
 
                 ax.imshow(spatial, cmap="hot", interpolation="bilinear",
                           vmin=0, vmax=1)
