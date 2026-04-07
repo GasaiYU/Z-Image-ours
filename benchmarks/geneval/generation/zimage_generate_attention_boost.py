@@ -25,7 +25,6 @@ from einops import rearrange
 from torchvision.utils import make_grid
 from torchvision.transforms import ToTensor
 from pytorch_lightning import seed_everything
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 from utils import ensure_model_weights, load_from_local_dir, set_attention_backend
@@ -76,106 +75,74 @@ def find_noun_indices(content_tokens, count_indices_set):
 
 # ── Attention Patching ────────────────────────────────────────────────────────
 
-def apply_attention_boost(text_encoder, expected_ids, count_indices, noun_indices, boost_value, start_layer):
+def _get_decoder_layers(model):
     """
-    Monkey patch Qwen2Attention to boost specific attention scores.
+    通用方法：从任意 HuggingFace 模型中找到 Transformer Layer 列表。
+    兼容 Qwen3 / Qwen2 / LLaMA 等 Decoder-only 模型。
     """
+    for attr_path in ["layers", "model.layers", "encoder.layers", "transformer.h"]:
+        obj = model
+        found = True
+        for part in attr_path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                found = False
+                break
+        if found and obj is not None:
+            return obj
+    raise AttributeError(
+        f"Cannot find transformer layers in {type(model).__name__}. "
+        f"Tried: layers, model.layers, encoder.layers, transformer.h"
+    )
+
+
+def apply_attention_boost(text_encoder, count_indices, noun_indices, boost_value, start_layer):
+    """
+    通过修改传递给每一层的 4D Attention Mask 来注入 Boost。
+    这是模型无关（Model-Agnostic）的方法：
+      - 不依赖任何具体的 Attention 实现（Qwen2/Qwen3/LLaMA）
+      - Transformer 内部: attn_scores = QK^T / sqrt(d) + attention_mask
+      - 因此，在 attention_mask 的 [b, :, noun_idx, count_idx] 位置加上 boost_value，
+        等价于在 Softmax 前直接放大该位置的 attention score。
+    """
+    layers = _get_decoder_layers(text_encoder)
     original_forwards = {}
 
-    for layer_idx, layer in enumerate(text_encoder.encoder.layers):
-        attn_module = layer.self_attn
-        original_forwards[layer_idx] = attn_module.forward
-
+    for layer_idx, layer in enumerate(layers):
+        original_forwards[layer_idx] = layer.forward
         if layer_idx < start_layer:
             continue
 
-        def make_patched_forward(orig_fwd, l_idx):
-            def patched_forward(
-                hidden_states,
-                attention_mask=None,
-                position_ids=None,
-                past_key_value=None,
-                output_attentions=False,
-                use_cache=False,
-                cache_position=None,
-                **kwargs
-            ):
-                # 1. 检查是否是我们关心的 input_ids（避免影响其他无关的 forward）
-                # 由于在 transformers 内部 forward 时拿不到 input_ids，我们通过 seq_len 简单过滤
-                # 这是一个 hack，但在单次推理中足够安全
-                seq_len = hidden_states.shape[1]
-                is_target = (seq_len == expected_ids.shape[1])
+        def make_patched(orig_fwd, _c_idxs, _n_idxs):
+            def patched(hidden_states, attention_mask=None, **kwargs):
+                if attention_mask is not None and attention_mask.dim() == 4:
+                    # attention_mask shape: [B, 1, seq_len, seq_len]
+                    # 值是加性 mask：0 表示可以 attend，-inf 表示被遮蔽
+                    # 我们在 noun->count 的位置加上 boost_value，强迫注意力集中
+                    bsz = attention_mask.shape[0]
+                    q_len = attention_mask.shape[2]
+                    boosted = attention_mask.clone()
+                    for b in range(min(bsz, len(_c_idxs))):
+                        for ni in _n_idxs[b]:
+                            for ci in _c_idxs[b]:
+                                if ni < q_len and ci < q_len and ni >= ci:
+                                    boosted[b, :, ni, ci] = boosted[b, :, ni, ci] + boost_value
+                    return orig_fwd(hidden_states, attention_mask=boosted, **kwargs)
+                return orig_fwd(hidden_states, attention_mask=attention_mask, **kwargs)
+            return patched
 
-                if not is_target:
-                    return orig_fwd(
-                        hidden_states=hidden_states, attention_mask=attention_mask,
-                        position_ids=position_ids, past_key_value=past_key_value,
-                        output_attentions=output_attentions, use_cache=use_cache,
-                        cache_position=cache_position, **kwargs
-                    )
+        layer.forward = make_patched(
+            original_forwards[layer_idx],
+            count_indices,
+            noun_indices,
+        )
 
-                # 2. 手动实现 Qwen2 的 Attention 计算，以便在 Softmax 前注入 Bias
-                bsz, q_len, _ = hidden_states.size()
-                
-                # 获取 Q, K, V
-                query_states = attn_module.q_proj(hidden_states)
-                key_states = attn_module.k_proj(hidden_states)
-                value_states = attn_module.v_proj(hidden_states)
-
-                query_states = query_states.view(bsz, q_len, attn_module.num_heads, attn_module.head_dim).transpose(1, 2)
-                key_states = key_states.view(bsz, q_len, attn_module.num_key_value_heads, attn_module.head_dim).transpose(1, 2)
-                value_states = value_states.view(bsz, q_len, attn_module.num_key_value_heads, attn_module.head_dim).transpose(1, 2)
-
-                # RoPE
-                cos, sin = attn_module.rotary_emb(value_states, position_ids)
-                from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-                # Repeat KV if needed (GQA)
-                from transformers.models.qwen2.modeling_qwen2 import repeat_kv
-                key_states = repeat_kv(key_states, attn_module.num_key_value_groups)
-                value_states = repeat_kv(value_states, attn_module.num_key_value_groups)
-
-                # QK^T
-                attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(attn_module.head_dim)
-
-                # Apply standard attention mask
-                if attention_mask is not None:
-                    attn_weights = attn_weights + attention_mask
-
-                # ── 核心干预逻辑：Attention Boosting ──
-                # 给所有 Head 的 [noun_idx, count_idx] 加上 boost_value
-                for b in range(bsz):
-                    for ni in noun_indices[b]:
-                        for ci in count_indices[b]:
-                            # 确保不会越界
-                            if ni < q_len and ci < q_len:
-                                # 只在因果允许的范围内加（ni >= ci）
-                                if ni >= ci:
-                                    attn_weights[b, :, ni, ci] += boost_value
-
-                # Softmax
-                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                attn_weights = F.dropout(attn_weights, p=attn_module.attention_dropout, training=attn_module.training)
-
-                # V
-                attn_output = torch.matmul(attn_weights, value_states)
-                attn_output = attn_output.transpose(1, 2).contiguous()
-                attn_output = attn_output.reshape(bsz, q_len, -1)
-                attn_output = attn_module.o_proj(attn_output)
-
-                return attn_output, None, past_key_value
-
-            return patched_forward
-
-        layer.self_attn.forward = make_patched_forward(original_forwards[layer_idx], layer_idx)
-
-    return original_forwards
+    return original_forwards, layers
 
 
-def remove_attention_boost(text_encoder, original_forwards):
+def remove_attention_boost(layers, original_forwards):
     for layer_idx, orig_fwd in original_forwards.items():
-        text_encoder.encoder.layers[layer_idx].self_attn.forward = orig_fwd
+        layers[layer_idx].forward = orig_fwd
 
 
 # ── Generation Wrapper ────────────────────────────────────────────────────────
@@ -206,12 +173,9 @@ def generate_with_attention_boost(components, prompts, opt, device, generator):
         batch_count_indices.append([cs + i for i in c_idx])
         batch_noun_indices.append([cs + i for i in n_idx])
 
-    # 必须强制使用 eager 模式才能拦截 attention
-    text_encoder.config._attn_implementation = "eager"
-
-    # 应用 Monkey Patch
-    orig_fwds = apply_attention_boost(
-        text_encoder, ids, batch_count_indices, batch_noun_indices, 
+    # 应用 Monkey Patch（修改 4D Attention Mask，模型无关）
+    orig_fwds, layers = apply_attention_boost(
+        text_encoder, batch_count_indices, batch_noun_indices,
         boost_value=opt.boost_value, start_layer=opt.start_layer
     )
 
@@ -227,7 +191,7 @@ def generate_with_attention_boost(components, prompts, opt, device, generator):
             max_sequence_length=opt.max_sequence_length,
         )
     finally:
-        remove_attention_boost(text_encoder, orig_fwds)
+        remove_attention_boost(layers, orig_fwds)
 
     return images
 
