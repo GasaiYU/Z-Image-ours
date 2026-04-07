@@ -483,6 +483,103 @@ def visualize(
         print("  Saved: top_head_text_attn.png")
 
 
+def visualize_all_heads(
+    capture:     HeadCapture,
+    grid_h: int,
+    grid_w: int,
+    word_label:  str,
+    word_indices: List[int],
+    binding_arr: np.ndarray,   # [n_timesteps, n_layers, n_heads]
+    t_idxs:      List[int],
+    layer_idxs:  List[int],
+    outdir: str,
+) -> None:
+    """
+    为每个捕获的 timestep，画一张大图：
+        行 = 捕获的 Layer，列 = 所有 Head
+    每个小格是该 Head 对 word 的空间注意力热力图。
+    小格边框颜色编码 Binding Score（越红说明该头越关心 count-noun 绑定）。
+
+    额外在每个小格右上角叠加一个小三角，颜色深浅代表 binding score 高低。
+    """
+    if not word_indices:
+        return
+
+    n_layers = len(layer_idxs)
+    n_heads  = binding_arr.shape[2]
+
+    # 归一化 binding score 用于颜色映射
+    bs_min, bs_max = binding_arr.min(), binding_arr.max()
+
+    for ti, t_idx in enumerate(t_idxs):
+        cell   = 1.8          # 每个小格的英寸大小
+        margin = 0.6
+        fig_w  = cell * n_heads + margin
+        fig_h  = cell * n_layers + margin + 0.4   # 额外留标题空间
+
+        fig, axes = plt.subplots(
+            n_layers, n_heads,
+            figsize=(fig_w, fig_h),
+            squeeze=False,
+        )
+        fig.suptitle(
+            f'All Heads | Spatial Attention to "{word_label}" | Step {t_idx}\n'
+            f'(border color = binding score: red=high, blue=low)',
+            fontsize=10,
+        )
+
+        for li, layer in enumerate(layer_idxs):
+            for h in range(n_heads):
+                ax = axes[li][h]
+
+                img_text = capture.img_text_maps.get(t_idx, {}).get(layer, {}).get(h)
+                if img_text is None:
+                    ax.set_visible(False)
+                    continue
+
+                cols = [img_text[:, wi] for wi in word_indices
+                        if wi < img_text.shape[1]]
+                if not cols:
+                    ax.set_visible(False)
+                    continue
+
+                attn_1d = torch.stack(cols).mean(0).numpy()[:grid_h * grid_w]
+                spatial = attn_1d.reshape(grid_h, grid_w)
+                lo = np.percentile(spatial, 5)
+                hi = np.percentile(spatial, 99)
+                spatial = np.clip((spatial - lo) / (hi - lo + 1e-8), 0, 1)
+
+                ax.imshow(spatial, cmap="hot", interpolation="bilinear",
+                          vmin=0, vmax=1)
+
+                # 边框颜色：根据 binding score，从蓝（低）到红（高）
+                score = binding_arr[ti, li, h]
+                norm_score = (score - bs_min) / (bs_max - bs_min + 1e-8)
+                # 蓝 → 黄 → 红  (使用 "RdYlBu_r" colormap)
+                import matplotlib.cm as cm
+                border_color = cm.RdYlBu_r(norm_score)
+                for spine in ax.spines.values():
+                    spine.set_edgecolor(border_color)
+                    spine.set_linewidth(2.5)
+
+                # 小标题（只在第一行加 Head 索引，只在第一列加 Layer 索引）
+                if li == 0:
+                    ax.set_title(f"H{h}", fontsize=5, pad=1)
+                if h == 0:
+                    ax.set_ylabel(f"L{layer}", fontsize=5, labelpad=1)
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+        plt.subplots_adjust(wspace=0.05, hspace=0.15,
+                            left=0.04, right=0.99,
+                            top=0.93, bottom=0.01)
+        slug_word = word_label.replace(" ", "_")
+        fname     = f"all_heads_step{t_idx:02d}_{slug_word}.png"
+        plt.savefig(os.path.join(outdir, fname), dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {fname}")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main(opt: argparse.Namespace) -> None:
@@ -577,6 +674,23 @@ def main(opt: argparse.Namespace) -> None:
         outdir=outdir,
         gen_image=gen_image,
     )
+
+    if opt.show_all_heads:
+        arr, t_idxs, layer_idxs = _binding_score_array(capture)
+        grid_h = (opt.H // 16) // 2
+        grid_w = (opt.W // 16) // 2
+        print("\nGenerating all-heads visualizations...")
+        for word_label, word_indices in [
+            (opt.count_token, capture.count_indices),
+            (opt.noun_token,  capture.noun_indices),
+        ]:
+            visualize_all_heads(
+                capture, grid_h, grid_w,
+                word_label, word_indices,
+                arr, t_idxs, layer_idxs,
+                outdir,
+            )
+
     print(f"\nDone. Results saved to: {outdir}")
 
 
@@ -600,6 +714,8 @@ def parse_args() -> argparse.Namespace:
                    help="要捕获的去噪步索引（0=第一步）")
     p.add_argument("--top_k_heads",  type=int, default=6,
                    help="展示绑定分数最高的 Top-K 个 (layer, head) 组合")
+    p.add_argument("--show_all_heads", action="store_true",
+                   help="额外生成全头可视化图（行=layer，列=head，边框颜色=binding score）")
     return p.parse_args()
 
 
