@@ -11,24 +11,19 @@ generate_triplet_images.py
                 seed{seed}.png
                 meta.json
 
-单卡用法：
-    python data/generate_triplet_images.py \
-        --triplet_dir data/train_triplets \
-        --outdir      data/generated_images \
-        --n_samples   4 --batch_size 4
+单卡用法（直接运行，默认 rank=0 world_size=1）：
+    python data/generate_triplet_images.py
 
-多卡用法（自动检测所有 GPU）：
-    python data/generate_triplet_images.py --n_gpus 8
-
-指定 GPU：
-    python data/generate_triplet_images.py --gpu_ids 0 1 2 3
+多卡用法（用 bash 脚本依次启动独立进程，每进程独占一张卡）：
+    bash data/gen_image.sh               # 默认 8 卡
+    N_GPUS=4 bash data/gen_image.sh      # 只用前 4 张
+    N_GPUS=1 bash data/gen_image.sh      # 单卡调试（等同于直接 python）
 """
 
 import argparse
 import json
 import re
 import torch
-import torch.multiprocessing as mp
 from pathlib import Path
 from tqdm import tqdm
 
@@ -89,24 +84,11 @@ def load_all_anchors(triplet_dir: str, tasks: list) -> list:
 
 def worker(rank: int, gpu_id: int, shard: list, opt):
     """每个进程负责处理 shard 中的 anchor 列表，独占 gpu_id 这张卡。"""
+    # 通过 CUDA_VISIBLE_DEVICES 启动时，只能看到一张卡，统一用 cuda:0
     device = f"cuda:{gpu_id}"
     dtype  = torch.bfloat16
 
-    # 限制每个进程的 CPU 线程数，防止 8 个进程把所有核心都抢光
-    # 如果服务器有 N 核，建议设为 N // n_gpus，比如 64核8卡 → 8
-    torch.set_num_threads(max(1, torch.get_num_threads() // 8))
-
-    # 只在 rank==0 的进程打印总体信息
-    is_main = (rank == 0)
-    if is_main:
-        print(f"[GPU {gpu_id}] Loading QwenImagePipeline ...")
-
-    # 解决多卡加载模型时的 IO 拥堵：错开加载时间
-    if not is_main:
-        import time
-        import random
-        # 睡 0~10 秒，避免 8 个进程同时读硬盘、解压 safetensors 导致 IO 瓶颈
-        time.sleep(random.uniform(0, 10))
+    print(f"[rank={rank} GPU={gpu_id}] Loading QwenImagePipeline ...")
 
     from diffusers import QwenImagePipeline
     pipe = QwenImagePipeline.from_pretrained(
@@ -194,43 +176,22 @@ def worker(rank: int, gpu_id: int, shard: list, opt):
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
 def main(opt):
-    # 确定使用哪几张 GPU
-    n_available = torch.cuda.device_count()
-    if opt.gpu_ids:
-        gpu_ids = opt.gpu_ids
-    elif opt.n_gpus > 0:
-        gpu_ids = list(range(min(opt.n_gpus, n_available)))
-    else:
-        gpu_ids = list(range(n_available)) if n_available > 0 else []
-
-    if not gpu_ids:
-        print("No CUDA GPU found, falling back to CPU (slow!).")
-        gpu_ids = [None]   # None → CPU
-
     # 收集所有 anchor，全局去重
     all_items = load_all_anchors(opt.triplet_dir, opt.tasks)
     total     = len(all_items)
-    n_gpus    = len(gpu_ids)
-    print(f"Total unique (task, anchor) pairs: {total}")
-    print(f"Using {n_gpus} GPU(s): {gpu_ids}")
 
-    if n_gpus == 1:
-        # 单卡：直接在主进程里跑，方便调试
-        worker(0, gpu_ids[0] if gpu_ids[0] is not None else "cpu",
-               all_items, opt)
-    else:
-        # 多卡：均匀切分，每张卡启动一个独立进程
-        shards = [all_items[i::n_gpus] for i in range(n_gpus)]
-        processes = []
-        mp.set_start_method("spawn", force=True)
-        for rank, (gpu_id, shard) in enumerate(zip(gpu_ids, shards)):
-            p = mp.Process(target=worker, args=(rank, gpu_id, shard, opt))
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
+    # 通过 --rank / --world_size 切分数据（bash 多进程模式）
+    rank       = opt.rank
+    world_size = opt.world_size
+    shard      = all_items[rank::world_size]
 
-    print(f"\nAll done. Images saved to: {opt.outdir}")
+    print(f"Total unique anchors: {total}")
+    print(f"This worker: rank={rank}/{world_size}  shard_size={len(shard)}")
+
+    # CUDA_VISIBLE_DEVICES 已经由 bash 脚本设置，直接用 cuda:0
+    gpu_id = 0
+    worker(rank, gpu_id, shard, opt)
+    print(f"\n[rank={rank}] Done. Images saved to: {opt.outdir}")
 
 
 def parse_args():
@@ -247,11 +208,11 @@ def parse_args():
     p.add_argument("--height",      type=int, default=DEFAULT_HEIGHT)
     p.add_argument("--seed",        type=int, default=42)
 
-    # 多卡控制（二选一）
-    p.add_argument("--n_gpus",   type=int, default=0,
-                   help="使用前 N 张 GPU（0 = 自动检测所有）")
-    p.add_argument("--gpu_ids",  type=int, nargs="+", default=None,
-                   help="手动指定 GPU ID，如 --gpu_ids 0 1 4 5")
+    # bash 多进程分片参数
+    p.add_argument("--rank",       type=int, default=0,
+                   help="当前进程编号（0-based），由 bash 脚本传入")
+    p.add_argument("--world_size", type=int, default=1,
+                   help="总进程数，由 bash 脚本传入")
     return p.parse_args()
 
 
