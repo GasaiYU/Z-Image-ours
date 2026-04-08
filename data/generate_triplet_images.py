@@ -97,10 +97,33 @@ def worker(rank: int, gpu_id: int, shard: list, opt):
     if is_main:
         print(f"[GPU {gpu_id}] Loading QwenImagePipeline ...")
 
+    # 解决多卡加载模型时的 IO 拥堵：错开加载时间
+    if not is_main:
+        import time
+        import random
+        # 睡 0~10 秒，避免 8 个进程同时读硬盘、解压 safetensors 导致 IO 瓶颈
+        time.sleep(random.uniform(0, 10))
+
     from diffusers import QwenImagePipeline
     pipe = QwenImagePipeline.from_pretrained(
         "Qwen/Qwen-Image-2512", torch_dtype=dtype
     ).to(device)
+    
+    # 开启内存/速度优化：
+    # 1. 禁用 cudnn_benchmark，在多进程变长序列下它会导致每次都重新寻找最优算法，反而极慢
+    torch.backends.cudnn.benchmark = False
+    
+    # 2. VAE Tiling 和 Slicing 会大幅降低推理速度（用时间换空间）。
+    # 如果你不爆显存（比如 A100 80G），千万不要开！
+    # pipe.vae.enable_tiling()
+    # pipe.vae.enable_slicing()
+    
+    # 3. 开启 xformers 或 sdpa 加速（如果环境支持）
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception:
+        pass # fallback to default SDPA
+
     pipe.set_progress_bar_config(disable=True)
 
     outdir = Path(opt.outdir)
@@ -206,8 +229,8 @@ def parse_args():
                    default=["counting", "color", "scene", "non-spatial"])
     p.add_argument("--n_samples",   type=int, default=4,
                    help="每个 anchor 生成几张图")
-    p.add_argument("--batch_size",  type=int, default=4,
-                   help="单次推理 batch size")
+    p.add_argument("--batch_size",  type=int, default=1,
+                   help="单次推理 batch size (建议设为1，QwenImage 1024x1024 很容易 OOM)")
     p.add_argument("--width",       type=int, default=DEFAULT_WIDTH)
     p.add_argument("--height",      type=int, default=DEFAULT_HEIGHT)
     p.add_argument("--seed",        type=int, default=42)
