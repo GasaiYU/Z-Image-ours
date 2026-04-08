@@ -92,6 +92,10 @@ def worker(rank: int, gpu_id: int, shard: list, opt):
     device = f"cuda:{gpu_id}"
     dtype  = torch.bfloat16
 
+    # 限制每个进程的 CPU 线程数，防止 8 个进程把所有核心都抢光
+    # 如果服务器有 N 核，建议设为 N // n_gpus，比如 64核8卡 → 8
+    torch.set_num_threads(max(1, torch.get_num_threads() // 8))
+
     # 只在 rank==0 的进程打印总体信息
     is_main = (rank == 0)
     if is_main:
