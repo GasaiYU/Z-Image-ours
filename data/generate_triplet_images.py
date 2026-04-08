@@ -124,6 +124,9 @@ def worker(rank: int, gpu_id: int, shard: list, opt):
     except Exception:
         pass # fallback to default SDPA
 
+    # 4. 强制使用 CPU offload（如果你的显存是 40G 或更小，极力推荐开启，能彻底解决越跑越慢的显存碎片问题）
+    # pipe.enable_model_cpu_offload()
+
     pipe.set_progress_bar_config(disable=True)
 
     outdir = Path(opt.outdir)
@@ -150,15 +153,20 @@ def worker(rank: int, gpu_id: int, shard: list, opt):
                     torch.Generator(device=device).manual_seed(opt.seed + generated + i)
                     for i in range(cur_bs)
                 ]
-                outs = pipe(
-                    prompt=[prompt] * cur_bs,
-                    negative_prompt=[NEGATIVE_PROMPT] * cur_bs,
-                    width=opt.width,
-                    height=opt.height,
-                    num_inference_steps=INFERENCE_STEPS,
-                    true_cfg_scale=CFG_SCALE,
-                    generator=gens,
-                ).images
+                
+                # 强制释放上一轮推理中残留的显存和计算图
+                torch.cuda.empty_cache()
+                
+                with torch.inference_mode(): # 使用 inference_mode 比 no_grad 更快，且绝对不存图
+                    outs = pipe(
+                        prompt=[prompt] * cur_bs,
+                        negative_prompt=[NEGATIVE_PROMPT] * cur_bs,
+                        width=opt.width,
+                        height=opt.height,
+                        num_inference_steps=INFERENCE_STEPS,
+                        true_cfg_scale=CFG_SCALE,
+                        generator=gens,
+                    ).images
                 images.extend(outs)
                 generated += cur_bs
         except Exception as e:
