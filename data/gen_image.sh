@@ -19,12 +19,9 @@ N_SAMPLES=${N_SAMPLES:-4}    # 每个 anchor 生成几张图
 BATCH_SIZE=${BATCH_SIZE:-1}  # 单次推理 batch size
 OUTDIR=${OUTDIR:-"data/generated_images"}
 TRIPLET_DIR=${TRIPLET_DIR:-"data/train_triplets"}
-LOG_DIR=${LOG_DIR:-"data/logs"}
 # 要生成的 task，空格分隔多个，留空则生成全部
 # 例：TASKS="counting" 或 TASKS="counting color"
 TASKS=${TASKS:-""}
-
-mkdir -p "$LOG_DIR"
 
 echo "========================================"
 echo "  Launching ${N_GPUS} workers"
@@ -36,7 +33,6 @@ echo "========================================"
 PIDS=()
 for (( rank=0; rank<N_GPUS; rank++ )); do
     gpu_id=$(( GPU_START + rank ))
-    log_file="${LOG_DIR}/rank${rank}_gpu${gpu_id}.log"
 
     # 若 TASKS 非空，则拼接 --tasks 参数（支持多个 task 空格分隔）
     TASKS_ARG=""
@@ -54,18 +50,14 @@ for (( rank=0; rank<N_GPUS; rank++ )); do
         --batch_size  "${BATCH_SIZE}" \
         --rank        "${rank}" \
         --world_size  "${N_GPUS}" \
-        ${TASKS_ARG} \
-        > "${log_file}" 2>&1 &
+        ${TASKS_ARG} &
 
     PIDS+=($!)
-    echo "  [rank=${rank}] pid=${PIDS[-1]}  GPU=${gpu_id}  log=${log_file}"
+    echo "  [rank=${rank}] pid=${PIDS[-1]}  GPU=${gpu_id}"
 done
 
 echo ""
 echo "All workers started. Waiting for completion ..."
-echo "You can monitor progress with:"
-echo "  tail -f ${LOG_DIR}/rank*.log"
-echo "  watch -n5 'grep -c \"seed\" ${OUTDIR}/*/*/*png 2>/dev/null | tail -1'"
 echo ""
 
 # 等待所有子进程结束，任何一个以非 0 退出则打印警告
@@ -84,6 +76,6 @@ echo ""
 if [[ $FAILED -eq 0 ]]; then
     echo "All workers finished successfully."
 else
-    echo "${FAILED} worker(s) failed. Check logs in ${LOG_DIR}/" >&2
+    echo "${FAILED} worker(s) failed." >&2
     exit 1
 fi
