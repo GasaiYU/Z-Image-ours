@@ -31,7 +31,7 @@ from tqdm import tqdm
 # ── 默认生成参数 ──────────────────────────────────────────────────────────────
 DEFAULT_WIDTH   = 1024
 DEFAULT_HEIGHT  = 1024
-INFERENCE_STEPS = 50
+INFERENCE_STEPS = 28
 CFG_SCALE       = 4.0
 NEGATIVE_PROMPT = (
     "low resolution, low quality, deformed limbs, deformed fingers, "
