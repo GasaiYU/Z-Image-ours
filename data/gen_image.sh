@@ -10,7 +10,7 @@
 #   N_GPUS=1 GPU_START=3 bash data/gen_image.sh         # 只用第 3 张卡（单卡调试）
 #   TASKS="counting" bash data/gen_image.sh             # 只生成 counting task
 #   TASKS="counting color" bash data/gen_image.sh       # 生成 counting + color
-
+export HF_HOME=/mmu-vcg/gaomingju/data/T2I/hf_cache/
 set -euo pipefail
 
 N_GPUS=${N_GPUS:-8}          # 要启动的进程数
