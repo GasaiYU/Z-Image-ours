@@ -1,10 +1,10 @@
 """
-Train counting-aware text encoder with joint losses:
+Train counting-aware transformer refiners with joint losses:
 1) Counting-token contrastive loss (InfoNCE, 1 positive : 12 negatives)
 2) Diffusion denoising loss
 
 Key constraints from task:
-- Only train text encoder refiner layers.
+- Only train transformer refiner layers.
 - Data source: data/train_triplets/counting_triplets_filtered.jsonl
 - Sample filtering: only keep anchors with at least one image score > threshold in
   data/generated_images/counting/<sanitized_anchor>/verdict.json
@@ -94,23 +94,46 @@ def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperatu
     return F.cross_entropy(logits, labels)
 
 
-def unfreeze_refiner_layers(text_encoder: torch.nn.Module) -> list[str]:
-    """Freeze all text encoder params, then unfreeze everything under 'refiner'."""
-    for p in text_encoder.parameters():
+def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[str]:
+    """Freeze all transformer params, then unfreeze only noise/context refiners."""
+    for p in transformer.parameters():
         p.requires_grad_(False)
 
     trainable_names: list[str] = []
-    for name, param in text_encoder.named_parameters():
-        if "refiner" in name.lower():
+    for name, param in transformer.named_parameters():
+        name_l = name.lower()
+        if "noise_refiner" in name_l or "context_refiner" in name_l:
             param.requires_grad_(True)
             trainable_names.append(name)
 
     if not trainable_names:
         raise RuntimeError(
-            "No parameters with 'refiner' in their name found in text_encoder. "
-            "Check the model structure."
+            "No transformer refiner parameters found. "
+            "Expected names under noise_refiner/context_refiner."
         )
     return trainable_names
+
+
+def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Project text features to transformer dim, then run context_refiner blocks."""
+    model = transformer.module if hasattr(transformer, "module") else transformer
+    bsz, seq_len, _ = token_hidden.shape
+    device = token_hidden.device
+    dtype = next(model.parameters()).dtype
+    attn_mask = attention_mask.bool()
+
+    cap_feats = model.cap_embedder(token_hidden.to(dtype))
+    cap_feats = cap_feats.clone()
+    cap_feats[~attn_mask] = model.cap_pad_token.to(dtype)
+
+    pos_ids = torch.zeros((bsz, seq_len, 3), dtype=torch.int32, device=device)
+    pos_ids[:, :, 0] = torch.arange(1, seq_len + 1, dtype=torch.int32, device=device).unsqueeze(0).expand(bsz, -1)
+    cap_freqs = model.rope_embedder(pos_ids.view(-1, 3)).view(bsz, seq_len, -1)
+
+    refined = cap_feats
+    for layer in model.context_refiner:
+        refined = layer(refined, attn_mask, cap_freqs)
+    return refined
 
 
 @dataclass
@@ -336,17 +359,17 @@ def main(args: argparse.Namespace) -> None:
     text_encoder = components["text_encoder"].to(device)
     tokenizer = components["tokenizer"]
 
-    for p in transformer.parameters():
+    for p in text_encoder.parameters():
         p.requires_grad_(False)
     for p in vae.parameters():
         p.requires_grad_(False)
-    transformer.eval()
+    text_encoder.eval()
     vae.eval()
 
-    trainable_names = unfreeze_refiner_layers(text_encoder)
-    trainable_params = [p for p in text_encoder.parameters() if p.requires_grad]
+    trainable_names = unfreeze_transformer_refiner_layers(transformer)
+    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
     if is_main:
-        print(f"[Init] trainable text params: {sum(p.numel() for p in trainable_params):,}")
+        print(f"[Init] trainable transformer params: {sum(p.numel() for p in trainable_params):,}")
     if args.print_trainable and is_main:
         print("[Init] trainable parameter names:")
         for name in trainable_names[:50]:
@@ -380,17 +403,18 @@ def main(args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
-    # accelerate wraps text_encoder (trainable) + optimizer + loader
-    text_encoder, optimizer, loader = accelerator.prepare(text_encoder, optimizer, loader)
+    # accelerate wraps transformer (trainable) + optimizer + loader
+    transformer, optimizer, loader = accelerator.prepare(transformer, optimizer, loader)
 
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
 
     global_step = 0
     transformer_dtype = next(transformer.parameters()).dtype
+    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
 
     for epoch in range(1, args.epochs + 1):
-        text_encoder.train()
+        transformer.train()
         sampler.set_epoch(epoch)
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         running_total = 0.0
@@ -418,13 +442,19 @@ def main(args: argparse.Namespace) -> None:
             p_mask = p_mask.to(device)
             n_mask = n_mask.to(device)
 
-            # Text forward (only text_encoder is wrapped by accelerate)
-            a_out = text_encoder(input_ids=a_ids, attention_mask=a_mask.bool(), output_hidden_states=True)
-            p_out = text_encoder(input_ids=p_ids, attention_mask=p_mask.bool(), output_hidden_states=True)
-            n_out = text_encoder(input_ids=n_ids, attention_mask=n_mask.bool(), output_hidden_states=True)
-            a_h = a_out.hidden_states[-2]
-            p_h = p_out.hidden_states[-2]
-            n_h = n_out.hidden_states[-2]
+            # Text encoder stays frozen; refiners in transformer are trainable.
+            with torch.no_grad():
+                a_out = text_encoder(input_ids=a_ids, attention_mask=a_mask.bool(), output_hidden_states=True)
+                p_out = text_encoder(input_ids=p_ids, attention_mask=p_mask.bool(), output_hidden_states=True)
+                n_out = text_encoder(input_ids=n_ids, attention_mask=n_mask.bool(), output_hidden_states=True)
+                a_h = a_out.hidden_states[-2]
+                p_h = p_out.hidden_states[-2]
+                n_h = n_out.hidden_states[-2]
+
+            # Run transformer context_refiner on text features for contrastive learning.
+            a_h_ref = run_context_refiner(transformer, a_h, a_mask)
+            p_h_ref = run_context_refiner(transformer, p_h, p_mask)
+            n_h_ref = run_context_refiner(transformer, n_h, n_mask)
 
             # Contrastive (counting token embedding, InfoNCE 1:K)
             a_tidx = [find_target_idx(tokenizer, a_ids[i], a_mask[i], tw) for i, tw in enumerate(batch["target_word"])]
@@ -435,9 +465,9 @@ def main(args: argparse.Namespace) -> None:
                 for i in range(n_ids.shape[0])
             ]
 
-            ea, vm_a = extract_token_feature(a_h, a_tidx)
-            ep, vm_p = extract_token_feature(p_h, p_tidx)
-            en_flat, vm_n_flat = extract_token_feature(n_h, n_tidx)
+            ea, vm_a = extract_token_feature(a_h_ref, a_tidx)
+            ep, vm_p = extract_token_feature(p_h_ref, p_tidx)
+            en_flat, vm_n_flat = extract_token_feature(n_h_ref, n_tidx)
             B = a_ids.shape[0]
             K = args.num_negatives
             en = en_flat.view(B, K, -1)
@@ -506,13 +536,13 @@ def main(args: argparse.Namespace) -> None:
                     )
 
             if is_main and args.save_every > 0 and global_step % args.save_every == 0:
-                save_path = Path(args.output_dir) / f"text_encoder_step{global_step}.pt"
-                unwrapped = accelerator.unwrap_model(text_encoder)
+                save_path = Path(args.output_dir) / f"transformer_refiner_step{global_step}.pt"
+                unwrapped = accelerator.unwrap_model(transformer)
                 torch.save(
                     {
                         "step": global_step,
                         "epoch": epoch,
-                        "text_encoder_state_dict": unwrapped.state_dict(),
+                        "transformer_state_dict": unwrapped.state_dict(),
                         "args": vars(args),
                     },
                     save_path,
@@ -542,13 +572,13 @@ def main(args: argparse.Namespace) -> None:
 
     accelerator.wait_for_everyone()
     if is_main:
-        final_path = Path(args.output_dir) / "text_encoder_final.pt"
-        unwrapped = accelerator.unwrap_model(text_encoder)
+        final_path = Path(args.output_dir) / "transformer_refiner_final.pt"
+        unwrapped = accelerator.unwrap_model(transformer)
         torch.save(
             {
                 "step": global_step,
                 "epoch": args.epochs,
-                "text_encoder_state_dict": unwrapped.state_dict(),
+                "transformer_state_dict": unwrapped.state_dict(),
                 "args": vars(args),
             },
             final_path,
@@ -559,7 +589,7 @@ def main(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train counting text refiner with contrastive + diffusion losses")
+    p = argparse.ArgumentParser(description="Train transformer refiners with counting contrastive + diffusion losses")
     p.add_argument("--model_dir", type=str, default="ckpts/Z-Image-Turbo")
     p.add_argument("--triplets_jsonl", type=str, default="data/train_triplets/counting_triplets_filtered.jsonl")
     p.add_argument("--generated_root", type=str, default="data/generated_images")
