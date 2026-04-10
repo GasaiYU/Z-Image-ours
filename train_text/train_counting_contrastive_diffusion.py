@@ -570,12 +570,23 @@ def main(args: argparse.Namespace) -> None:
             en = en_flat.view(B_ctr, K, -1)
             vm_n = vm_n_flat.view(B_ctr, K).all(dim=1)
             valid = vm_a & vm_p & vm_n
+            valid_rate = valid.float().mean().item()
 
             if valid.sum() == 0:
+                if is_main and global_step % 2 == 0:
+                    print(f"[Step {global_step}] WARNING: valid_rate=0, all target tokens missing. "
+                          f"vm_a={vm_a.float().mean():.2f} vm_p={vm_p.float().mean():.2f} vm_n={vm_n.float().mean():.2f}")
                 continue
 
-            loss_ctr = infonce_loss(ea[valid], ep[valid], en[valid], temperature=args.temperature)
-            del ea, ep, en_flat, en, vm_a, vm_p, vm_n_flat, vm_n, valid
+            ea_v, ep_v, en_v = ea[valid], ep[valid], en[valid]
+
+            # Diagnostic: pos_sim and neg_sim to check if model is learning
+            with torch.no_grad():
+                pos_sim = (ea_v.float() * ep_v.float()).sum(dim=-1).mean().item()
+                neg_sim = (ea_v.float().unsqueeze(1) * en_v.float()).sum(dim=-1).mean().item()
+
+            loss_ctr = infonce_loss(ea_v, ep_v, en_v, temperature=args.temperature)
+            del ea, ep, en_flat, en, vm_a, vm_p, vm_n_flat, vm_n, valid, ea_v, ep_v, en_v
 
             # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
             # Use anchor text from the image batch for diffusion conditioning
@@ -616,7 +627,9 @@ def main(args: argparse.Namespace) -> None:
 
             if global_step == 0 and is_main:
                 print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
-                      f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}")
+                      f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
+                      f"valid_rate={valid_rate:.2f}  pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  "
+                      f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
@@ -632,9 +645,10 @@ def main(args: argparse.Namespace) -> None:
             if is_main:
                 pbar.set_postfix(
                     {
-                        "L": f"{loss.item():.4f}",
                         "L_diff": f"{loss_diff.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
+                        "p-n": f"{pos_sim - neg_sim:+.3f}",
+                        "vld": f"{valid_rate:.2f}",
                     }
                 )
                 if use_wandb:
@@ -643,6 +657,10 @@ def main(args: argparse.Namespace) -> None:
                             "train/loss_total": loss.item(),
                             "train/loss_diff": loss_diff.item(),
                             "train/loss_ctr": loss_ctr.item(),
+                            "train/pos_sim": pos_sim,
+                            "train/neg_sim": neg_sim,
+                            "train/pos_neg_gap": pos_sim - neg_sim,
+                            "train/valid_rate": valid_rate,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                         },
