@@ -39,6 +39,7 @@ except ImportError:
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 from utils import load_from_local_dir  # noqa: E402
+from zimage.pipeline import generate as pipeline_generate  # noqa: E402
 
 
 def sanitize(text: str, maxlen: int = 80) -> str:
@@ -409,10 +410,52 @@ def main(args: argparse.Namespace) -> None:
 
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
+        vis_dir = Path(args.output_dir) / "vis"
+        vis_dir.mkdir(exist_ok=True)
+
+    # Fixed prompts for periodic visualization
+    VIS_PROMPTS = [
+        "three cats sitting on a sofa",
+        "five apples on a table",
+        "two dogs running in a park",
+        "seven birds on a wire",
+    ]
+
+    def visualize(step: int) -> None:
+        """Generate one-step images with current weights and save/log them."""
+        unwrapped = accelerator.unwrap_model(transformer)
+        unwrapped.eval()
+        images = pipeline_generate(
+            transformer=unwrapped,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            scheduler=components["scheduler"],
+            prompt=VIS_PROMPTS,
+            height=args.resolution,
+            width=args.resolution,
+            num_inference_steps=1,
+            guidance_scale=0.0,
+        )
+        for i, (img, prompt) in enumerate(zip(images, VIS_PROMPTS)):
+            fname = vis_dir / f"step{step:06d}_p{i}.png"
+            img.save(fname)
+        if use_wandb:
+            wandb.log(
+                {"vis": [wandb.Image(img, caption=p) for img, p in zip(images, VIS_PROMPTS)]},
+                step=step,
+            )
+        unwrapped.train()
+        if is_main:
+            print(f"[Vis] saved {len(images)} images at step {step} → {vis_dir}")
 
     global_step = 0
     transformer_dtype = next(transformer.parameters()).dtype
     trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+
+    # Baseline visualization before any training
+    if is_main and args.vis_every > 0:
+        visualize(0)
 
     for epoch in range(1, args.epochs + 1):
         transformer.train()
@@ -557,6 +600,9 @@ def main(args: argparse.Namespace) -> None:
                 )
                 print(f"[Checkpoint] saved: {save_path}")
 
+            if args.vis_every > 0 and global_step % args.vis_every == 0:
+                visualize(global_step)
+
         if steps == 0:
             if is_main:
                 print(f"[Epoch {epoch}] no valid step.")
@@ -620,6 +666,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")
 
     p.add_argument("--save_every", type=int, default=500)
+    p.add_argument("--vis_every", type=int, default=500,
+                   help="Generate visualization images every N steps (0 = disabled)")
     p.add_argument("--print_trainable", action="store_true")
     p.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"],
                    help="Accelerate mixed precision mode")
