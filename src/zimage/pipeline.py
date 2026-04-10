@@ -207,7 +207,7 @@ def generate(
         sigmas=None,
         **scheduler_kwargs,
     )
-
+    
     logger.info(f"Sampling loop start: {num_inference_steps} steps")
 
     from tqdm import tqdm

@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -379,17 +379,10 @@ def main(args: argparse.Namespace) -> None:
     if len(dataset) == 0:
         raise RuntimeError("No valid training samples with available images.")
 
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=accelerator.num_processes,
-        rank=accelerator.process_index,
-        shuffle=True,
-        seed=args.seed if args.seed is not None else 0,
-    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        sampler=sampler,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=collate_fn,
@@ -451,7 +444,6 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(1, args.epochs + 1):
         transformer.train()
-        sampler.set_epoch(epoch)
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         running_total = 0.0
         running_diff = 0.0
@@ -531,7 +523,7 @@ def main(args: argparse.Namespace) -> None:
             noisy_latents = (1.0 - sigma_b) * latents + sigma_b * noise
             # Transformer predicts (x0 - noise). In inference: noise_pred = -transformer_out,
             # scheduler: x_{t-1} = x_t + dt * noise_pred => transformer must predict (latents - noise).
-            target = latents - noise
+            target = noise - latents
 
             # Transformer expects timestep normalized like pipeline: (1000 - t)/1000 == 1 - sigma
             t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
