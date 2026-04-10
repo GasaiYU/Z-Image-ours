@@ -87,6 +87,7 @@ def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperatu
     InfoNCE with one positive and K negatives per anchor.
     ea: [B, D], ep: [B, D], en: [B, K, D]
     """
+    ea, ep, en = ea.float(), ep.float(), en.float()
     pos_logits = (ea * ep).sum(dim=-1, keepdim=True)          # [B, 1]
     neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1)           # [B, K]
     logits = torch.cat([pos_logits, neg_logits], dim=1) / temperature
@@ -482,7 +483,11 @@ def main(args: argparse.Namespace) -> None:
             # Diffusion denoising loss (flow matching)
             pixel_values = batch["pixel_values"].to(device, dtype=vae.dtype)
             with torch.no_grad():
-                latents = vae.encode(pixel_values).latent_dist.sample()
+                h = vae.encoder(pixel_values)
+                moments = vae.quant_conv(h) if vae.quant_conv is not None else h
+                mean, log_var = moments.chunk(2, dim=1)
+                std = torch.exp(0.5 * log_var.clamp(-30, 20))
+                latents = mean + std * torch.randn_like(mean)
                 latents = latents * vae.config.scaling_factor
 
             noise = torch.randn_like(latents)
@@ -501,7 +506,7 @@ def main(args: argparse.Namespace) -> None:
             pred_list = transformer(lat_list, t_norm, cap_feats)[0]
             pred = torch.stack(pred_list, dim=0).squeeze(2).float()
 
-            loss_diff = F.mse_loss(pred, target.float(), reduction="mean")
+            loss_diff = F.mse_loss(pred.float(), target.float(), reduction="mean")
             loss = args.diffusion_weight * loss_diff + args.contrastive_weight * loss_ctr
 
             optimizer.zero_grad(set_to_none=True)
