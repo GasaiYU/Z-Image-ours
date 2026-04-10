@@ -23,10 +23,13 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchvision import transforms
 from tqdm import tqdm
+
 try:
     import wandb
     _WANDB_AVAILABLE = True
@@ -303,11 +306,16 @@ def tokenize_texts(tokenizer, texts: list[str], max_length: int) -> tuple[torch.
 
 
 def main(args: argparse.Namespace) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Init] device={device}")
-    use_wandb = args.use_wandb and _WANDB_AVAILABLE
-    if args.use_wandb and not _WANDB_AVAILABLE:
-        print("[WandB] wandb not installed, disable logging. Install via: pip install wandb")
+    accelerator = Accelerator(mixed_precision=args.mixed_precision)
+    device = accelerator.device
+    is_main = accelerator.is_main_process
+
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    use_wandb = args.use_wandb and _WANDB_AVAILABLE and is_main
+    if args.use_wandb and not _WANDB_AVAILABLE and is_main:
+        print("[WandB] wandb not installed. Install via: pip install wandb")
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
@@ -316,15 +324,16 @@ def main(args: argparse.Namespace) -> None:
         )
         print(f"[WandB] Run: {wandb.run.url}")
 
+    # Load all components on CPU first to save GPU memory during setup
     components = load_from_local_dir(
         args.model_dir,
-        device=str(device),
+        device="cpu",
         dtype=torch.bfloat16,
-        verbose=True,
+        verbose=is_main,
     )
-    transformer = components["transformer"]
-    vae = components["vae"]
-    text_encoder = components["text_encoder"]
+    transformer = components["transformer"].to(device)
+    vae = components["vae"].to(device)
+    text_encoder = components["text_encoder"].to(device)
     tokenizer = components["tokenizer"]
 
     for p in transformer.parameters():
@@ -336,9 +345,10 @@ def main(args: argparse.Namespace) -> None:
 
     trainable_names = unfreeze_refiner_layers(text_encoder)
     trainable_params = [p for p in text_encoder.parameters() if p.requires_grad]
-    print(f"[Init] trainable text params: {sum(p.numel() for p in trainable_params):,}")
-    if args.print_trainable:
-        print("[Init] trainable parameter names (truncated):")
+    if is_main:
+        print(f"[Init] trainable text params: {sum(p.numel() for p in trainable_params):,}")
+    if args.print_trainable and is_main:
+        print("[Init] trainable parameter names:")
         for name in trainable_names[:50]:
             print("  ", name)
 
@@ -352,10 +362,17 @@ def main(args: argparse.Namespace) -> None:
     if len(dataset) == 0:
         raise RuntimeError("No valid training samples after verdict filtering.")
 
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=accelerator.num_processes,
+        rank=accelerator.process_index,
+        shuffle=True,
+        seed=args.seed if args.seed is not None else 0,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=collate_fn,
@@ -363,12 +380,19 @@ def main(args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # accelerate wraps text_encoder (trainable) + optimizer + loader
+    text_encoder, optimizer, loader = accelerator.prepare(text_encoder, optimizer, loader)
+
+    if is_main:
+        os.makedirs(args.output_dir, exist_ok=True)
+
     global_step = 0
-    text_encoder.train()
+    transformer_dtype = next(transformer.parameters()).dtype
 
     for epoch in range(1, args.epochs + 1):
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
+        text_encoder.train()
+        sampler.set_epoch(epoch)
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         running_total = 0.0
         running_diff = 0.0
         running_ctr = 0.0
@@ -394,7 +418,7 @@ def main(args: argparse.Namespace) -> None:
             p_mask = p_mask.to(device)
             n_mask = n_mask.to(device)
 
-            # Text forward
+            # Text forward (only text_encoder is wrapped by accelerate)
             a_out = text_encoder(input_ids=a_ids, attention_mask=a_mask.bool(), output_hidden_states=True)
             p_out = text_encoder(input_ids=p_ids, attention_mask=p_mask.bool(), output_hidden_states=True)
             n_out = text_encoder(input_ids=n_ids, attention_mask=n_mask.bool(), output_hidden_states=True)
@@ -423,14 +447,9 @@ def main(args: argparse.Namespace) -> None:
             if valid.sum() == 0:
                 continue
 
-            loss_ctr = infonce_loss(
-                ea[valid],
-                ep[valid],
-                en[valid],
-                temperature=args.temperature,
-            )
+            loss_ctr = infonce_loss(ea[valid], ep[valid], en[valid], temperature=args.temperature)
 
-            # Diffusion denoising loss (flow matching style)
+            # Diffusion denoising loss (flow matching)
             pixel_values = batch["pixel_values"].to(device, dtype=vae.dtype)
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
@@ -445,11 +464,10 @@ def main(args: argparse.Namespace) -> None:
             target = latents - noise
 
             # Transformer expects timestep normalized like pipeline: (1000 - t)/1000 == 1 - sigma
-            t_norm = (1.0 - sigma).to(dtype=next(transformer.parameters()).dtype)
-            lat_list = [x.unsqueeze(1).to(dtype=next(transformer.parameters()).dtype) for x in noisy_latents]
+            t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
+            lat_list = [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_latents]
+            cap_feats = [a_h[i][a_mask[i].bool()].to(dtype=transformer_dtype) for i in range(a_h.shape[0])]
 
-            # Use anchor prompt embeds as condition sequence (masked valid tokens)
-            cap_feats = [a_h[i][a_mask[i].bool()].to(dtype=next(transformer.parameters()).dtype) for i in range(a_h.shape[0])]
             pred_list = transformer(lat_list, t_norm, cap_feats)[0]
             pred = torch.stack(pred_list, dim=0).squeeze(2).float()
 
@@ -457,8 +475,8 @@ def main(args: argparse.Namespace) -> None:
             loss = args.diffusion_weight * loss_diff + args.contrastive_weight * loss_ctr
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
             global_step += 1
@@ -467,32 +485,34 @@ def main(args: argparse.Namespace) -> None:
             running_diff += loss_diff.item()
             running_ctr += loss_ctr.item()
 
-            pbar.set_postfix(
-                {
-                    "L": f"{loss.item():.4f}",
-                    "L_diff": f"{loss_diff.item():.4f}",
-                    "L_ctr": f"{loss_ctr.item():.4f}",
-                }
-            )
-            if use_wandb:
-                wandb.log(
+            if is_main:
+                pbar.set_postfix(
                     {
-                        "train/loss_total": loss.item(),
-                        "train/loss_diff": loss_diff.item(),
-                        "train/loss_ctr": loss_ctr.item(),
-                        "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/epoch": epoch,
-                    },
-                    step=global_step,
+                        "L": f"{loss.item():.4f}",
+                        "L_diff": f"{loss_diff.item():.4f}",
+                        "L_ctr": f"{loss_ctr.item():.4f}",
+                    }
                 )
+                if use_wandb:
+                    wandb.log(
+                        {
+                            "train/loss_total": loss.item(),
+                            "train/loss_diff": loss_diff.item(),
+                            "train/loss_ctr": loss_ctr.item(),
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/epoch": epoch,
+                        },
+                        step=global_step,
+                    )
 
-            if args.save_every > 0 and global_step % args.save_every == 0:
+            if is_main and args.save_every > 0 and global_step % args.save_every == 0:
                 save_path = Path(args.output_dir) / f"text_encoder_step{global_step}.pt"
+                unwrapped = accelerator.unwrap_model(text_encoder)
                 torch.save(
                     {
                         "step": global_step,
                         "epoch": epoch,
-                        "text_encoder_state_dict": text_encoder.state_dict(),
+                        "text_encoder_state_dict": unwrapped.state_dict(),
                         "args": vars(args),
                     },
                     save_path,
@@ -500,37 +520,42 @@ def main(args: argparse.Namespace) -> None:
                 print(f"[Checkpoint] saved: {save_path}")
 
         if steps == 0:
-            print(f"[Epoch {epoch}] no valid step.")
+            if is_main:
+                print(f"[Epoch {epoch}] no valid step.")
             continue
 
         avg_total = running_total / steps
         avg_diff = running_diff / steps
         avg_ctr = running_ctr / steps
-        print(f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_diff={avg_diff:.4f} avg_ctr={avg_ctr:.4f}")
-        if use_wandb:
-            wandb.log(
-                {
-                    "epoch/avg_total": avg_total,
-                    "epoch/avg_diff": avg_diff,
-                    "epoch/avg_ctr": avg_ctr,
-                    "epoch/epoch": epoch,
-                },
-                step=global_step,
-            )
+        if is_main:
+            print(f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_diff={avg_diff:.4f} avg_ctr={avg_ctr:.4f}")
+            if use_wandb:
+                wandb.log(
+                    {
+                        "epoch/avg_total": avg_total,
+                        "epoch/avg_diff": avg_diff,
+                        "epoch/avg_ctr": avg_ctr,
+                        "epoch/epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
-    final_path = Path(args.output_dir) / "text_encoder_final.pt"
-    torch.save(
-        {
-            "step": global_step,
-            "epoch": args.epochs,
-            "text_encoder_state_dict": text_encoder.state_dict(),
-            "args": vars(args),
-        },
-        final_path,
-    )
-    print(f"[Done] final checkpoint: {final_path}")
-    if use_wandb:
-        wandb.finish()
+    accelerator.wait_for_everyone()
+    if is_main:
+        final_path = Path(args.output_dir) / "text_encoder_final.pt"
+        unwrapped = accelerator.unwrap_model(text_encoder)
+        torch.save(
+            {
+                "step": global_step,
+                "epoch": args.epochs,
+                "text_encoder_state_dict": unwrapped.state_dict(),
+                "args": vars(args),
+            },
+            final_path,
+        )
+        print(f"[Done] final checkpoint: {final_path}")
+        if use_wandb:
+            wandb.finish()
 
 
 def parse_args() -> argparse.Namespace:
@@ -558,6 +583,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--print_trainable", action="store_true")
+    p.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"],
+                   help="Accelerate mixed precision mode")
+    p.add_argument("--seed", type=int, default=None)
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default="z-image-counting")
     p.add_argument("--wandb_run", type=str, default="")
