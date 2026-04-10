@@ -19,7 +19,7 @@ MAX_LENGTH=${MAX_LENGTH:-128}
 
 # ── Training ──────────────────────────────────────────────────────────────────
 EPOCHS=${EPOCHS:-50}
-BATCH_SIZE=${BATCH_SIZE:-2}          # per-GPU batch size
+BATCH_SIZE=${BATCH_SIZE:-1}          # per-GPU batch size
 NUM_WORKERS=${NUM_WORKERS:-2}
 LR=${LR:-1e-5}
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
