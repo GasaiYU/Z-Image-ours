@@ -18,8 +18,8 @@ RESOLUTION=${RESOLUTION:-1024}
 MAX_LENGTH=${MAX_LENGTH:-128}
 
 # ── Training ──────────────────────────────────────────────────────────────────
-EPOCHS=${EPOCHS:-3}
-BATCH_SIZE=${BATCH_SIZE:-4}          # per-GPU batch size
+EPOCHS=${EPOCHS:-50}
+BATCH_SIZE=${BATCH_SIZE:-2}          # per-GPU batch size
 NUM_WORKERS=${NUM_WORKERS:-2}
 LR=${LR:-1e-5}
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
@@ -27,7 +27,7 @@ MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 SEED=${SEED:-42}
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
-NUM_NEGATIVES=${NUM_NEGATIVES:-12}
+NUM_NEGATIVES=${NUM_NEGATIVES:-512}
 TEMPERATURE=${TEMPERATURE:-0.07}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}
