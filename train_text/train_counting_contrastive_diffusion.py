@@ -239,7 +239,7 @@ class CountingVerdictDataset(Dataset):
 
         print(f"[Dataset] Total counting triplets: {len(rows)}")
         print(f"[Dataset] Kept after verdict>{threshold}: {len(self.samples)}")
-
+  
     def _collect_passing_images(self, anchor: str) -> list[Path]:
         sample_dir = self.generated_root / "counting" / sanitize(anchor)
         verdict_path = sample_dir / "verdict.json"
