@@ -88,36 +88,48 @@ def extract_token_feature(hidden_states: torch.Tensor, token_indices: list[int])
     return torch.stack(feats, dim=0), torch.tensor(valid, device=hidden_states.device, dtype=torch.bool)
 
 
-def chunked_text_encode(
+def chunked_encode_and_extract(
     text_encoder,
+    transformer: torch.nn.Module,
+    tokenizer,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    target_words: list[str],
     chunk_size: int,
-) -> torch.Tensor:
-    """Run frozen text encoder in chunks to cap peak memory."""
-    chunks = []
-    for i in range(0, input_ids.shape[0], chunk_size):
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pipeline encode → refine → extract_token_feature chunk by chunk.
+    Peak memory = chunk_size × seq_len × D (full sequences never accumulate in memory).
+    Returns token-level features [N, D] and valid mask [N].
+    """
+    all_feats: list[torch.Tensor] = []
+    all_valid: list[torch.Tensor] = []
+    N = input_ids.shape[0]
+
+    for i in range(0, N, chunk_size):
         ids = input_ids[i : i + chunk_size]
         mask = attention_mask[i : i + chunk_size]
+        tws = target_words[i : i + chunk_size]
+
+        # Step 1: frozen text encoder, no grad, free output immediately after extracting hidden states
         with torch.no_grad():
             out = text_encoder(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True)
-        chunks.append(out.hidden_states[-2])
-    return torch.cat(chunks, dim=0)
+        h = out.hidden_states[-2].detach().clone()
+        del out
 
+        # Step 2: context_refiner (trainable, gradients flow)
+        h_ref = run_context_refiner(transformer, h, mask)
+        del h
 
-def chunked_run_context_refiner(
-    transformer: torch.nn.Module,
-    token_hidden: torch.Tensor,
-    attention_mask: torch.Tensor,
-    chunk_size: int,
-) -> torch.Tensor:
-    """Run context_refiner in chunks; gradients flow normally through each chunk."""
-    chunks = []
-    for i in range(0, token_hidden.shape[0], chunk_size):
-        h = token_hidden[i : i + chunk_size]
-        m = attention_mask[i : i + chunk_size]
-        chunks.append(run_context_refiner(transformer, h, m))
-    return torch.cat(chunks, dim=0)
+        # Step 3: extract only the target token feature [chunk, D] — discard full sequence
+        tidx = [find_target_idx(tokenizer, ids[j], mask[j], tws[j]) for j in range(ids.shape[0])]
+        feats, valid = extract_token_feature(h_ref, tidx)
+        del h_ref
+
+        all_feats.append(feats)
+        all_valid.append(valid)
+
+    return torch.cat(all_feats, dim=0), torch.cat(all_valid, dim=0)
 
 
 def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -533,28 +545,27 @@ def main(args: argparse.Namespace) -> None:
             p_mask = p_mask.to(device)
             n_mask = n_mask.to(device)
 
-            # Chunked text encoding: peak memory bounded by text_chunk_size, not total batch size
-            a_h = chunked_text_encode(text_encoder, a_ids, a_mask, args.text_chunk_size)
-            p_h = chunked_text_encode(text_encoder, p_ids, p_mask, args.text_chunk_size)
-            n_h = chunked_text_encode(text_encoder, n_ids, n_mask, args.text_chunk_size)
-
-            # Chunked context_refiner: gradients flow normally, memory bounded by chunk size
-            a_h_ref = chunked_run_context_refiner(transformer, a_h, a_mask, args.text_chunk_size)
-            p_h_ref = chunked_run_context_refiner(transformer, p_h, p_mask, args.text_chunk_size)
-            n_h_ref = chunked_run_context_refiner(transformer, n_h, n_mask, args.text_chunk_size)
-
-            a_tidx = [find_target_idx(tokenizer, a_ids[i], a_mask[i], tw) for i, tw in enumerate(text_batch["target_word"])]
-            p_tidx = [find_target_idx(tokenizer, p_ids[i], p_mask[i], tw) for i, tw in enumerate(text_batch["target_word"])]
+            # Pipeline: encode → refine → extract token feature, chunk by chunk.
+            # Full-sequence tensors ([N, seq_len, D]) are freed inside each chunk;
+            # only token-level vectors ([N, D]) accumulate → peak memory = chunk_size × seq_len × D.
             flat_target_words = [tw for tw in text_batch["target_word"] for _ in range(args.num_negatives)]
-            n_tidx = [
-                find_target_idx(tokenizer, n_ids[i], n_mask[i], flat_target_words[i])
-                for i in range(n_ids.shape[0])
-            ]
+            ea, vm_a = chunked_encode_and_extract(
+                text_encoder, transformer, tokenizer,
+                a_ids, a_mask, list(text_batch["target_word"]), args.text_chunk_size,
+            )
+            ep, vm_p = chunked_encode_and_extract(
+                text_encoder, transformer, tokenizer,
+                p_ids, p_mask, list(text_batch["target_word"]), args.text_chunk_size,
+            )
+            en_flat, vm_n_flat = chunked_encode_and_extract(
+                text_encoder, transformer, tokenizer,
+                n_ids, n_mask, flat_target_words, args.text_chunk_size,
+            )
 
-            ea, vm_a = extract_token_feature(a_h_ref, a_tidx)
-            ep, vm_p = extract_token_feature(p_h_ref, p_tidx)
-            en_flat, vm_n_flat = extract_token_feature(n_h_ref, n_tidx)
-            B_ctr = a_ids.shape[0]
+            # Free input token tensors — no longer needed after feature extraction
+            del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
+
+            B_ctr = ea.shape[0]
             K = args.num_negatives
             en = en_flat.view(B_ctr, K, -1)
             vm_n = vm_n_flat.view(B_ctr, K).all(dim=1)
@@ -564,6 +575,7 @@ def main(args: argparse.Namespace) -> None:
                 continue
 
             loss_ctr = infonce_loss(ea[valid], ep[valid], en[valid], temperature=args.temperature)
+            del ea, ep, en_flat, en, vm_a, vm_p, vm_n_flat, vm_n, valid
 
             # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
             # Use anchor text from the image batch for diffusion conditioning
@@ -574,7 +586,8 @@ def main(args: argparse.Namespace) -> None:
 
             with torch.no_grad():
                 da_out = text_encoder(input_ids=da_ids, attention_mask=da_mask.bool(), output_hidden_states=True)
-                da_h = da_out.hidden_states[-2]
+                da_h = da_out.hidden_states[-2].detach().clone()
+                del da_out
 
             pixel_values = batch["pixel_values"].to(device, dtype=vae.dtype)
             with torch.no_grad():
@@ -603,7 +616,7 @@ def main(args: argparse.Namespace) -> None:
 
             if global_step == 0 and is_main:
                 print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
-                      f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  valid={valid.sum().item()}")
+                      f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}")
 
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
