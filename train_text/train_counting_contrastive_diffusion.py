@@ -523,7 +523,7 @@ def main(args: argparse.Namespace) -> None:
             noisy_latents = (1.0 - sigma_b) * latents + sigma_b * noise
             # Transformer predicts (x0 - noise). In inference: noise_pred = -transformer_out,
             # scheduler: x_{t-1} = x_t + dt * noise_pred => transformer must predict (latents - noise).
-            target = noise - latents
+            target = latents - noise
 
             # Transformer expects timestep normalized like pipeline: (1000 - t)/1000 == 1 - sigma
             t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
