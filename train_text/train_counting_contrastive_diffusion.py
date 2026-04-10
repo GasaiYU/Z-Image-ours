@@ -6,8 +6,8 @@ Train counting-aware transformer refiners with joint losses:
 Key constraints from task:
 - Only train transformer refiner layers.
 - Data source: data/train_triplets/counting_triplets_filtered.jsonl
-- Sample filtering: only keep anchors with at least one image score > threshold in
-  data/generated_images/counting/<sanitized_anchor>/verdict.json
+- The JSONL is assumed to be pre-filtered already; training uses all images found under
+  data/generated_images/counting/<sanitized_anchor>/ without re-checking verdict.json
 """
 
 import argparse
@@ -185,7 +185,7 @@ class CountingVerdictDataset(Dataset):
                 if all(k in obj for k in ("anchor", "positive", "negative", "target_word")):
                     rows.append(obj)
 
-        verdict_cache: dict[str, list[Path]] = {}
+        image_cache: dict[str, list[Path]] = {}
         same_word_texts: dict[str, set[str]] = defaultdict(set)
         grouped: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"target_word": "", "positive_pool": set(), "negative_pool": set()}
@@ -218,12 +218,12 @@ class CountingVerdictDataset(Dataset):
 
         self.samples: list[CountingSample] = []
         for anchor, item in grouped.items():
-            if anchor not in verdict_cache:
-                verdict_cache[anchor] = self._collect_passing_images(anchor)
-            passing_images = verdict_cache[anchor]
+            if anchor not in image_cache:
+                image_cache[anchor] = self._collect_anchor_images(anchor)
+            image_paths = image_cache[anchor]
             pos_pool = [x for x in item["positive_pool"] if x]
             neg_pool = [x for x in item["negative_pool"] if x]
-            if not passing_images or not pos_pool or not neg_pool:
+            if not image_paths:
                 continue
             self.samples.append(
                 CountingSample(
@@ -231,7 +231,7 @@ class CountingVerdictDataset(Dataset):
                     positive_pool=pos_pool,
                     negative_pool=neg_pool,
                     target_word=item["target_word"],
-                    image_paths=passing_images,
+                    image_paths=image_paths,
                 )
             )
 
@@ -240,28 +240,20 @@ class CountingVerdictDataset(Dataset):
         }
 
         print(f"[Dataset] Total counting triplets: {len(rows)}")
-        print(f"[Dataset] Kept after verdict>{threshold}: {len(self.samples)}")
+        print(f"[Dataset] Unique anchors: {len(grouped)}")
+        print(f"[Dataset] Kept with available images: {len(self.samples)}")
   
-    def _collect_passing_images(self, anchor: str) -> list[Path]:
+    def _collect_anchor_images(self, anchor: str) -> list[Path]:
         sample_dir = self.generated_root / "counting" / sanitize(anchor)
-        verdict_path = sample_dir / "verdict.json"
-        if not verdict_path.exists():
+        if not sample_dir.exists():
             return []
-        try:
-            with open(verdict_path, "r", encoding="utf-8") as f:
-                verdict = json.load(f)
-        except Exception:
-            return []
-
-        passed: list[Path] = []
-        for item in verdict.get("results", []):
-            score = item.get("score")
-            image_name = item.get("image")
-            if isinstance(score, (int, float)) and score > self.threshold and image_name:
-                p = sample_dir / image_name
-                if p.exists():
-                    passed.append(p)
-        return passed
+        valid_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        return sorted(
+            [
+                p for p in sample_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in valid_suffixes
+            ]
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -385,7 +377,7 @@ def main(args: argparse.Namespace) -> None:
         num_negatives=args.num_negatives,
     )
     if len(dataset) == 0:
-        raise RuntimeError("No valid training samples after verdict filtering.")
+        raise RuntimeError("No valid training samples with available images.")
 
     sampler = DistributedSampler(
         dataset,
