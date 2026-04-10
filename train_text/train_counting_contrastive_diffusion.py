@@ -96,21 +96,20 @@ def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperatu
 
 
 def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[str]:
-    """Freeze all transformer params, then unfreeze only noise/context refiners."""
+    """Freeze all transformer params, then unfreeze only context_refiner (text conditioning side)."""
     for p in transformer.parameters():
         p.requires_grad_(False)
 
     trainable_names: list[str] = []
     for name, param in transformer.named_parameters():
-        name_l = name.lower()
-        if "noise_refiner" in name_l or "context_refiner" in name_l:
+        if "context_refiner" in name.lower():
             param.requires_grad_(True)
             trainable_names.append(name)
 
     if not trainable_names:
         raise RuntimeError(
-            "No transformer refiner parameters found. "
-            "Expected names under noise_refiner/context_refiner."
+            "No context_refiner parameters found in transformer. "
+            "Check the model structure."
         )
     return trainable_names
 
