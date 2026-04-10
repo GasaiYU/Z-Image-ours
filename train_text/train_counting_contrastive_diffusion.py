@@ -27,6 +27,11 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 from utils import load_from_local_dir  # noqa: E402
@@ -300,6 +305,16 @@ def tokenize_texts(tokenizer, texts: list[str], max_length: int) -> tuple[torch.
 def main(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Init] device={device}")
+    use_wandb = args.use_wandb and _WANDB_AVAILABLE
+    if args.use_wandb and not _WANDB_AVAILABLE:
+        print("[WandB] wandb not installed, disable logging. Install via: pip install wandb")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run or None,
+            config=vars(args),
+        )
+        print(f"[WandB] Run: {wandb.run.url}")
 
     components = load_from_local_dir(
         args.model_dir,
@@ -459,6 +474,17 @@ def main(args: argparse.Namespace) -> None:
                     "L_ctr": f"{loss_ctr.item():.4f}",
                 }
             )
+            if use_wandb:
+                wandb.log(
+                    {
+                        "train/loss_total": loss.item(),
+                        "train/loss_diff": loss_diff.item(),
+                        "train/loss_ctr": loss_ctr.item(),
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
             if args.save_every > 0 and global_step % args.save_every == 0:
                 save_path = Path(args.output_dir) / f"text_encoder_step{global_step}.pt"
@@ -481,6 +507,16 @@ def main(args: argparse.Namespace) -> None:
         avg_diff = running_diff / steps
         avg_ctr = running_ctr / steps
         print(f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_diff={avg_diff:.4f} avg_ctr={avg_ctr:.4f}")
+        if use_wandb:
+            wandb.log(
+                {
+                    "epoch/avg_total": avg_total,
+                    "epoch/avg_diff": avg_diff,
+                    "epoch/avg_ctr": avg_ctr,
+                    "epoch/epoch": epoch,
+                },
+                step=global_step,
+            )
 
     final_path = Path(args.output_dir) / "text_encoder_final.pt"
     torch.save(
@@ -493,6 +529,8 @@ def main(args: argparse.Namespace) -> None:
         final_path,
     )
     print(f"[Done] final checkpoint: {final_path}")
+    if use_wandb:
+        wandb.finish()
 
 
 def parse_args() -> argparse.Namespace:
@@ -520,6 +558,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--print_trainable", action="store_true")
+    p.add_argument("--use_wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default="z-image-counting")
+    p.add_argument("--wandb_run", type=str, default="")
     return p.parse_args()
 
 
