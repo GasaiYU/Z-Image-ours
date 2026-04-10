@@ -10,6 +10,7 @@ Key constraints from task:
   data/generated_images/counting/<sanitized_anchor>/verdict.json
 """
 
+
 import argparse
 import json
 import os
