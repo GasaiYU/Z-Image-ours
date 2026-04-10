@@ -204,7 +204,7 @@ class CountingVerdictDataset(Dataset):
                 same_word_texts[target_word].add(anchor)
 
         # Build global negative text pool for each target_word
-        all_target_words = sorted(same_word_texts.keys())
+        all_target_words = sorted(same_word_texts.keys())  
         self.global_negatives_by_target: dict[str, list[str]] = {}
         for tw in all_target_words:
             neg_texts = set()
