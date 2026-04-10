@@ -88,6 +88,38 @@ def extract_token_feature(hidden_states: torch.Tensor, token_indices: list[int])
     return torch.stack(feats, dim=0), torch.tensor(valid, device=hidden_states.device, dtype=torch.bool)
 
 
+def chunked_text_encode(
+    text_encoder,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Run frozen text encoder in chunks to cap peak memory."""
+    chunks = []
+    for i in range(0, input_ids.shape[0], chunk_size):
+        ids = input_ids[i : i + chunk_size]
+        mask = attention_mask[i : i + chunk_size]
+        with torch.no_grad():
+            out = text_encoder(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True)
+        chunks.append(out.hidden_states[-2])
+    return torch.cat(chunks, dim=0)
+
+
+def chunked_run_context_refiner(
+    transformer: torch.nn.Module,
+    token_hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Run context_refiner in chunks; gradients flow normally through each chunk."""
+    chunks = []
+    for i in range(0, token_hidden.shape[0], chunk_size):
+        h = token_hidden[i : i + chunk_size]
+        m = attention_mask[i : i + chunk_size]
+        chunks.append(run_context_refiner(transformer, h, m))
+    return torch.cat(chunks, dim=0)
+
+
 def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
     """
     InfoNCE with one positive and K negatives per anchor.
@@ -501,17 +533,15 @@ def main(args: argparse.Namespace) -> None:
             p_mask = p_mask.to(device)
             n_mask = n_mask.to(device)
 
-            with torch.no_grad():
-                a_out = text_encoder(input_ids=a_ids, attention_mask=a_mask.bool(), output_hidden_states=True)
-                p_out = text_encoder(input_ids=p_ids, attention_mask=p_mask.bool(), output_hidden_states=True)
-                n_out = text_encoder(input_ids=n_ids, attention_mask=n_mask.bool(), output_hidden_states=True)
-                a_h = a_out.hidden_states[-2]
-                p_h = p_out.hidden_states[-2]
-                n_h = n_out.hidden_states[-2]
+            # Chunked text encoding: peak memory bounded by text_chunk_size, not total batch size
+            a_h = chunked_text_encode(text_encoder, a_ids, a_mask, args.text_chunk_size)
+            p_h = chunked_text_encode(text_encoder, p_ids, p_mask, args.text_chunk_size)
+            n_h = chunked_text_encode(text_encoder, n_ids, n_mask, args.text_chunk_size)
 
-            a_h_ref = run_context_refiner(transformer, a_h, a_mask)
-            p_h_ref = run_context_refiner(transformer, p_h, p_mask)
-            n_h_ref = run_context_refiner(transformer, n_h, n_mask)
+            # Chunked context_refiner: gradients flow normally, memory bounded by chunk size
+            a_h_ref = chunked_run_context_refiner(transformer, a_h, a_mask, args.text_chunk_size)
+            p_h_ref = chunked_run_context_refiner(transformer, p_h, p_mask, args.text_chunk_size)
+            n_h_ref = chunked_run_context_refiner(transformer, n_h, n_mask, args.text_chunk_size)
 
             a_tidx = [find_target_idx(tokenizer, a_ids[i], a_mask[i], tw) for i, tw in enumerate(text_batch["target_word"])]
             p_tidx = [find_target_idx(tokenizer, p_ids[i], p_mask[i], tw) for i, tw in enumerate(text_batch["target_word"])]
@@ -678,6 +708,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=1, help="Per-GPU image batch size for diffusion loss")
     p.add_argument("--contrastive_batch_size", type=int, default=32,
                    help="Text-only batch size for contrastive loss (no images, cheap to scale up)")
+    p.add_argument("--text_chunk_size", type=int, default=16,
+                   help="Chunk size for text encoder / context_refiner forward pass (controls peak memory)")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=1e-4)

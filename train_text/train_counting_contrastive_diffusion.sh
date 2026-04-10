@@ -21,6 +21,7 @@ MAX_LENGTH=${MAX_LENGTH:-128}
 EPOCHS=${EPOCHS:-50}
 BATCH_SIZE=${BATCH_SIZE:-1}                  # per-GPU image batch size (diffusion loss, GPU-memory bound)
 CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}  # text-only batch size (contrastive loss, very cheap)
+TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}       # chunk size for text encoder / context_refiner (controls peak memory)
 NUM_WORKERS=${NUM_WORKERS:-2}
 LR=${LR:-1e-5}
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
@@ -54,6 +55,7 @@ accelerate launch \
     --epochs "$EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --contrastive_batch_size "$CONTRASTIVE_BATCH_SIZE" \
+    --text_chunk_size "$TEXT_CHUNK_SIZE" \
     --num_workers "$NUM_WORKERS" \
     --lr "$LR" \
     --weight_decay "$WEIGHT_DECAY" \
