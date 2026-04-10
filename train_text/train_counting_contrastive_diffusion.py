@@ -509,6 +509,9 @@ def main(args: argparse.Namespace) -> None:
             loss_diff = F.mse_loss(pred.float(), target.float(), reduction="mean")
             loss = args.diffusion_weight * loss_diff + args.contrastive_weight * loss_ctr
 
+            if global_step == 0 and is_main:
+                print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  sigma_mean={sigma.mean().item():.3f}")
+
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
             accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
