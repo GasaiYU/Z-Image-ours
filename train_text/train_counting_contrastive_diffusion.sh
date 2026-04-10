@@ -4,7 +4,7 @@ set -euo pipefail
 # ── GPU selection ─────────────────────────────────────────────────────────────
 # Set NUM_GPUS to the number of GPUs you want to use.
 # e.g.  NUM_GPUS=4 bash train_text/train_counting_contrastive_diffusion.sh
-NUM_GPUS=${NUM_GPUS:-1}
+NUM_GPUS=${NUM_GPUS:-8}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}

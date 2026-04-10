@@ -434,7 +434,7 @@ def main(args: argparse.Namespace) -> None:
             prompt=VIS_PROMPTS,
             height=args.resolution,
             width=args.resolution,
-            num_inference_steps=1,
+            num_inference_steps=8,
             guidance_scale=0.0,
         )
         for i, (img, prompt) in enumerate(zip(images, VIS_PROMPTS)):
