@@ -186,10 +186,42 @@ def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor
     return refined
 
 
+def make_anchor_variants(anchor: str) -> list[str]:
+    """
+    Generate template rewrites of the same anchor (same number + same object, different phrasing).
+    These are used as positives for contrastive learning, replacing cross-anchor positives.
+    All variants share the same semantic content, so context_refiner pollution from
+    the object is symmetric between anchor and positive — much easier to pull together.
+    """
+    base = anchor.strip()
+    candidates = [
+        base,
+        f"a photo of {base}",
+        f"an image of {base}",
+        f"a picture of {base}",
+        f"a realistic photo of {base}",
+        f"a high-quality photo of {base}",
+        f"{base} on a plain background",
+        f"{base}, studio photography",
+        f"a detailed image of {base}",
+        f"a clear photo of {base}",
+        f"a bright photo of {base}",
+    ]
+    seen: set[str] = set()
+    variants: list[str] = []
+    for v in candidates:
+        k = v.strip().lower()
+        if k and k not in seen:
+            variants.append(v)
+            seen.add(k)
+    return variants
+
+
 @dataclass
 class CountingSample:
     anchor: str
-    positive_pool: list[str]
+    anchor_variants: list[str]   # template rewrites of anchor (used as positives)
+    positive_pool: list[str]     # kept for reference / fallback only
     negative_pool: list[str]
     target_word: str
     image_paths: list[Path]
@@ -276,6 +308,7 @@ class CountingVerdictDataset(Dataset):
             self.samples.append(
                 CountingSample(
                     anchor=anchor,
+                    anchor_variants=make_anchor_variants(anchor),
                     positive_pool=pos_pool,
                     negative_pool=neg_pool,
                     target_word=item["target_word"],
@@ -321,13 +354,15 @@ class CountingVerdictDataset(Dataset):
             return random.sample(pool, self.num_negatives)
         return [random.choice(pool) for _ in range(self.num_negatives)]
 
-    def _sample_positive(self, anchor: str, local_pool: list[str], target_word: str) -> str:
-        pool = list(local_pool)
+    def _sample_anchor_positive(self, anchor: str, variants: list[str]) -> str:
+        """
+        Sample a template rewrite of the same anchor as the positive.
+        Positive shares the same number word AND object as the anchor — only phrasing differs.
+        This ensures context_refiner's bidirectional object-context pollution is symmetric
+        between anchor and positive, making them naturally easier to pull together.
+        """
+        pool = [v for v in variants if v.strip().lower() != anchor.strip().lower()]
         if not pool:
-            # Fallback to same target_word global pool
-            pool = [x for x in self.global_positives_by_target.get(target_word, []) if x != anchor]
-        if not pool:
-            # Last-resort fallback
             return anchor
         return random.choice(pool)
 
@@ -348,7 +383,7 @@ class CountingVerdictDataset(Dataset):
         chosen = random.choices(self.samples, k=n)
         items = []
         for s in chosen:
-            positive = self._sample_positive(s.anchor, s.positive_pool, s.target_word)
+            positive = self._sample_anchor_positive(s.anchor, s.anchor_variants)
             negatives = self._sample_negatives(s.negative_pool, s.target_word)
             if not negatives:
                 negatives = [s.anchor for _ in range(self.num_negatives)]
