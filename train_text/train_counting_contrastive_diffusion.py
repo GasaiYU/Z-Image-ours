@@ -89,22 +89,17 @@ def extract_token_feature(hidden_states: torch.Tensor, token_indices: list[int])
 
 
 class ContrastiveProjectionHead(torch.nn.Module):
-    """SimCLR-style projection head for contrastive learning.
+    """Single-layer linear projection head for contrastive learning.
 
-    Maps refiner mean-pool vectors to a low-dim discriminative space.
-    Only used during training for the contrastive loss; never used at inference time.
-    The input norm (~1 after L2-normalize) ensures the L2-normalize Jacobian inside
-    the head is O(1) rather than O(1/||h||), fixing the gradient shrinkage issue.
+    Simpler than MLP: shorter gradient path back to refiner, less capacity to
+    "cheat" by solving the contrastive task without the refiner changing.
+    Maps refiner mean-pool vectors [in_dim] → projected space [out_dim], L2-normalised.
+    hidden_dim is kept in __init__ for API compatibility but is ignored.
     """
 
     def __init__(self, in_dim: int, hidden_dim: int = 512, out_dim: int = 256):
         super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(in_dim, hidden_dim, bias=False),
-            torch.nn.LayerNorm(hidden_dim),
-            torch.nn.GELU(),
-            torch.nn.Linear(hidden_dim, out_dim, bias=False),
-        )
+        self.net = torch.nn.Linear(in_dim, out_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.normalize(self.net(x.float()), dim=-1)
@@ -619,6 +614,7 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(1, args.epochs + 1):
         transformer.train()
+        proj_head.train()
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         running_total = 0.0
         running_diff = 0.0
@@ -627,63 +623,58 @@ def main(args: argparse.Namespace) -> None:
 
         for batch in pbar:
             # ── Contrastive loss (large text-only batch, no images) ──────────────
-            # Sample contrastive_batch_size anchors from dataset directly (no DataLoader overhead)
-            text_items = dataset.sample_text_batch(args.contrastive_batch_size)
-            text_batch = collate_text_batch(text_items)
+            if args.contrastive_weight > 0:
+                text_items = dataset.sample_text_batch(args.contrastive_batch_size)
+                text_batch = collate_text_batch(text_items)
 
-            anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["anchor"]]
-            pos_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["positive"]]
-            neg_texts_nested = [
-                [format_prompt(tokenizer, t, args.use_chat_template) for t in negs]
-                for negs in text_batch["negatives"]
-            ]
-            flat_neg_texts = [x for negs in neg_texts_nested for x in negs]
+                anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["anchor"]]
+                pos_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["positive"]]
+                neg_texts_nested = [
+                    [format_prompt(tokenizer, t, args.use_chat_template) for t in negs]
+                    for negs in text_batch["negatives"]
+                ]
+                flat_neg_texts = [x for negs in neg_texts_nested for x in negs]
 
-            a_ids, a_mask = tokenize_texts(tokenizer, anchor_texts, args.max_length)
-            p_ids, p_mask = tokenize_texts(tokenizer, pos_texts, args.max_length)
-            n_ids, n_mask = tokenize_texts(tokenizer, flat_neg_texts, args.max_length)
+                a_ids, a_mask = tokenize_texts(tokenizer, anchor_texts, args.max_length)
+                p_ids, p_mask = tokenize_texts(tokenizer, pos_texts, args.max_length)
+                n_ids, n_mask = tokenize_texts(tokenizer, flat_neg_texts, args.max_length)
 
-            a_ids = a_ids.to(device)
-            p_ids = p_ids.to(device)
-            n_ids = n_ids.to(device)
-            a_mask = a_mask.to(device)
-            p_mask = p_mask.to(device)
-            n_mask = n_mask.to(device)
+                a_ids = a_ids.to(device);  a_mask = a_mask.to(device)
+                p_ids = p_ids.to(device);  p_mask = p_mask.to(device)
+                n_ids = n_ids.to(device);  n_mask = n_mask.to(device)
 
-            # Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
-            # Special tokens excluded so only number+object tokens shape the sentence vector.
-            ea = chunked_encode_and_extract(
-                text_encoder, transformer, tokenizer,
-                a_ids, a_mask, args.text_chunk_size,
-            )
-            ep = chunked_encode_and_extract(
-                text_encoder, transformer, tokenizer,
-                p_ids, p_mask, args.text_chunk_size,
-            )
-            en_flat = chunked_encode_and_extract(
-                text_encoder, transformer, tokenizer,
-                n_ids, n_mask, args.text_chunk_size,
-            )
+                ea = chunked_encode_and_extract(text_encoder, transformer, tokenizer, a_ids, a_mask, args.text_chunk_size)
+                ep = chunked_encode_and_extract(text_encoder, transformer, tokenizer, p_ids, p_mask, args.text_chunk_size)
+                en_flat = chunked_encode_and_extract(text_encoder, transformer, tokenizer, n_ids, n_mask, args.text_chunk_size)
+                del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
 
-            # Free input token tensors — no longer needed after feature extraction
-            del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
+                B_ctr = ea.shape[0]
+                K = args.num_negatives
 
-            B_ctr = ea.shape[0]
-            K = args.num_negatives
+                # Diagnostic: p-n in refiner space (before projection)
+                with torch.no_grad():
+                    en_diag = en_flat.view(B_ctr, K, -1)
+                    pre_pos_sim = (ea * ep).sum(dim=-1).mean().item()
+                    pre_neg_sim = (ea.unsqueeze(1) * en_diag).sum(dim=-1).mean().item()
+                    del en_diag
 
-            # SimCLR projection head: map refiner mean-pool → discriminative low-dim space
-            ea_proj = proj_head(ea)
-            ep_proj = proj_head(ep)
-            en_proj = proj_head(en_flat).view(B_ctr, K, -1)
-            del ea, ep, en_flat
+                ea_proj = proj_head(ea)
+                ep_proj = proj_head(ep)
+                en_proj = proj_head(en_flat).view(B_ctr, K, -1)
+                del ea, ep, en_flat
 
-            # Diagnostic: pos_sim and neg_sim in projected space
-            with torch.no_grad():
-                pos_sim = (ea_proj * ep_proj).sum(dim=-1).mean().item()
-                neg_sim = (ea_proj.unsqueeze(1) * en_proj).sum(dim=-1).mean().item()
+                with torch.no_grad():
+                    pos_sim = (ea_proj * ep_proj).sum(dim=-1).mean().item()
+                    neg_sim = (ea_proj.unsqueeze(1) * en_proj).sum(dim=-1).mean().item()
 
-            loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
-            del ea_proj, ep_proj, en_proj
+                loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
+                del ea_proj, ep_proj, en_proj
+            else:
+                loss_ctr = torch.tensor(0.0, device=device)
+                pos_sim = neg_sim = 0.0
+                pre_pos_sim = pre_neg_sim = 0.0
+                B_ctr = args.contrastive_batch_size
+                K = args.num_negatives
 
             # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
             # Use anchor text from the image batch for diffusion conditioning
@@ -725,7 +716,8 @@ def main(args: argparse.Namespace) -> None:
             if global_step == 0 and is_main:
                 print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
                       f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
-                      f"pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  "
+                      f"pre_p-n={pre_pos_sim - pre_neg_sim:+.4f}  "
+                      f"post_p-n={pos_sim - neg_sim:+.4f}  "
                       f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
             optimizer.zero_grad(set_to_none=True)
@@ -744,7 +736,8 @@ def main(args: argparse.Namespace) -> None:
                     {
                         "L_diff": f"{loss_diff.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
-                        "p-n": f"{pos_sim - neg_sim:+.3f}",
+                        "pre": f"{pre_pos_sim - pre_neg_sim:+.3f}",
+                        "post": f"{pos_sim - neg_sim:+.3f}",
                     }
                 )
                 if use_wandb:
@@ -753,9 +746,12 @@ def main(args: argparse.Namespace) -> None:
                             "train/loss_total": loss.item(),
                             "train/loss_diff": loss_diff.item(),
                             "train/loss_ctr": loss_ctr.item(),
-                            "train/pos_sim": pos_sim,
-                            "train/neg_sim": neg_sim,
-                            "train/pos_neg_gap": pos_sim - neg_sim,
+                            "train/pre_pos_sim": pre_pos_sim,
+                            "train/pre_neg_sim": pre_neg_sim,
+                            "train/pre_pos_neg_gap": pre_pos_sim - pre_neg_sim,
+                            "train/post_pos_sim": pos_sim,
+                            "train/post_neg_sim": neg_sim,
+                            "train/post_pos_neg_gap": pos_sim - neg_sim,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                         },
@@ -806,11 +802,13 @@ def main(args: argparse.Namespace) -> None:
     if is_main:
         final_path = Path(args.output_dir) / "transformer_refiner_final.pt"
         unwrapped = accelerator.unwrap_model(transformer)
+        unwrapped_proj = accelerator.unwrap_model(proj_head)
         torch.save(
             {
                 "step": global_step,
                 "epoch": args.epochs,
                 "transformer_state_dict": unwrapped.state_dict(),
+                "proj_head_state_dict": unwrapped_proj.state_dict(),
                 "args": vars(args),
             },
             final_path,
