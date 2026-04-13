@@ -589,13 +589,11 @@ def main(args: argparse.Namespace) -> None:
             text_items = dataset.sample_text_batch(args.contrastive_batch_size)
             text_batch = collate_text_batch(text_items)
 
-            anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["anchor"]]
-            pos_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["positive"]]
-            neg_texts_nested = [
-                [format_prompt(tokenizer, t, args.use_chat_template) for t in negs]
-                for negs in text_batch["negatives"]
-            ]
-            flat_neg_texts = [x for negs in neg_texts_nested for x in negs]
+            # Contrastive texts use raw format (no chat template) so that mean pooling
+            # is not dominated by shared role tokens ("user", "assistant", etc.).
+            anchor_texts = list(text_batch["anchor"])
+            pos_texts = list(text_batch["positive"])
+            flat_neg_texts = [t for negs in text_batch["negatives"] for t in negs]
 
             a_ids, a_mask = tokenize_texts(tokenizer, anchor_texts, args.max_length)
             p_ids, p_mask = tokenize_texts(tokenizer, pos_texts, args.max_length)
