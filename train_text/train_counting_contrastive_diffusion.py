@@ -722,66 +722,10 @@ def main(args: argparse.Namespace) -> None:
                       f"pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  "
                       f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
-            # ── snapshot refiner param BEFORE update (step 0 only) ──────────────
-            if global_step == 0 and is_main:
-                _model = accelerator.unwrap_model(transformer)
-                _first_param = next(
-                    (p for n, p in _model.named_parameters() if "context_refiner" in n),
-                    None,
-                )
-                _param_before = _first_param.detach().float().flatten()[:8].clone() if _first_param is not None else None
-                _first_param_name = next(
-                    (n for n, p in _model.named_parameters() if "context_refiner" in n),
-                    "N/A",
-                )
-
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
-
-            # ── print gradients right after backward ──────────────────────────────
-            if global_step % 10 == 0 and is_main:
-                _model = accelerator.unwrap_model(transformer)
-                print("\n[Grad check] context_refiner parameter gradients:")
-                has_any_grad = False
-                for name, param in _model.named_parameters():
-                    if "context_refiner" not in name:
-                        continue
-                    if param.grad is None:
-                        print(f"  {name}: grad=None  ← NO GRADIENT")
-                    else:
-                        gnorm = param.grad.float().norm().item()
-                        has_any_grad = True
-                        print(f"  {name}: grad_norm={gnorm:.6f}")
-                if not has_any_grad:
-                    print("  [WARNING] ALL context_refiner params have grad=None!")
-
-                _proj = accelerator.unwrap_model(proj_head)
-                print("[Grad check] proj_head parameter gradients:")
-                for name, param in _proj.named_parameters():
-                    if param.grad is None:
-                        print(f"  proj_head.{name}: grad=None  ← NO GRADIENT")
-                    else:
-                        gnorm = param.grad.float().norm().item()
-                        print(f"  proj_head.{name}: grad_norm={gnorm:.6f}")
-                print()
-
             accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
-
-            # ── check param actually changed after first step ─────────────────────
-            if global_step % 10 == 0 and is_main and _param_before is not None:
-                _model = accelerator.unwrap_model(transformer)
-                _param_after = next(
-                    (p for n, p in _model.named_parameters() if "context_refiner" in n),
-                    None,
-                )
-                if _param_after is not None:
-                    _param_after_val = _param_after.detach().float().flatten()[:8]
-                    _delta = (_param_after_val - _param_before).abs().max().item()
-                    print(f"[Param check] '{_first_param_name}' first 8 values:")
-                    print(f"  before: {_param_before.tolist()}")
-                    print(f"  after : {_param_after_val.tolist()}")
-                    print(f"  max |delta| = {_delta:.2e}  ({'UPDATED ✓' if _delta > 0 else 'NOT UPDATED ✗'})\n")
 
             global_step += 1
             steps += 1
