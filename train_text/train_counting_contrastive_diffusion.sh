@@ -71,6 +71,7 @@ accelerate launch \
     --save_every "$SAVE_EVERY" \
     --vis_every "$VIS_EVERY" \
     --use_chat_template \
+    --use_proj_head \
     --use_wandb \
     --wandb_project "$WANDB_PROJECT" \
     --wandb_run "$WANDB_RUN"

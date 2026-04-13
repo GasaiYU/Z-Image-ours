@@ -888,8 +888,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")
     p.add_argument("--use_proj_head", action="store_true", default=True,
                    help="Use SimCLR projection head for contrastive loss (recommended for gradient flow)")
-    p.add_argument("--no_proj_head", dest="use_proj_head", action="store_false",
-                   help="Disable projection head: InfoNCE directly on refiner token embedding")
     p.add_argument("--proj_hidden_dim", type=int, default=512,
                    help="SimCLR projection head hidden dim (in_dim → hidden_dim → out_dim)")
     p.add_argument("--proj_out_dim", type=int, default=256,
