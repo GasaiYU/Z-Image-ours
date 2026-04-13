@@ -205,7 +205,6 @@ def make_anchor_variants(anchor: str) -> list[str]:
         f"{base}, studio photography",
         f"a detailed image of {base}",
         f"a clear photo of {base}",
-        f"a bright photo of {base}",
     ]
     seen: set[str] = set()
     variants: list[str] = []
