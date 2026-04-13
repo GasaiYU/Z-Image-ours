@@ -2,15 +2,13 @@
 set -euo pipefail
 
 # ── GPU selection ─────────────────────────────────────────────────────────────
-# Set NUM_GPUS to the number of GPUs you want to use.
-# e.g.  NUM_GPUS=4 bash train_text/train_counting_contrastive_diffusion.sh
 NUM_GPUS=${NUM_GPUS:-8}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/counting_triplets_filtered.jsonl}
 GENERATED_ROOT=${GENERATED_ROOT:-data/generated_images}
-OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_infonce}
+OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_sigreg}
 
 # ── Data / model ──────────────────────────────────────────────────────────────
 VERDICT_THRESHOLD=${VERDICT_THRESHOLD:-0.8}
@@ -19,27 +17,28 @@ MAX_LENGTH=${MAX_LENGTH:-128}
 
 # ── Training ──────────────────────────────────────────────────────────────────
 EPOCHS=${EPOCHS:-50}
-BATCH_SIZE=${BATCH_SIZE:-1}                  # per-GPU image batch size (diffusion loss, GPU-memory bound)
-CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}  # text-only batch size (contrastive loss, very cheap)
-TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}       # chunk size for text encoder / context_refiner (controls peak memory)
+BATCH_SIZE=${BATCH_SIZE:-1}
+CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}
+TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}
 NUM_WORKERS=${NUM_WORKERS:-2}
-LR=${LR:-1e-3}          # proj_head lr (from scratch)
-REFINER_LR=${REFINER_LR:-1e-4}  # context_refiner lr (pre-trained fine-tune)
+REFINER_LR=${REFINER_LR:-5e-4}
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 SEED=${SEED:-42}
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
-MARGIN=${MARGIN:-0.2}
+TEMPERATURE=${TEMPERATURE:-0.07}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
-DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}
+DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-0.0}    # set 0 first; add back once collapse is fixed
+SIGREG_WEIGHT=${SIGREG_WEIGHT:-1.0}
+SIGREG_SLICES=${SIGREG_SLICES:-256}
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
 SAVE_EVERY=${SAVE_EVERY:-100}
 VIS_EVERY=${VIS_EVERY:-100}
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
-WANDB_RUN=${WANDB_RUN:-text_refiner_counting_w_head_only_counting}
+WANDB_RUN=${WANDB_RUN:-sigreg_infonce_no_proj}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 accelerate launch \
@@ -58,19 +57,17 @@ accelerate launch \
     --contrastive_batch_size "$CONTRASTIVE_BATCH_SIZE" \
     --text_chunk_size "$TEXT_CHUNK_SIZE" \
     --num_workers "$NUM_WORKERS" \
-    --lr "$LR" \
     --refiner_lr "$REFINER_LR" \
     --weight_decay "$WEIGHT_DECAY" \
     --mixed_precision "$MIXED_PRECISION" \
     --seed "$SEED" \
     --num_negatives "$NUM_NEGATIVES" \
-    --margin "$MARGIN" \
+    --temperature "$TEMPERATURE" \
     --contrastive_weight "$CONTRASTIVE_WEIGHT" \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
-    --save_every "$SAVE_EVERY" \
-    --vis_every "$VIS_EVERY" \
+    --sigreg_weight "$SIGREG_WEIGHT" \
+    --sigreg_slices "$SIGREG_SLICES" \
     --use_chat_template \
-    --use_proj_head \
     --use_wandb \
     --wandb_project "$WANDB_PROJECT" \
     --wandb_run "$WANDB_RUN"
