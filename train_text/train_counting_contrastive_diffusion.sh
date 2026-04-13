@@ -36,8 +36,8 @@ CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
-SAVE_EVERY=${SAVE_EVERY:-500}
-VIS_EVERY=${VIS_EVERY:-500}
+SAVE_EVERY=${SAVE_EVERY:-150}
+VIS_EVERY=${VIS_EVERY:-150}
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
 WANDB_RUN=${WANDB_RUN:-text_refiner_counting}
 
