@@ -285,16 +285,19 @@ class CountingVerdictDataset(Dataset):
             if anchor:
                 same_word_texts[target_word].add(anchor)
 
-        # Build global negative text pool for each target_word
-        all_target_words = sorted(same_word_texts.keys())  
-        self.global_negatives_by_target: dict[str, list[str]] = {}
+        # Build global negative text pool for each target_word.
+        # Each entry is (text, neg_target_word) so callers know which number word to locate.
+        all_target_words = sorted(same_word_texts.keys())
+        self.global_negatives_by_target: dict[str, list[tuple[str, str]]] = {}
         for tw in all_target_words:
-            neg_texts = set()
+            neg_pairs: list[tuple[str, str]] = []
             for other_tw in all_target_words:
                 if other_tw == tw:
                     continue
-                neg_texts.update(same_word_texts[other_tw])
-            self.global_negatives_by_target[tw] = [x for x in neg_texts if x]
+                for text in same_word_texts[other_tw]:
+                    if text:
+                        neg_pairs.append((text, other_tw))
+            self.global_negatives_by_target[tw] = neg_pairs
 
         self.samples: list[CountingSample] = []
         for anchor, item in grouped.items():
@@ -339,20 +342,29 @@ class CountingVerdictDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _sample_negatives(self, local_pool: list[str], target_word: str) -> list[str]:
-        pool = list(local_pool)
-        if len(pool) < self.num_negatives:
-            global_pool = self.global_negatives_by_target.get(target_word, [])
-            for x in global_pool:
-                if x not in pool:
-                    pool.append(x)
-                if len(pool) >= self.num_negatives:
-                    break
-        if not pool:
-            return []
-        if len(pool) >= self.num_negatives:
-            return random.sample(pool, self.num_negatives)
-        return [random.choice(pool) for _ in range(self.num_negatives)]
+    def _sample_negatives(self, local_pool: list[str], target_word: str) -> tuple[list[str], list[str]]:
+        """Return (neg_texts, neg_target_words) — each negative paired with its own number word."""
+        # local_pool texts share different number words; use global pool to tag them.
+        # Build a tagged pool: (text, neg_tw) from the global pool.
+        tagged: list[tuple[str, str]] = self.global_negatives_by_target.get(target_word, [])
+
+        # Supplement with local_pool items if needed (tagged with a placeholder; will still work
+        # because find_target_idx falls back to scanning when the word isn't in the text).
+        # Local pool texts already come from triplets where their target_word differs from anchor's.
+        # To keep it correct, only use the global tagged pool.
+        if not tagged:
+            texts = [s.anchor for _ in range(self.num_negatives)]
+            words = [target_word] * self.num_negatives
+            return texts, words
+
+        if len(tagged) >= self.num_negatives:
+            chosen = random.sample(tagged, self.num_negatives)
+        else:
+            chosen = [random.choice(tagged) for _ in range(self.num_negatives)]
+
+        neg_texts = [t for t, _ in chosen]
+        neg_tws = [tw for _, tw in chosen]
+        return neg_texts, neg_tws
 
     def _sample_anchor_positive(self, anchor: str, variants: list[str]) -> str:
         """
@@ -384,13 +396,12 @@ class CountingVerdictDataset(Dataset):
         items = []
         for s in chosen:
             positive = self._sample_anchor_positive(s.anchor, s.anchor_variants)
-            negatives = self._sample_negatives(s.negative_pool, s.target_word)
-            if not negatives:
-                negatives = [s.anchor for _ in range(self.num_negatives)]
+            negatives, neg_target_words = self._sample_negatives(s.negative_pool, s.target_word)
             items.append({
                 "anchor": s.anchor,
                 "positive": positive,
                 "negatives": negatives,
+                "neg_target_words": neg_target_words,
                 "target_word": s.target_word,
             })
         return items
@@ -411,6 +422,7 @@ def collate_text_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
         "anchor": [b["anchor"] for b in items],
         "positive": [b["positive"] for b in items],
         "negatives": [b["negatives"] for b in items],
+        "neg_target_words": [b["neg_target_words"] for b in items],
         "target_word": [b["target_word"] for b in items],
     }
 
@@ -583,7 +595,8 @@ def main(args: argparse.Namespace) -> None:
             # Pipeline: encode → refine → extract token feature, chunk by chunk.
             # Full-sequence tensors ([N, seq_len, D]) are freed inside each chunk;
             # only token-level vectors ([N, D]) accumulate → peak memory = chunk_size × seq_len × D.
-            flat_target_words = [tw for tw in text_batch["target_word"] for _ in range(args.num_negatives)]
+            # Each negative uses its OWN number word (not the anchor's) so find_target_idx succeeds.
+            flat_target_words = [tw for neg_tws in text_batch["neg_target_words"] for tw in neg_tws]
             ea, vm_a = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
                 a_ids, a_mask, list(text_batch["target_word"]), args.text_chunk_size,
