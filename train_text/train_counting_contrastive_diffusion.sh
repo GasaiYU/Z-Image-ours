@@ -29,8 +29,8 @@ SEED=${SEED:-42}
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
 TEMPERATURE=${TEMPERATURE:-0.07}
-CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
-DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}    # set 0 first; add back once collapse is fixed
+CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-0.0}
+DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}
 SIGREG_WEIGHT=${SIGREG_WEIGHT:-1.0}
 SIGREG_SLICES=${SIGREG_SLICES:-256}
 
@@ -67,6 +67,8 @@ accelerate launch \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
     --sigreg_weight "$SIGREG_WEIGHT" \
     --sigreg_slices "$SIGREG_SLICES" \
+    --save_every "$SAVE_EVERY" \
+    --vis_every "$VIS_EVERY" \
     --use_chat_template \
     --use_wandb \
     --wandb_project "$WANDB_PROJECT" \

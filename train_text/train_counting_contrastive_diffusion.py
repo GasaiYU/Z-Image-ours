@@ -64,48 +64,50 @@ def format_prompt(tokenizer, text: str, use_chat_template: bool) -> str:
     )
 
 
+def find_target_idx(tokenizer, input_ids: torch.Tensor, attention_mask: torch.Tensor, target_word: str) -> int:
+    valid_ids = input_ids[attention_mask.bool()].tolist()
+    tw = target_word.lower().strip()
+    for idx, tid in enumerate(valid_ids):
+        token_str = tokenizer.decode([tid], skip_special_tokens=True).lower().strip()
+        if tw in token_str or token_str in tw:
+            return idx
+    return -1
 
-def sigreg_loss(x: torch.Tensor, global_step: int, num_slices: int = 256) -> torch.Tensor:
-    """Sketched Isotropic Gaussian Regularization (SIGReg) from LeJEPA (Balestriero & LeCun, 2025).
 
-    Forces the distribution of embeddings toward N(0, I) via the Epps-Pulley characteristic
-    function test. Unlike InfoNCE, the gradient is bounded and non-zero even under complete
-    representation collapse, making it effective as an anti-collapse regularizer.
+def extract_token_feature(hidden_states: torch.Tensor, token_indices: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    feats = []
+    valid = []
+    seq_len = hidden_states.shape[1]
+    for i, tidx in enumerate(token_indices):
+        if 0 <= tidx < seq_len:
+            feats.append(F.normalize(hidden_states[i, tidx, :], dim=-1))
+            valid.append(True)
+        else:
+            feats.append(torch.zeros_like(hidden_states[i, 0, :]))
+            valid.append(False)
+    return torch.stack(feats, dim=0), torch.tensor(valid, device=hidden_states.device, dtype=torch.bool)
 
-    x           [N, K]  raw (unnormalized) float features
-    global_step         used to seed random projections (reproducible + changes each step)
-    num_slices          number of 1-D random projections (M in the paper)
 
-    Returns scalar loss (sum over slices, averaged).
+class ContrastiveProjectionHead(torch.nn.Module):
+    """SimCLR-style projection head for contrastive learning.
+
+    Maps refiner mean-pool vectors to a low-dim discriminative space.
+    Only used during training for the contrastive loss; never used at inference time.
+    The input norm (~1 after L2-normalize) ensures the L2-normalize Jacobian inside
+    the head is O(1) rather than O(1/||h||), fixing the gradient shrinkage issue.
     """
-    x = x.float()
-    N, K = x.shape
-    device = x.device
 
-    # Random unit-norm projection directions, seeded so multi-GPU workers agree
-    g = torch.Generator(device=device)
-    g.manual_seed(global_step)
-    A = torch.randn(K, num_slices, generator=g, device=device, dtype=x.dtype)
-    A = A / A.norm(p=2, dim=0, keepdim=True)             # [K, M] unit-norm columns
+    def __init__(self, in_dim: int, hidden_dim: int = 512, out_dim: int = 256):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, hidden_dim, bias=False),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_dim, out_dim, bias=False),
+        )
 
-    # Integration grid for Epps-Pulley
-    t = torch.linspace(-5, 5, 17, device=device, dtype=x.dtype)  # [T]
-    exp_f = torch.exp(-0.5 * t ** 2)                              # N(0,1) CF  [T]
-
-    # Projected values: [N, M], then broadcast to [N, M, T]
-    x_t = (x @ A).unsqueeze(2) * t                        # [N, M, T]
-
-    # Empirical characteristic function (real + imaginary parts)
-    ecf_real = torch.cos(x_t).mean(0)                     # [M, T]
-    ecf_imag = torch.sin(x_t).mean(0)                     # [M, T]
-
-    # Weighted L2 distance from target CF, Gaussian window w(t) = exp_f
-    err = ((ecf_real - exp_f) ** 2 + ecf_imag ** 2) * exp_f  # [M, T]
-
-    # Approximate integral via trapezoid rule.
-    # We do NOT multiply by N (unlike the raw test-statistic in the paper) so that
-    # the loss magnitude is O(1) and comparable to InfoNCE, regardless of batch size.
-    return torch.trapezoid(err, t, dim=-1).mean()         # scalar, O(1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(x.float()), dim=-1)
 
 
 def chunked_encode_and_extract(
@@ -115,75 +117,63 @@ def chunked_encode_and_extract(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
-    Pipeline: encode → refine → mean pool, chunk by chunk.
+    Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
 
-    Always returns RAW (unnormalized) features so SIGReg can operate on real norms.
-    After SIGReg convergence, ||h|| ≈ √D, making raw dot products proportional to
-    cosine similarity and compatible with scaled InfoNCE (scale = D * τ).
+    Chat-template special tokens (<|im_start|>, <|im_end|>, role words, etc.) are excluded
+    from the pool so the sentence vector reflects only real content tokens (number + object).
+    This way "seven canes" and "one canes" differ because both the number token AND the
+    "canes" token (which is aware of its neighbour via bidirectional attention) contribute.
 
-    target_words: kept for API compatibility but currently ignored (mean pooling is
-    always used for the contrastive path).
-
-    Returns:
-        feats      [N, D]  raw (unnormalized) mean-pooled refiner output
-        valid_mask [N]     bool, always all-True (mean pooling never fails)
+    Peak memory = chunk_size × seq_len × D (full-sequence tensors freed after pooling).
+    Returns L2-normalised sentence vectors [N, D].
     """
-    all_feats:  list[torch.Tensor] = []
-    all_valid:  list[torch.Tensor] = []
-    N = input_ids.shape[0]
     special_ids = set(tokenizer.all_special_ids)
+    all_feats: list[torch.Tensor] = []
+    N = input_ids.shape[0]
 
     for i in range(0, N, chunk_size):
         ids  = input_ids[i : i + chunk_size]
         mask = attention_mask[i : i + chunk_size]
-        bsz  = ids.shape[0]
 
-        # Step 1: frozen text encoder
+        # Content mask: real token (mask==1) AND not a special token
+        is_special = torch.zeros_like(ids, dtype=torch.bool)
+        for sid in special_ids:
+            is_special |= (ids == sid)
+        content_mask = mask.bool() & ~is_special          # [chunk, seq_len]
+
+        # Step 1: frozen text encoder — use full attention_mask for the encoder itself
         with torch.no_grad():
             out = text_encoder(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True)
         h = out.hidden_states[-2].detach().clone()
         del out
 
-        # Step 2: context_refiner — trainable, gradients flow
+        # Step 2: context_refiner — trainable, gradients flow; full mask for padding
         h_ref = run_context_refiner(transformer, h, mask)
         del h
 
-        # Mean pool over non-special, non-padding tokens
-        is_special = torch.zeros_like(ids, dtype=torch.bool)
-        for sid in special_ids:
-            is_special |= (ids == sid)
-        content_mask = mask.bool() & ~is_special
+        # Step 3: mean pool over content tokens only, then L2-normalise
         float_mask = content_mask.unsqueeze(-1).float()
         denom = float_mask.sum(dim=1).clamp(min=1.0)
-        feats = (h_ref * float_mask).sum(dim=1).float() / denom
-        valid = torch.ones(bsz, dtype=torch.bool, device=ids.device)
-
+        pooled = (h_ref * float_mask).sum(dim=1) / denom
+        pooled = F.normalize(pooled.float(), dim=-1)
         del h_ref
-        all_feats.append(feats)   # raw, NOT L2-normalised — SIGReg needs raw norms
-        all_valid.append(valid)
 
-    return torch.cat(all_feats, dim=0), torch.cat(all_valid, dim=0)
+        all_feats.append(pooled)
+
+    return torch.cat(all_feats, dim=0)
 
 
-def infonce_loss(
-    ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor,
-    temperature: float, dim: int | None = None,
-) -> torch.Tensor:
-    """InfoNCE with one positive and K negatives per anchor.
-
-    ea: [B, D], ep: [B, D], en: [B, K, D]  — raw (unnormalised) features
-    temperature: base temperature (τ)
-    dim: feature dimension D.  When provided, scale = D * τ so that raw dot
-         products behave like cosine-sim / τ after SIGReg forces ||h|| ≈ √D.
-         When None, inputs are expected to be already L2-normalised.
+def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
+    """
+    InfoNCE with one positive and K negatives per anchor.
+    ea: [B, D], ep: [B, D], en: [B, K, D]
     """
     ea, ep, en = ea.float(), ep.float(), en.float()
-    scale = (dim * temperature) if dim is not None else temperature
-    pos_logits = (ea * ep).sum(dim=-1, keepdim=True) / scale       # [B, 1]
-    neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1) / scale        # [B, K]
-    logits = torch.cat([pos_logits, neg_logits], dim=1)
+    pos_logits = (ea * ep).sum(dim=-1, keepdim=True)          # [B, 1]
+    neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1)           # [B, K]
+    logits = torch.cat([pos_logits, neg_logits], dim=1) / temperature
     labels = torch.zeros(ea.shape[0], dtype=torch.long, device=ea.device)
     return F.cross_entropy(logits, labels)
 
@@ -341,6 +331,7 @@ class CountingVerdictDataset(Dataset):
                     rows.append(obj)
 
         image_cache: dict[str, list[Path]] = {}
+        same_word_texts: dict[str, set[str]] = defaultdict(set)
         grouped: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"target_word": "", "positive_pool": set(), "negative_pool": set()}
         )
@@ -353,8 +344,11 @@ class CountingVerdictDataset(Dataset):
             grouped[anchor]["target_word"] = target_word
             if positive:
                 grouped[anchor]["positive_pool"].add(positive)
+                same_word_texts[target_word].add(positive)
             if negative:
                 grouped[anchor]["negative_pool"].add(negative)
+            if anchor:
+                same_word_texts[target_word].add(anchor)
 
         self.samples: list[CountingSample] = []
         for anchor, item in grouped.items():
@@ -522,13 +516,22 @@ def main(args: argparse.Namespace) -> None:
 
     trainable_names = unfreeze_transformer_refiner_layers(transformer)
 
+    # Get transformer hidden dim before accelerator wraps it
     _raw_transformer = transformer.module if hasattr(transformer, "module") else transformer
     _transformer_dim = _raw_transformer.dim
 
+    proj_head = ContrastiveProjectionHead(
+        in_dim=_transformer_dim,
+        hidden_dim=args.proj_hidden_dim,
+        out_dim=args.proj_out_dim,
+    ).to(device)
+
+    trainable_params = [p for p in transformer.parameters() if p.requires_grad] + list(proj_head.parameters())
     if is_main:
         n_refiner = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-        print(f"[Init] trainable refiner params: {n_refiner:,}  (dim={_transformer_dim})")
-        print(f"[Init] SIGReg slices={args.sigreg_slices}  sigreg_weight={args.sigreg_weight}")
+        n_proj = sum(p.numel() for p in proj_head.parameters())
+        print(f"[Init] trainable transformer params: {n_refiner:,}")
+        print(f"[Init] projection head params: {n_proj:,}  (in={_transformer_dim} → hid={args.proj_hidden_dim} → out={args.proj_out_dim})")
     if args.print_trainable and is_main:
         print("[Init] trainable parameter names:")
         for name in trainable_names[:50]:
@@ -554,12 +557,15 @@ def main(args: argparse.Namespace) -> None:
     )
 
     optimizer = torch.optim.AdamW(
-        [p for p in transformer.parameters() if p.requires_grad],
-        lr=args.refiner_lr,
+        [
+            {"params": [p for p in transformer.parameters() if p.requires_grad], "lr": args.refiner_lr},
+            {"params": list(proj_head.parameters()), "lr": args.lr},
+        ],
         weight_decay=args.weight_decay,
     )
 
-    transformer, optimizer, loader = accelerator.prepare(transformer, optimizer, loader)
+    # accelerate wraps transformer + proj_head (trainable) + optimizer + loader
+    transformer, proj_head, optimizer, loader = accelerator.prepare(transformer, proj_head, optimizer, loader)
 
     vis_dir = Path(args.output_dir) / "vis"
     if is_main:
@@ -605,7 +611,7 @@ def main(args: argparse.Namespace) -> None:
 
     global_step = 0
     transformer_dtype = next(transformer.parameters()).dtype
-    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+    # trainable_params already defined above to include both transformer refiner + proj_head
 
     # Baseline visualization before any training
     if args.vis_every > 0:
@@ -617,7 +623,6 @@ def main(args: argparse.Namespace) -> None:
         running_total = 0.0
         running_diff = 0.0
         running_ctr = 0.0
-        running_sig = 0.0
         steps = 0
 
         for batch in pbar:
@@ -626,107 +631,101 @@ def main(args: argparse.Namespace) -> None:
             text_items = dataset.sample_text_batch(args.contrastive_batch_size)
             text_batch = collate_text_batch(text_items)
 
-            anchor_texts   = list(text_batch["anchor"])
-            pos_texts      = list(text_batch["positive"])
-            neg_texts_flat = [t for negs in text_batch["negatives"] for t in negs]
+            anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["anchor"]]
+            pos_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["positive"]]
+            neg_texts_nested = [
+                [format_prompt(tokenizer, t, args.use_chat_template) for t in negs]
+                for negs in text_batch["negatives"]
+            ]
+            flat_neg_texts = [x for negs in neg_texts_nested for x in negs]
 
             a_ids, a_mask = tokenize_texts(tokenizer, anchor_texts, args.max_length)
-            p_ids, p_mask = tokenize_texts(tokenizer, pos_texts,    args.max_length)
-            n_ids, n_mask = tokenize_texts(tokenizer, neg_texts_flat, args.max_length)
+            p_ids, p_mask = tokenize_texts(tokenizer, pos_texts, args.max_length)
+            n_ids, n_mask = tokenize_texts(tokenizer, flat_neg_texts, args.max_length)
 
-            a_ids = a_ids.to(device);  a_mask = a_mask.to(device)
-            p_ids = p_ids.to(device);  p_mask = p_mask.to(device)
-            n_ids = n_ids.to(device);  n_mask = n_mask.to(device)
+            a_ids = a_ids.to(device)
+            p_ids = p_ids.to(device)
+            n_ids = n_ids.to(device)
+            a_mask = a_mask.to(device)
+            p_mask = p_mask.to(device)
+            n_mask = n_mask.to(device)
 
-            # Mean-pool refiner output — raw (unnormalised), gradients flow directly to refiner
-            ea, _ = chunked_encode_and_extract(
+            # Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
+            # Special tokens excluded so only number+object tokens shape the sentence vector.
+            ea = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
                 a_ids, a_mask, args.text_chunk_size,
             )
-            del a_ids, a_mask
-
-            ep, _ = chunked_encode_and_extract(
+            ep = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
                 p_ids, p_mask, args.text_chunk_size,
             )
-            del p_ids, p_mask
-
-            en_flat, _ = chunked_encode_and_extract(
+            en_flat = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
                 n_ids, n_mask, args.text_chunk_size,
             )
-            del n_ids, n_mask
+
+            # Free input token tensors — no longer needed after feature extraction
+            del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
 
             B_ctr = ea.shape[0]
-            K     = args.num_negatives
-            D     = ea.shape[-1]
-            en    = en_flat.view(B_ctr, K, D)
-            del en_flat
+            K = args.num_negatives
 
-            # SIGReg: force refiner output distribution → N(0, I)
-            # Applied on all embeddings in the batch (anchor + positive + negatives)
-            all_feats = torch.cat([ea, ep, en.view(-1, D)], dim=0)  # [B*(2+K), D]
-            loss_sigreg = sigreg_loss(all_feats, global_step, num_slices=args.sigreg_slices)
-            del all_feats
+            # SimCLR projection head: map refiner mean-pool → discriminative low-dim space
+            ea_proj = proj_head(ea)
+            ep_proj = proj_head(ep)
+            en_proj = proj_head(en_flat).view(B_ctr, K, -1)
+            del ea, ep, en_flat
 
-            # Raw InfoNCE: scale by D*τ so dot-product ≈ cosine/τ after SIGReg
-            loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature, dim=D)
-
-            # Diagnostic: raw dot products, matching the actual InfoNCE objective.
+            # Diagnostic: pos_sim and neg_sim in projected space
             with torch.no_grad():
-                pos_dot = (ea.float() * ep.float()).sum(dim=-1).mean().item()
-                neg_dot = (ea.unsqueeze(1).float() * en.float()).sum(dim=-1).mean().item()
-                norm_mean = ea.float().norm(dim=-1).mean().item()   # track ||h|| vs √D
-            del ea, ep, en
+                pos_sim = (ea_proj * ep_proj).sum(dim=-1).mean().item()
+                neg_sim = (ea_proj.unsqueeze(1) * en_proj).sum(dim=-1).mean().item()
+
+            loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
+            del ea_proj, ep_proj, en_proj
 
             # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
-            if args.diffusion_weight > 0:
-                diff_anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in batch["anchor"]]
-                da_ids, da_mask = tokenize_texts(tokenizer, diff_anchor_texts, args.max_length)
-                da_ids = da_ids.to(device)
-                da_mask = da_mask.to(device)
+            # Use anchor text from the image batch for diffusion conditioning
+            diff_anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in batch["anchor"]]
+            da_ids, da_mask = tokenize_texts(tokenizer, diff_anchor_texts, args.max_length)
+            da_ids = da_ids.to(device)
+            da_mask = da_mask.to(device)
 
-                with torch.no_grad():
-                    da_out = text_encoder(input_ids=da_ids, attention_mask=da_mask.bool(), output_hidden_states=True)
-                    da_h = da_out.hidden_states[-2].detach().clone()
-                    del da_out
+            with torch.no_grad():
+                da_out = text_encoder(input_ids=da_ids, attention_mask=da_mask.bool(), output_hidden_states=True)
+                da_h = da_out.hidden_states[-2].detach().clone()
+                del da_out
 
-                pixel_values = batch["pixel_values"].to(device, dtype=vae.dtype)
-                with torch.no_grad():
-                    h = vae.encoder(pixel_values)
-                    moments = vae.quant_conv(h) if vae.quant_conv is not None else h
-                    mean, log_var = moments.chunk(2, dim=1)
-                    std = torch.exp(0.5 * log_var.clamp(-30, 20))
-                    latents = mean + std * torch.randn_like(mean)
-                    latents = latents * vae.config.scaling_factor
+            pixel_values = batch["pixel_values"].to(device, dtype=vae.dtype)
+            with torch.no_grad():
+                h = vae.encoder(pixel_values)
+                moments = vae.quant_conv(h) if vae.quant_conv is not None else h
+                mean, log_var = moments.chunk(2, dim=1)
+                std = torch.exp(0.5 * log_var.clamp(-30, 20))
+                latents = mean + std * torch.randn_like(mean)
+                latents = latents * vae.config.scaling_factor
 
-                noise = torch.randn_like(latents)
-                sigma = torch.rand((latents.shape[0],), device=device, dtype=latents.dtype)
-                sigma_b = sigma.view(-1, 1, 1, 1)
-                noisy_latents = (1.0 - sigma_b) * latents + sigma_b * noise
-                target = latents - noise
+            noise = torch.randn_like(latents)
+            sigma = torch.rand((latents.shape[0],), device=device, dtype=latents.dtype)
+            sigma_b = sigma.view(-1, 1, 1, 1)
+            noisy_latents = (1.0 - sigma_b) * latents + sigma_b * noise
+            target = latents - noise
 
-                t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
-                lat_list = [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_latents]
-                cap_feats = [da_h[i][da_mask[i].bool()].to(dtype=transformer_dtype) for i in range(da_h.shape[0])]
+            t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
+            lat_list = [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_latents]
+            cap_feats = [da_h[i][da_mask[i].bool()].to(dtype=transformer_dtype) for i in range(da_h.shape[0])]
 
-                pred_list = transformer(lat_list, t_norm, cap_feats)[0]
-                pred = torch.stack(pred_list, dim=0).squeeze(2).float()
-                loss_diff = F.mse_loss(pred.float(), target.float(), reduction="mean")
-            else:
-                loss_diff = torch.tensor(0.0, device=device)
-                sigma = torch.zeros((1,), device=device)
+            pred_list = transformer(lat_list, t_norm, cap_feats)[0]
+            pred = torch.stack(pred_list, dim=0).squeeze(2).float()
 
-            loss = (args.diffusion_weight * loss_diff
-                    + args.contrastive_weight * loss_ctr
-                    + args.sigreg_weight * loss_sigreg)
+            loss_diff = F.mse_loss(pred.float(), target.float(), reduction="mean")
+            loss = args.diffusion_weight * loss_diff + args.contrastive_weight * loss_ctr
 
             if global_step == 0 and is_main:
-                print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  "
-                      f"L_ctr={loss_ctr.item():.4f}  L_sig={loss_sigreg.item():.4f}  "
+                print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
                       f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
-                      f"pos_dot={pos_dot:.4f}  neg_dot={neg_dot:.4f}  "
-                      f"||h||={norm_mean:.2f}  √D={D**0.5:.2f}  "
+                      f"pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  "
                       f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
             optimizer.zero_grad(set_to_none=True)
@@ -739,15 +738,13 @@ def main(args: argparse.Namespace) -> None:
             running_total += loss.item()
             running_diff += loss_diff.item()
             running_ctr += loss_ctr.item()
-            running_sig += loss_sigreg.item()
 
             if is_main:
                 pbar.set_postfix(
                     {
+                        "L_diff": f"{loss_diff.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
-                        "L_sig": f"{loss_sigreg.item():.4f}",
-                        "p-n": f"{pos_dot - neg_dot:+.3f}",
-                        "||h||": f"{norm_mean:.1f}",
+                        "p-n": f"{pos_sim - neg_sim:+.3f}",
                     }
                 )
                 if use_wandb:
@@ -756,11 +753,9 @@ def main(args: argparse.Namespace) -> None:
                             "train/loss_total": loss.item(),
                             "train/loss_diff": loss_diff.item(),
                             "train/loss_ctr": loss_ctr.item(),
-                            "train/loss_sigreg": loss_sigreg.item(),
-                            "train/pos_dot": pos_dot,
-                            "train/neg_dot": neg_dot,
-                            "train/pos_neg_gap": pos_dot - neg_dot,
-                            "train/norm_mean": norm_mean,
+                            "train/pos_sim": pos_sim,
+                            "train/neg_sim": neg_sim,
+                            "train/pos_neg_gap": pos_sim - neg_sim,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                         },
@@ -770,13 +765,17 @@ def main(args: argparse.Namespace) -> None:
             if is_main and args.save_every > 0 and global_step % args.save_every == 0:
                 save_path = Path(args.output_dir) / f"transformer_refiner_step{global_step}.pt"
                 unwrapped = accelerator.unwrap_model(transformer)
-                ckpt = {
-                    "step": global_step,
-                    "epoch": epoch,
-                    "transformer_state_dict": unwrapped.state_dict(),
-                    "args": vars(args),
-                }
-                torch.save(ckpt, save_path)
+                unwrapped_proj = accelerator.unwrap_model(proj_head)
+                torch.save(
+                    {
+                        "step": global_step,
+                        "epoch": epoch,
+                        "transformer_state_dict": unwrapped.state_dict(),
+                        "proj_head_state_dict": unwrapped_proj.state_dict(),
+                        "args": vars(args),
+                    },
+                    save_path,
+                )
                 print(f"[Checkpoint] saved: {save_path}")
 
             if args.vis_every > 0 and global_step % args.vis_every == 0:
@@ -790,17 +789,14 @@ def main(args: argparse.Namespace) -> None:
         avg_total = running_total / steps
         avg_diff = running_diff / steps
         avg_ctr = running_ctr / steps
-        avg_sig = running_sig / steps
         if is_main:
-            print(f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_diff={avg_diff:.4f} "
-                  f"avg_ctr={avg_ctr:.4f} avg_sig={avg_sig:.4f}")
+            print(f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_diff={avg_diff:.4f} avg_ctr={avg_ctr:.4f}")
             if use_wandb:
                 wandb.log(
                     {
                         "epoch/avg_total": avg_total,
                         "epoch/avg_diff": avg_diff,
                         "epoch/avg_ctr": avg_ctr,
-                        "epoch/avg_sigreg": avg_sig,
                         "epoch/epoch": epoch,
                     },
                     step=global_step,
@@ -843,18 +839,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--text_chunk_size", type=int, default=16,
                    help="Chunk size for text encoder / context_refiner forward pass (controls peak memory)")
     p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner")
+    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for projection head (trained from scratch)")
+    p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner (pre-trained, fine-tuned)")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_negatives", type=int, default=12, help="InfoNCE negatives per anchor (1:K)")
-    p.add_argument("--temperature", type=float, default=0.07,
-                   help="InfoNCE base temperature τ. Effective scale = D*τ for raw dot products.")
+    p.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature")
 
     p.add_argument("--contrastive_weight", type=float, default=1.0)
-    p.add_argument("--diffusion_weight", type=float, default=0.0)
-    p.add_argument("--sigreg_weight", type=float, default=1.0,
-                   help="Weight for SIGReg anti-collapse loss (LeJEPA Epps-Pulley)")
-    p.add_argument("--sigreg_slices", type=int, default=256,
-                   help="Number of random 1-D projections for SIGReg (M in the paper)")
+    p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")
+    p.add_argument("--proj_hidden_dim", type=int, default=512,
+                   help="SimCLR projection head hidden dim (in_dim → hidden_dim → out_dim)")
+    p.add_argument("--proj_out_dim", type=int, default=256,
+                   help="SimCLR projection head output dim (the space where InfoNCE is computed)")
 
     p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--vis_every", type=int, default=500,
