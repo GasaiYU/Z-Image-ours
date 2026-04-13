@@ -8,7 +8,7 @@ NUM_GPUS=${NUM_GPUS:-8}
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/counting_triplets_filtered.jsonl}
 GENERATED_ROOT=${GENERATED_ROOT:-data/generated_images}
-OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_diffusion_baseline}
+OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_linear_proj}
 
 # ── Data / model ──────────────────────────────────────────────────────────────
 VERDICT_THRESHOLD=${VERDICT_THRESHOLD:-0.8}
@@ -22,24 +22,24 @@ CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}
 TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}
 NUM_WORKERS=${NUM_WORKERS:-2}
 LR=${LR:-1e-3}
-REFINER_LR=${REFINER_LR:-5e-4}
+REFINER_LR=${REFINER_LR:-1e-4}
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
-PROJ_HIDDEN_DIM=${PROJ_HIDDEN_DIM:-512}
-PROJ_OUT_DIM=${PROJ_OUT_DIM:-256}
+PROJ_HIDDEN_DIM=${PROJ_HIDDEN_DIM:-512}   # unused (single-layer proj, no hidden dim)
+PROJ_OUT_DIM=${PROJ_OUT_DIM:-256}         # linear proj output dim: refiner_dim → proj_out_dim
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 SEED=${SEED:-42}
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
 TEMPERATURE=${TEMPERATURE:-0.07}
-CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-0.0}   # 0 = diffusion-only baseline
+CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
 SAVE_EVERY=${SAVE_EVERY:-100}
 VIS_EVERY=${VIS_EVERY:-100}
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
-WANDB_RUN=${WANDB_RUN:-diffusion_baseline_proj_head}
+WANDB_RUN=${WANDB_RUN:-contrastive_diffusion_linear_proj}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 accelerate launch \
