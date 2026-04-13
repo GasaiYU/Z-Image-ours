@@ -179,17 +179,30 @@ def chunked_encode_and_extract(
     return torch.cat(all_feats, dim=0), torch.cat(all_valid, dim=0)
 
 
-def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
+def triplet_margin_loss(
+    ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, margin: float
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    InfoNCE with one positive and K negatives per anchor.
-    ea: [B, D], ep: [B, D], en: [B, K, D]
+    Batch hard triplet loss: for each anchor take the hardest (highest-sim) negative.
+
+    ea: [B, D]  anchor (L2-normalised)
+    ep: [B, D]  positive
+    en: [B, K, D] negatives
+
+    Gradient is constant-1 whenever the constraint is violated, unlike InfoNCE whose
+    gradient ∝ softmax → ≈ 0 when all similarities are very close together.
+
+    Returns:
+        loss        scalar
+        viol_rate   fraction of triplets where constraint is violated (neg_sim > pos_sim)
     """
     ea, ep, en = ea.float(), ep.float(), en.float()
-    pos_logits = (ea * ep).sum(dim=-1, keepdim=True)          # [B, 1]
-    neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1)           # [B, K]
-    logits = torch.cat([pos_logits, neg_logits], dim=1) / temperature
-    labels = torch.zeros(ea.shape[0], dtype=torch.long, device=ea.device)
-    return F.cross_entropy(logits, labels)
+    pos_sim = (ea * ep).sum(dim=-1)                           # [B]
+    neg_sim_all = (ea.unsqueeze(1) * en).sum(dim=-1)          # [B, K]
+    neg_sim_hard = neg_sim_all.max(dim=-1).values             # [B]  hardest negative
+    loss = F.relu(neg_sim_hard - pos_sim + margin).mean()
+    viol_rate = (neg_sim_hard > pos_sim).float().mean()
+    return loss, viol_rate
 
 
 def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[str]:
@@ -719,12 +732,13 @@ def main(args: argparse.Namespace) -> None:
                 ea_ctr, ep_ctr, en_ctr = ea, ep, en
                 del ea, ep, en
 
-            # Diagnostic: pos_sim and neg_sim
+            # Diagnostic: pos_sim and hard-neg_sim (mean over batch)
             with torch.no_grad():
                 pos_sim = (ea_ctr * ep_ctr).sum(dim=-1).mean().item()
-                neg_sim = (ea_ctr.unsqueeze(1) * en_ctr).sum(dim=-1).mean().item()
+                neg_sim = (ea_ctr.unsqueeze(1) * en_ctr).sum(dim=-1).max(dim=-1).values.mean().item()
 
-            loss_ctr = infonce_loss(ea_ctr, ep_ctr, en_ctr, temperature=args.temperature)
+            loss_ctr, viol_rate = triplet_margin_loss(ea_ctr, ep_ctr, en_ctr, margin=args.margin)
+            viol_rate = viol_rate.item()
             del ea_ctr, ep_ctr, en_ctr
 
             # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
@@ -767,8 +781,8 @@ def main(args: argparse.Namespace) -> None:
             if global_step == 0 and is_main:
                 print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
                       f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
-                      f"pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  vld={valid_rate:.2f}  "
-                      f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
+                      f"pos_sim={pos_sim:.4f}  neg_sim_hard={neg_sim:.4f}  "
+                      f"p-n={pos_sim-neg_sim:+.4f}  viol={viol_rate:.2f}  margin={args.margin}")
 
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
@@ -787,7 +801,7 @@ def main(args: argparse.Namespace) -> None:
                         "L_diff": f"{loss_diff.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
                         "p-n": f"{pos_sim - neg_sim:+.3f}",
-                        "vld": f"{valid_rate:.2f}",
+                        "viol": f"{viol_rate:.2f}",
                     }
                 )
                 if use_wandb:
@@ -797,8 +811,9 @@ def main(args: argparse.Namespace) -> None:
                             "train/loss_diff": loss_diff.item(),
                             "train/loss_ctr": loss_ctr.item(),
                             "train/pos_sim": pos_sim,
-                            "train/neg_sim": neg_sim,
+                            "train/neg_sim_hard": neg_sim,
                             "train/pos_neg_gap": pos_sim - neg_sim,
+                            "train/viol_rate": viol_rate,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                         },
@@ -883,8 +898,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for projection head (trained from scratch)")
     p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner (pre-trained, fine-tuned)")
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--num_negatives", type=int, default=12, help="InfoNCE negatives per anchor (1:K)")
-    p.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature")
+    p.add_argument("--num_negatives", type=int, default=12, help="Negatives per anchor")
+    p.add_argument("--margin", type=float, default=0.2,
+                   help="Triplet margin: loss = relu(neg_sim_hard - pos_sim + margin)")
 
     p.add_argument("--contrastive_weight", type=float, default=1.0)
     p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")

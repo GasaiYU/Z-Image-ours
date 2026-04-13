@@ -31,7 +31,7 @@ SEED=${SEED:-42}
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
-TEMPERATURE=${TEMPERATURE:-0.2}
+MARGIN=${MARGIN:-0.2}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}
 
@@ -64,7 +64,7 @@ accelerate launch \
     --mixed_precision "$MIXED_PRECISION" \
     --seed "$SEED" \
     --num_negatives "$NUM_NEGATIVES" \
-    --temperature "$TEMPERATURE" \
+    --margin "$MARGIN" \
     --contrastive_weight "$CONTRASTIVE_WEIGHT" \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
     --save_every "$SAVE_EVERY" \
