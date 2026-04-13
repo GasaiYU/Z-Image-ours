@@ -217,12 +217,45 @@ def make_anchor_variants(anchor: str) -> list[str]:
     return variants
 
 
+NUMBER_WORDS = [
+    "one", "two", "three", "four", "five",
+    "six", "seven", "eight", "nine", "ten",
+]
+
+
+def make_anchor_negatives(anchor: str, target_word: str) -> list[tuple[str, str]]:
+    """
+    Generate synthetic hard negatives by replacing the number word in the anchor
+    with every other number word, then expanding each with template variants.
+    Returns list of (neg_text, neg_target_word).
+
+    9 number substitutions × up to 10 templates = up to 90 unique negatives,
+    so any num_negatives ≤ 90 can be satisfied without repetition.
+    """
+    tw = target_word.strip().lower()
+    negatives: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for num in NUMBER_WORDS:
+        if num == tw:
+            continue
+        neg_base = anchor.replace(target_word, num, 1)
+        if neg_base == anchor:          # replacement didn't happen (word not found)
+            continue
+        for variant in make_anchor_variants(neg_base):
+            key = variant.strip().lower()
+            if key not in seen:
+                negatives.append((variant, num))
+                seen.add(key)
+    return negatives
+
+
 @dataclass
 class CountingSample:
     anchor: str
-    anchor_variants: list[str]   # template rewrites of anchor (used as positives)
-    positive_pool: list[str]     # kept for reference / fallback only
-    negative_pool: list[str]
+    anchor_variants: list[str]          # template rewrites of anchor (used as positives)
+    synthetic_negatives: list[tuple[str, str]]  # (neg_text, neg_target_word) — same object, diff number
+    positive_pool: list[str]            # kept for reference only
+    negative_pool: list[str]            # kept for reference only
     target_word: str
     image_paths: list[Path]
 
@@ -285,51 +318,25 @@ class CountingVerdictDataset(Dataset):
             if anchor:
                 same_word_texts[target_word].add(anchor)
 
-        # Reverse map: text → its own target_word (number word appearing in that text).
-        # Used to tag local_pool negatives with their correct number word.
-        self.text_to_tw: dict[str, str] = {}
-        for tw, texts in same_word_texts.items():
-            for text in texts:
-                if text:
-                    self.text_to_tw[text] = tw
-
-        # Build global negative text pool for each target_word.
-        # Each entry is (text, neg_target_word) so callers know which number word to locate.
-        all_target_words = sorted(same_word_texts.keys())
-        self.global_negatives_by_target: dict[str, list[tuple[str, str]]] = {}
-        for tw in all_target_words:
-            neg_pairs: list[tuple[str, str]] = []
-            for other_tw in all_target_words:
-                if other_tw == tw:
-                    continue
-                for text in same_word_texts[other_tw]:
-                    if text:
-                        neg_pairs.append((text, other_tw))
-            self.global_negatives_by_target[tw] = neg_pairs
-
         self.samples: list[CountingSample] = []
         for anchor, item in grouped.items():
             if anchor not in image_cache:
                 image_cache[anchor] = self._collect_anchor_images(anchor)
             image_paths = image_cache[anchor]
-            pos_pool = [x for x in item["positive_pool"] if x]
-            neg_pool = [x for x in item["negative_pool"] if x]
             if not image_paths:
                 continue
+            tw = item["target_word"]
             self.samples.append(
                 CountingSample(
                     anchor=anchor,
                     anchor_variants=make_anchor_variants(anchor),
-                    positive_pool=pos_pool,
-                    negative_pool=neg_pool,
-                    target_word=item["target_word"],
+                    synthetic_negatives=make_anchor_negatives(anchor, tw),
+                    positive_pool=[x for x in item["positive_pool"] if x],
+                    negative_pool=[x for x in item["negative_pool"] if x],
+                    target_word=tw,
                     image_paths=image_paths,
                 )
             )
-
-        self.global_positives_by_target = {
-            tw: [x for x in texts if x] for tw, texts in same_word_texts.items()
-        }
 
         print(f"[Dataset] Total counting triplets: {len(rows)}")
         print(f"[Dataset] Unique anchors: {len(grouped)}")
@@ -350,41 +357,20 @@ class CountingVerdictDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _sample_negatives(self, local_pool: list[str], target_word: str) -> tuple[list[str], list[str]]:
-        """Return (neg_texts, neg_target_words) — each negative paired with its own number word.
+    def _sample_negatives(self, synthetic_negatives: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+        """Return (neg_texts, neg_target_words) sampled from synthetic hard negatives.
 
-        Priority: local_pool (hard negatives — same object, different number) first,
-        then global pool to fill up to num_negatives.
+        Synthetic negatives are generated by replacing the anchor's number word with
+        every other number word — guaranteed same object, different number.
         """
-        # Tag local pool entries with their own target_word via the reverse map.
-        tagged: list[tuple[str, str]] = []
-        for text in local_pool:
-            neg_tw = self.text_to_tw.get(text)
-            if neg_tw and neg_tw != target_word:
-                tagged.append((text, neg_tw))
-
-        # Supplement from global pool if local pool is too small.
-        if len(tagged) < self.num_negatives:
-            global_pool = self.global_negatives_by_target.get(target_word, [])
-            existing_texts = {t for t, _ in tagged}
-            extras = [(t, tw) for t, tw in global_pool if t not in existing_texts]
-            needed = self.num_negatives - len(tagged)
-            if len(extras) >= needed:
-                tagged += random.sample(extras, needed)
-            else:
-                tagged += [random.choice(extras) for _ in range(needed)] if extras else []
-
-        if not tagged:
-            return [target_word] * self.num_negatives, [target_word] * self.num_negatives
-
-        if len(tagged) >= self.num_negatives:
-            chosen = random.sample(tagged, self.num_negatives)
+        pool = synthetic_negatives
+        if not pool:
+            return [], []
+        if len(pool) >= self.num_negatives:
+            chosen = random.sample(pool, self.num_negatives)
         else:
-            chosen = [random.choice(tagged) for _ in range(self.num_negatives)]
-
-        neg_texts = [t for t, _ in chosen]
-        neg_tws = [tw for _, tw in chosen]
-        return neg_texts, neg_tws
+            chosen = [random.choice(pool) for _ in range(self.num_negatives)]
+        return [t for t, _ in chosen], [tw for _, tw in chosen]
 
     def _sample_anchor_positive(self, anchor: str, variants: list[str]) -> str:
         """
@@ -416,7 +402,7 @@ class CountingVerdictDataset(Dataset):
         items = []
         for s in chosen:
             positive = self._sample_anchor_positive(s.anchor, s.anchor_variants)
-            negatives, neg_target_words = self._sample_negatives(s.negative_pool, s.target_word)
+            negatives, neg_target_words = self._sample_negatives(s.synthetic_negatives)
             items.append({
                 "anchor": s.anchor,
                 "positive": positive,
