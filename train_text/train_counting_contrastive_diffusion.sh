@@ -39,7 +39,7 @@ DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}
 SAVE_EVERY=${SAVE_EVERY:-100}
 VIS_EVERY=${VIS_EVERY:-100}
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
-WANDB_RUN=${WANDB_RUN:-text_refiner_counting_2e-4}
+WANDB_RUN=${WANDB_RUN:-text_refiner_counting_2e-4_5e-4}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 accelerate launch \
