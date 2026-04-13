@@ -40,7 +40,7 @@ NO_PROJ_HEAD=${NO_PROJ_HEAD:-0}    # set to 1 to disable projection head
 SAVE_EVERY=${SAVE_EVERY:-100}
 VIS_EVERY=${VIS_EVERY:-100}
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
-WANDB_RUN=${WANDB_RUN:-text_refiner_counting}
+WANDB_RUN=${WANDB_RUN:-text_refiner_counting_wo_head}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 accelerate launch \
