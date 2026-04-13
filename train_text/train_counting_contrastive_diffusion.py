@@ -143,6 +143,66 @@ def chunked_encode_and_extract(
     return torch.cat(all_feats, dim=0)
 
 
+def _content_mean_pool(h: torch.Tensor, ids: torch.Tensor, mask: torch.Tensor, special_ids: set) -> torch.Tensor:
+    """Content-only masked mean pool + L2-normalise. Returns [B, D]."""
+    is_special = torch.zeros_like(ids, dtype=torch.bool)
+    for sid in special_ids:
+        is_special |= (ids == sid)
+    content_mask = mask.bool() & ~is_special
+    fm = content_mask.unsqueeze(-1).float()
+    pooled = (h * fm).sum(dim=1) / fm.sum(dim=1).clamp(min=1.0)
+    return F.normalize(pooled.float(), dim=-1)
+
+
+@torch.no_grad()
+def diagnose_embeddings(
+    text_encoder, transformer, tokenizer,
+    a_ids, a_mask, p_ids, p_mask, n_ids, n_mask,
+    n_per_anchor: int, device, is_main: bool,
+) -> None:
+    """One-shot diagnostic: print pre- and post-refiner pos_sim / neg_sim for the first 4 anchors."""
+    if not is_main:
+        return
+    N = min(4, a_ids.shape[0])
+    special_ids = set(tokenizer.all_special_ids)
+
+    def pool_before_refiner(ids, mask):
+        out = text_encoder(input_ids=ids[:N], attention_mask=mask[:N].bool(), output_hidden_states=True)
+        h = out.hidden_states[-2].float()
+        return _content_mean_pool(h, ids[:N], mask[:N], special_ids)
+
+    def pool_after_refiner(ids, mask):
+        out = text_encoder(input_ids=ids[:N], attention_mask=mask[:N].bool(), output_hidden_states=True)
+        h = out.hidden_states[-2].detach().clone()
+        h_ref = run_context_refiner(transformer, h, mask[:N]).float()
+        return _content_mean_pool(h_ref, ids[:N], mask[:N], special_ids)
+
+    # ── Pre-refiner ──────────────────────────────────────────────
+    ea_pre = pool_before_refiner(a_ids, a_mask)
+    ep_pre = pool_before_refiner(p_ids, p_mask)
+    en_pre = pool_before_refiner(n_ids, n_mask).view(N, n_per_anchor, -1)
+
+    pre_pos = (ea_pre * ep_pre).sum(-1)
+    pre_neg = (ea_pre.unsqueeze(1) * en_pre).sum(-1)
+
+    # ── Post-refiner ─────────────────────────────────────────────
+    ea_post = pool_after_refiner(a_ids, a_mask)
+    ep_post = pool_after_refiner(p_ids, p_mask)
+    en_post = pool_after_refiner(n_ids, n_mask).view(N, n_per_anchor, -1)
+
+    post_pos = (ea_post * ep_post).sum(-1)
+    post_neg = (ea_post.unsqueeze(1) * en_post).sum(-1)
+
+    print("\n[Diagnose] Pre-refiner  pos_sim={:.4f}  neg_sim={:.4f}  p-n={:+.4f}".format(
+        pre_pos.mean().item(), pre_neg.mean().item(), (pre_pos - pre_neg.mean(1)).mean().item()))
+    print("[Diagnose] Post-refiner pos_sim={:.4f}  neg_sim={:.4f}  p-n={:+.4f}".format(
+        post_pos.mean().item(), post_neg.mean().item(), (post_pos - post_neg.mean(1)).mean().item()))
+    for i in range(N):
+        print(f"  [anchor {i}] pre p-n={pre_pos[i].item()-pre_neg[i].mean().item():+.4f} "
+              f"post p-n={post_pos[i].item()-post_neg[i].mean().item():+.4f}")
+    print()
+
+
 def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
     """
     InfoNCE with one positive and K negatives per anchor.
@@ -589,11 +649,13 @@ def main(args: argparse.Namespace) -> None:
             text_items = dataset.sample_text_batch(args.contrastive_batch_size)
             text_batch = collate_text_batch(text_items)
 
-            # Contrastive texts use raw format (no chat template) so that mean pooling
-            # is not dominated by shared role tokens ("user", "assistant", etc.).
-            anchor_texts = list(text_batch["anchor"])
-            pos_texts = list(text_batch["positive"])
-            flat_neg_texts = [t for negs in text_batch["negatives"] for t in negs]
+            anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["anchor"]]
+            pos_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["positive"]]
+            neg_texts_nested = [
+                [format_prompt(tokenizer, t, args.use_chat_template) for t in negs]
+                for negs in text_batch["negatives"]
+            ]
+            flat_neg_texts = [x for negs in neg_texts_nested for x in negs]
 
             a_ids, a_mask = tokenize_texts(tokenizer, anchor_texts, args.max_length)
             p_ids, p_mask = tokenize_texts(tokenizer, pos_texts, args.max_length)
@@ -605,6 +667,14 @@ def main(args: argparse.Namespace) -> None:
             a_mask = a_mask.to(device)
             p_mask = p_mask.to(device)
             n_mask = n_mask.to(device)
+
+            # One-shot diagnostic at step 0: compare pre- vs post-refiner similarities
+            if global_step == 0 and is_main:
+                diagnose_embeddings(
+                    text_encoder, transformer, tokenizer,
+                    a_ids, a_mask, p_ids, p_mask, n_ids, n_mask,
+                    n_per_anchor=args.num_negatives, device=device, is_main=is_main,
+                )
 
             # Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
             # Special tokens excluded so only number+object tokens shape the sentence vector.
