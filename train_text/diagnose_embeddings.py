@@ -96,7 +96,7 @@ def embed(text_encoder, transformer, tokenizer, texts, special_ids, device, max_
 def main(args):
     device = torch.device(args.device)
 
-    print(f"[Load] model from {args.model_dir}")
+    print(f"[Load] base model from {args.model_dir}")
     components = load_from_local_dir(
         args.model_dir, device="cpu", dtype=torch.bfloat16, verbose=True,
     )
@@ -108,6 +108,22 @@ def main(args):
         p.requires_grad_(False)
     for p in text_encoder.parameters():
         p.requires_grad_(False)
+
+    if args.checkpoint:
+        print(f"[Load] checkpoint from {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        if "transformer_state_dict" in ckpt:
+            missing, unexpected = transformer.load_state_dict(ckpt["transformer_state_dict"], strict=False)
+            print(f"  transformer: {len(missing)} missing keys, {len(unexpected)} unexpected keys")
+            if missing:
+                print(f"  missing (first 5): {missing[:5]}")
+        else:
+            print("  [WARNING] no 'transformer_state_dict' found in checkpoint")
+        ckpt_step = ckpt.get("step", "?")
+        ckpt_epoch = ckpt.get("epoch", "?")
+        print(f"  checkpoint step={ckpt_step}  epoch={ckpt_epoch}")
+    else:
+        print("[Load] no checkpoint given — using base pretrained weights")
 
     special_ids = set(tokenizer.all_special_ids)
 
@@ -211,6 +227,8 @@ def main(args):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_dir",      type=str, default="ckpts/Z-Image-Turbo")
+    p.add_argument("--checkpoint",     type=str, default="",
+                   help="Path to .pt checkpoint saved by training script (loads transformer_state_dict)")
     p.add_argument("--triplets_jsonl", type=str,
                    default="data/train_triplets/counting_triplets_filtered.jsonl")
     p.add_argument("--generated_root", type=str, default="data/generated_images")
