@@ -23,7 +23,8 @@ BATCH_SIZE=${BATCH_SIZE:-1}                  # per-GPU image batch size (diffusi
 CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}  # text-only batch size (contrastive loss, very cheap)
 TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}       # chunk size for text encoder / context_refiner (controls peak memory)
 NUM_WORKERS=${NUM_WORKERS:-2}
-LR=${LR:-1e-3}
+LR=${LR:-1e-3}          # proj_head lr (from scratch)
+REFINER_LR=${REFINER_LR:-5e-4}  # context_refiner lr (pre-trained fine-tune)
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 SEED=${SEED:-42}
@@ -58,6 +59,7 @@ accelerate launch \
     --text_chunk_size "$TEXT_CHUNK_SIZE" \
     --num_workers "$NUM_WORKERS" \
     --lr "$LR" \
+    --refiner_lr "$REFINER_LR" \
     --weight_decay "$WEIGHT_DECAY" \
     --mixed_precision "$MIXED_PRECISION" \
     --seed "$SEED" \

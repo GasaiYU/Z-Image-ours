@@ -556,7 +556,13 @@ def main(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
     )
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [p for p in transformer.parameters() if p.requires_grad], "lr": args.refiner_lr},
+            {"params": list(proj_head.parameters()), "lr": args.lr},
+        ],
+        weight_decay=args.weight_decay,
+    )
 
     # accelerate wraps transformer + proj_head (trainable) + optimizer + loader
     transformer, proj_head, optimizer, loader = accelerator.prepare(transformer, proj_head, optimizer, loader)
@@ -833,7 +839,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--text_chunk_size", type=int, default=16,
                    help="Chunk size for text encoder / context_refiner forward pass (controls peak memory)")
     p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for projection head (trained from scratch)")
+    p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner (pre-trained, fine-tuned)")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_negatives", type=int, default=12, help="InfoNCE negatives per anchor (1:K)")
     p.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature")
