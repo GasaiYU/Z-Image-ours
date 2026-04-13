@@ -634,6 +634,8 @@ def main(args: argparse.Namespace) -> None:
     global_step = 0
     transformer_dtype = next(transformer.parameters()).dtype
     trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+    if proj_head is not None:
+        trainable_params = trainable_params + list(proj_head.parameters())
 
     # Baseline visualization before any training
     if args.vis_every > 0:
@@ -698,7 +700,7 @@ def main(args: argparse.Namespace) -> None:
             valid_rate = valid.float().mean().item()
 
             if valid.sum() == 0:
-                del ea, en_flat, vn_2d, valid
+                del ea, ep, en_flat, vn_2d, valid
                 continue
 
             ea = ea[valid];  ep = ep[valid]
@@ -845,15 +847,15 @@ def main(args: argparse.Namespace) -> None:
     if is_main:
         final_path = Path(args.output_dir) / "transformer_refiner_final.pt"
         unwrapped = accelerator.unwrap_model(transformer)
-        torch.save(
-            {
-                "step": global_step,
-                "epoch": args.epochs,
-                "transformer_state_dict": unwrapped.state_dict(),
-                "args": vars(args),
-            },
-            final_path,
-        )
+        final_ckpt = {
+            "step": global_step,
+            "epoch": args.epochs,
+            "transformer_state_dict": unwrapped.state_dict(),
+            "args": vars(args),
+        }
+        if proj_head is not None:
+            final_ckpt["proj_head_state_dict"] = accelerator.unwrap_model(proj_head).state_dict()
+        torch.save(final_ckpt, final_path)
         print(f"[Done] final checkpoint: {final_path}")
         if use_wandb:
             wandb.finish()
