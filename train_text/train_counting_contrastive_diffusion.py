@@ -117,52 +117,66 @@ def chunked_encode_and_extract(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     chunk_size: int,
-) -> torch.Tensor:
+    target_words: list[str] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
+    Pipeline: encode → refine → extract counting token (or mean pool), chunk by chunk.
 
-    Chat-template special tokens (<|im_start|>, <|im_end|>, role words, etc.) are excluded
-    from the pool so the sentence vector reflects only real content tokens (number + object).
-    This way "seven canes" and "one canes" differ because both the number token AND the
-    "canes" token (which is aware of its neighbour via bidirectional attention) contribute.
+    If target_words is provided (list of N strings), extracts the hidden state at the
+    position of each target word (e.g. "nine") after the context_refiner.  This is the
+    preferred mode for contrastive learning because the gradient flows directly to the
+    number-word token rather than being diluted by the full sentence.
 
-    Peak memory = chunk_size × seq_len × D (full-sequence tensors freed after pooling).
-    Returns L2-normalised sentence vectors [N, D].
+    If target_words is None, falls back to content-only mean pooling.
+
+    Returns:
+        feats      [N, D]  L2-normalised token/sentence vectors
+        valid_mask [N]     bool, True where the target token was found (token mode only,
+                           always all-True in mean-pool mode)
     """
-    special_ids = set(tokenizer.all_special_ids)
-    all_feats: list[torch.Tensor] = []
+    all_feats:  list[torch.Tensor] = []
+    all_valid:  list[torch.Tensor] = []
     N = input_ids.shape[0]
+    special_ids = set(tokenizer.all_special_ids)
 
     for i in range(0, N, chunk_size):
         ids  = input_ids[i : i + chunk_size]
         mask = attention_mask[i : i + chunk_size]
+        bsz  = ids.shape[0]
 
-        # Content mask: real token (mask==1) AND not a special token
-        is_special = torch.zeros_like(ids, dtype=torch.bool)
-        for sid in special_ids:
-            is_special |= (ids == sid)
-        content_mask = mask.bool() & ~is_special          # [chunk, seq_len]
-
-        # Step 1: frozen text encoder — use full attention_mask for the encoder itself
+        # Step 1: frozen text encoder
         with torch.no_grad():
             out = text_encoder(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True)
         h = out.hidden_states[-2].detach().clone()
         del out
 
-        # Step 2: context_refiner — trainable, gradients flow; full mask for padding
+        # Step 2: context_refiner — trainable, gradients flow
         h_ref = run_context_refiner(transformer, h, mask)
         del h
 
-        # Step 3: mean pool over content tokens only, then L2-normalise
-        float_mask = content_mask.unsqueeze(-1).float()
-        denom = float_mask.sum(dim=1).clamp(min=1.0)
-        pooled = (h_ref * float_mask).sum(dim=1) / denom
-        pooled = F.normalize(pooled.float(), dim=-1)
+        if target_words is not None:
+            # Token extraction: find counting-word position per sequence
+            chunk_words = target_words[i : i + bsz]
+            indices = [find_target_idx(tokenizer, ids[j], mask[j], chunk_words[j])
+                       for j in range(bsz)]
+            feats, valid = extract_token_feature(h_ref, indices)
+            feats = feats.float()
+        else:
+            # Mean pool over non-special, non-padding tokens
+            is_special = torch.zeros_like(ids, dtype=torch.bool)
+            for sid in special_ids:
+                is_special |= (ids == sid)
+            content_mask = mask.bool() & ~is_special
+            float_mask = content_mask.unsqueeze(-1).float()
+            denom = float_mask.sum(dim=1).clamp(min=1.0)
+            feats = (h_ref * float_mask).sum(dim=1).float() / denom
+            valid = torch.ones(bsz, dtype=torch.bool, device=ids.device)
+
         del h_ref
+        all_feats.append(F.normalize(feats, dim=-1))
+        all_valid.append(valid)
 
-        all_feats.append(pooled)
-
-    return torch.cat(all_feats, dim=0)
+    return torch.cat(all_feats, dim=0), torch.cat(all_valid, dim=0)
 
 
 def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -520,18 +534,26 @@ def main(args: argparse.Namespace) -> None:
     _raw_transformer = transformer.module if hasattr(transformer, "module") else transformer
     _transformer_dim = _raw_transformer.dim
 
-    proj_head = ContrastiveProjectionHead(
-        in_dim=_transformer_dim,
-        hidden_dim=args.proj_hidden_dim,
-        out_dim=args.proj_out_dim,
-    ).to(device)
+    if args.use_proj_head:
+        proj_head = ContrastiveProjectionHead(
+            in_dim=_transformer_dim,
+            hidden_dim=args.proj_hidden_dim,
+            out_dim=args.proj_out_dim,
+        ).to(device)
+    else:
+        proj_head = None
 
-    trainable_params = [p for p in transformer.parameters() if p.requires_grad] + list(proj_head.parameters())
+    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+    if proj_head is not None:
+        trainable_params = trainable_params + list(proj_head.parameters())
     if is_main:
         n_refiner = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-        n_proj = sum(p.numel() for p in proj_head.parameters())
         print(f"[Init] trainable transformer params: {n_refiner:,}")
-        print(f"[Init] projection head params: {n_proj:,}  (in={_transformer_dim} → hid={args.proj_hidden_dim} → out={args.proj_out_dim})")
+        if proj_head is not None:
+            n_proj = sum(p.numel() for p in proj_head.parameters())
+            print(f"[Init] projection head params: {n_proj:,}  (in={_transformer_dim} → hid={args.proj_hidden_dim} → out={args.proj_out_dim})")
+        else:
+            print(f"[Init] projection head: disabled (InfoNCE directly on {_transformer_dim}-dim token embedding)")
     if args.print_trainable and is_main:
         print("[Init] trainable parameter names:")
         for name in trainable_names[:50]:
@@ -556,16 +578,16 @@ def main(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
     )
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": [p for p in transformer.parameters() if p.requires_grad], "lr": args.refiner_lr},
-            {"params": list(proj_head.parameters()), "lr": args.lr},
-        ],
-        weight_decay=args.weight_decay,
-    )
+    param_groups = [{"params": [p for p in transformer.parameters() if p.requires_grad], "lr": args.refiner_lr}]
+    if proj_head is not None:
+        param_groups.append({"params": list(proj_head.parameters()), "lr": args.lr})
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
-    # accelerate wraps transformer + proj_head (trainable) + optimizer + loader
-    transformer, proj_head, optimizer, loader = accelerator.prepare(transformer, proj_head, optimizer, loader)
+    # accelerate wraps transformer + (optional) proj_head + optimizer + loader
+    if proj_head is not None:
+        transformer, proj_head, optimizer, loader = accelerator.prepare(transformer, proj_head, optimizer, loader)
+    else:
+        transformer, optimizer, loader = accelerator.prepare(transformer, optimizer, loader)
 
     vis_dir = Path(args.output_dir) / "vis"
     if is_main:
@@ -631,59 +653,77 @@ def main(args: argparse.Namespace) -> None:
             text_items = dataset.sample_text_batch(args.contrastive_batch_size)
             text_batch = collate_text_batch(text_items)
 
-            anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["anchor"]]
-            pos_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["positive"]]
-            neg_texts_nested = [
-                [format_prompt(tokenizer, t, args.use_chat_template) for t in negs]
-                for negs in text_batch["negatives"]
-            ]
-            flat_neg_texts = [x for negs in neg_texts_nested for x in negs]
+            anchor_texts   = list(text_batch["anchor"])
+            pos_texts      = list(text_batch["positive"])   # template variant, e.g. "a photo of nine hammers"
+            anchor_words   = list(text_batch["target_word"])
+            neg_texts_flat = [t for negs in text_batch["negatives"] for t in negs]
+            neg_words_flat = [w for ws   in text_batch["neg_target_words"] for w in ws]
 
             a_ids, a_mask = tokenize_texts(tokenizer, anchor_texts, args.max_length)
-            p_ids, p_mask = tokenize_texts(tokenizer, pos_texts, args.max_length)
-            n_ids, n_mask = tokenize_texts(tokenizer, flat_neg_texts, args.max_length)
+            p_ids, p_mask = tokenize_texts(tokenizer, pos_texts,    args.max_length)
+            n_ids, n_mask = tokenize_texts(tokenizer, neg_texts_flat, args.max_length)
 
-            a_ids = a_ids.to(device)
-            p_ids = p_ids.to(device)
-            n_ids = n_ids.to(device)
-            a_mask = a_mask.to(device)
-            p_mask = p_mask.to(device)
-            n_mask = n_mask.to(device)
+            a_ids = a_ids.to(device);  a_mask = a_mask.to(device)
+            p_ids = p_ids.to(device);  p_mask = p_mask.to(device)
+            n_ids = n_ids.to(device);  n_mask = n_mask.to(device)
 
-            # Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
-            # Special tokens excluded so only number+object tokens shape the sentence vector.
-            ea = chunked_encode_and_extract(
+            # Encode anchor — counting token embedding after refiner
+            ea, va = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
                 a_ids, a_mask, args.text_chunk_size,
+                target_words=anchor_words,
             )
-            ep = chunked_encode_and_extract(
+            del a_ids, a_mask
+
+            # Encode positive — find same counting word by content (position may differ)
+            ep, vp = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
                 p_ids, p_mask, args.text_chunk_size,
+                target_words=anchor_words,   # same number word as anchor
             )
-            en_flat = chunked_encode_and_extract(
+            del p_ids, p_mask
+
+            en_flat, vn = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
                 n_ids, n_mask, args.text_chunk_size,
+                target_words=neg_words_flat,
             )
+            del n_ids, n_mask
 
-            # Free input token tensors — no longer needed after feature extraction
-            del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
+            # Filter to samples where anchor, positive AND all negatives had valid token positions
+            B_ctr = ea.shape[0]
+            K     = args.num_negatives
+            vn_2d = vn.view(B_ctr, K)                         # [B, K]
+            valid  = va & vp & vn_2d.all(dim=1)               # [B]
+            valid_rate = valid.float().mean().item()
+
+            if valid.sum() == 0:
+                del ea, en_flat, vn_2d, valid
+                continue
+
+            ea = ea[valid];  ep = ep[valid]
+            en = en_flat.view(B_ctr, K, -1)[valid]            # [B_valid, K, D]
+            del en_flat, vn_2d
 
             B_ctr = ea.shape[0]
-            K = args.num_negatives
 
-            # SimCLR projection head: map refiner mean-pool → discriminative low-dim space
-            ea_proj = proj_head(ea)
-            ep_proj = proj_head(ep)
-            en_proj = proj_head(en_flat).view(B_ctr, K, -1)
-            del ea, ep, en_flat
+            # Optional SimCLR projection head
+            if proj_head is not None:
+                ea_ctr = proj_head(ea)
+                ep_ctr = proj_head(ep)
+                en_ctr = proj_head(en.view(-1, ea.shape[-1])).view(B_ctr, K, -1)
+                del ea, ep, en
+            else:
+                ea_ctr, ep_ctr, en_ctr = ea, ep, en
+                del ea, ep, en
 
-            # Diagnostic: pos_sim and neg_sim in projected space
+            # Diagnostic: pos_sim and neg_sim
             with torch.no_grad():
-                pos_sim = (ea_proj * ep_proj).sum(dim=-1).mean().item()
-                neg_sim = (ea_proj.unsqueeze(1) * en_proj).sum(dim=-1).mean().item()
+                pos_sim = (ea_ctr * ep_ctr).sum(dim=-1).mean().item()
+                neg_sim = (ea_ctr.unsqueeze(1) * en_ctr).sum(dim=-1).mean().item()
 
-            loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
-            del ea_proj, ep_proj, en_proj
+            loss_ctr = infonce_loss(ea_ctr, ep_ctr, en_ctr, temperature=args.temperature)
+            del ea_ctr, ep_ctr, en_ctr
 
             # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
             # Use anchor text from the image batch for diffusion conditioning
@@ -725,7 +765,7 @@ def main(args: argparse.Namespace) -> None:
             if global_step == 0 and is_main:
                 print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
                       f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
-                      f"pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  "
+                      f"pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  vld={valid_rate:.2f}  "
                       f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
             optimizer.zero_grad(set_to_none=True)
@@ -745,6 +785,7 @@ def main(args: argparse.Namespace) -> None:
                         "L_diff": f"{loss_diff.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
                         "p-n": f"{pos_sim - neg_sim:+.3f}",
+                        "vld": f"{valid_rate:.2f}",
                     }
                 )
                 if use_wandb:
@@ -765,17 +806,15 @@ def main(args: argparse.Namespace) -> None:
             if is_main and args.save_every > 0 and global_step % args.save_every == 0:
                 save_path = Path(args.output_dir) / f"transformer_refiner_step{global_step}.pt"
                 unwrapped = accelerator.unwrap_model(transformer)
-                unwrapped_proj = accelerator.unwrap_model(proj_head)
-                torch.save(
-                    {
-                        "step": global_step,
-                        "epoch": epoch,
-                        "transformer_state_dict": unwrapped.state_dict(),
-                        "proj_head_state_dict": unwrapped_proj.state_dict(),
-                        "args": vars(args),
-                    },
-                    save_path,
-                )
+                ckpt = {
+                    "step": global_step,
+                    "epoch": epoch,
+                    "transformer_state_dict": unwrapped.state_dict(),
+                    "args": vars(args),
+                }
+                if proj_head is not None:
+                    ckpt["proj_head_state_dict"] = accelerator.unwrap_model(proj_head).state_dict()
+                torch.save(ckpt, save_path)
                 print(f"[Checkpoint] saved: {save_path}")
 
             if args.vis_every > 0 and global_step % args.vis_every == 0:
@@ -847,6 +886,10 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--contrastive_weight", type=float, default=1.0)
     p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")
+    p.add_argument("--use_proj_head", action="store_true", default=True,
+                   help="Use SimCLR projection head for contrastive loss (recommended for gradient flow)")
+    p.add_argument("--no_proj_head", dest="use_proj_head", action="store_false",
+                   help="Disable projection head: InfoNCE directly on refiner token embedding")
     p.add_argument("--proj_hidden_dim", type=int, default=512,
                    help="SimCLR projection head hidden dim (in_dim → hidden_dim → out_dim)")
     p.add_argument("--proj_out_dim", type=int, default=256,

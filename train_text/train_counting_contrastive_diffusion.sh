@@ -34,6 +34,7 @@ NUM_NEGATIVES=${NUM_NEGATIVES:-12}
 TEMPERATURE=${TEMPERATURE:-0.07}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}
+NO_PROJ_HEAD=${NO_PROJ_HEAD:-0}    # set to 1 to disable projection head
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
 SAVE_EVERY=${SAVE_EVERY:-100}
