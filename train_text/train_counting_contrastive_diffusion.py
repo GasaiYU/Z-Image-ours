@@ -166,29 +166,34 @@ def diagnose_embeddings(
     N = min(4, a_ids.shape[0])
     special_ids = set(tokenizer.all_special_ids)
 
-    def pool_before_refiner(ids, mask):
-        out = text_encoder(input_ids=ids[:N], attention_mask=mask[:N].bool(), output_hidden_states=True)
-        h = out.hidden_states[-2].float()
-        return _content_mean_pool(h, ids[:N], mask[:N], special_ids)
+    Na = N                      # number of anchors to sample
+    Nn = N * n_per_anchor       # corresponding flat negatives
 
-    def pool_after_refiner(ids, mask):
-        out = text_encoder(input_ids=ids[:N], attention_mask=mask[:N].bool(), output_hidden_states=True)
+    def pool_before_refiner(ids, mask, n_rows):
+        ids_, mask_ = ids[:n_rows], mask[:n_rows]
+        out = text_encoder(input_ids=ids_, attention_mask=mask_.bool(), output_hidden_states=True)
+        h = out.hidden_states[-2].float()
+        return _content_mean_pool(h, ids_, mask_, special_ids)
+
+    def pool_after_refiner(ids, mask, n_rows):
+        ids_, mask_ = ids[:n_rows], mask[:n_rows]
+        out = text_encoder(input_ids=ids_, attention_mask=mask_.bool(), output_hidden_states=True)
         h = out.hidden_states[-2].detach().clone()
-        h_ref = run_context_refiner(transformer, h, mask[:N]).float()
-        return _content_mean_pool(h_ref, ids[:N], mask[:N], special_ids)
+        h_ref = run_context_refiner(transformer, h, mask_).float()
+        return _content_mean_pool(h_ref, ids_, mask_, special_ids)
 
     # ── Pre-refiner ──────────────────────────────────────────────
-    ea_pre = pool_before_refiner(a_ids, a_mask)
-    ep_pre = pool_before_refiner(p_ids, p_mask)
-    en_pre = pool_before_refiner(n_ids, n_mask).view(N, n_per_anchor, -1)
+    ea_pre = pool_before_refiner(a_ids, a_mask, Na)
+    ep_pre = pool_before_refiner(p_ids, p_mask, Na)
+    en_pre = pool_before_refiner(n_ids, n_mask, Nn).view(Na, n_per_anchor, -1)
 
     pre_pos = (ea_pre * ep_pre).sum(-1)
     pre_neg = (ea_pre.unsqueeze(1) * en_pre).sum(-1)
 
     # ── Post-refiner ─────────────────────────────────────────────
-    ea_post = pool_after_refiner(a_ids, a_mask)
-    ep_post = pool_after_refiner(p_ids, p_mask)
-    en_post = pool_after_refiner(n_ids, n_mask).view(N, n_per_anchor, -1)
+    ea_post = pool_after_refiner(a_ids, a_mask, Na)
+    ep_post = pool_after_refiner(p_ids, p_mask, Na)
+    en_post = pool_after_refiner(n_ids, n_mask, Nn).view(Na, n_per_anchor, -1)
 
     post_pos = (ea_post * ep_post).sum(-1)
     post_neg = (ea_post.unsqueeze(1) * en_post).sum(-1)
