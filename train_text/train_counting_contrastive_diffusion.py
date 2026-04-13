@@ -94,42 +94,53 @@ def chunked_encode_and_extract(
     tokenizer,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    target_words: list[str],
     chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
-    Pipeline encode → refine → extract_token_feature chunk by chunk.
-    Peak memory = chunk_size × seq_len × D (full sequences never accumulate in memory).
-    Returns token-level features [N, D] and valid mask [N].
+    Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
+
+    Chat-template special tokens (<|im_start|>, <|im_end|>, role words, etc.) are excluded
+    from the pool so the sentence vector reflects only real content tokens (number + object).
+    This way "seven canes" and "one canes" differ because both the number token AND the
+    "canes" token (which is aware of its neighbour via bidirectional attention) contribute.
+
+    Peak memory = chunk_size × seq_len × D (full-sequence tensors freed after pooling).
+    Returns L2-normalised sentence vectors [N, D].
     """
+    special_ids = set(tokenizer.all_special_ids)
     all_feats: list[torch.Tensor] = []
-    all_valid: list[torch.Tensor] = []
     N = input_ids.shape[0]
 
     for i in range(0, N, chunk_size):
-        ids = input_ids[i : i + chunk_size]
+        ids  = input_ids[i : i + chunk_size]
         mask = attention_mask[i : i + chunk_size]
-        tws = target_words[i : i + chunk_size]
 
-        # Step 1: frozen text encoder, no grad, free output immediately after extracting hidden states
+        # Content mask: real token (mask==1) AND not a special token
+        is_special = torch.zeros_like(ids, dtype=torch.bool)
+        for sid in special_ids:
+            is_special |= (ids == sid)
+        content_mask = mask.bool() & ~is_special          # [chunk, seq_len]
+
+        # Step 1: frozen text encoder — use full attention_mask for the encoder itself
         with torch.no_grad():
             out = text_encoder(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True)
         h = out.hidden_states[-2].detach().clone()
         del out
 
-        # Step 2: context_refiner (trainable, gradients flow)
+        # Step 2: context_refiner — trainable, gradients flow; full mask for padding
         h_ref = run_context_refiner(transformer, h, mask)
         del h
 
-        # Step 3: extract only the target token feature [chunk, D] — discard full sequence
-        tidx = [find_target_idx(tokenizer, ids[j], mask[j], tws[j]) for j in range(ids.shape[0])]
-        feats, valid = extract_token_feature(h_ref, tidx)
+        # Step 3: mean pool over content tokens only, then L2-normalise
+        float_mask = content_mask.unsqueeze(-1).float()
+        denom = float_mask.sum(dim=1).clamp(min=1.0)
+        pooled = (h_ref * float_mask).sum(dim=1) / denom
+        pooled = F.normalize(pooled.float(), dim=-1)
         del h_ref
 
-        all_feats.append(feats)
-        all_valid.append(valid)
+        all_feats.append(pooled)
 
-    return torch.cat(all_feats, dim=0), torch.cat(all_valid, dim=0)
+    return torch.cat(all_feats, dim=0)
 
 
 def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -597,22 +608,19 @@ def main(args: argparse.Namespace) -> None:
             p_mask = p_mask.to(device)
             n_mask = n_mask.to(device)
 
-            # Pipeline: encode → refine → extract token feature, chunk by chunk.
-            # Full-sequence tensors ([N, seq_len, D]) are freed inside each chunk;
-            # only token-level vectors ([N, D]) accumulate → peak memory = chunk_size × seq_len × D.
-            # Each negative uses its OWN number word (not the anchor's) so find_target_idx succeeds.
-            flat_target_words = [tw for neg_tws in text_batch["neg_target_words"] for tw in neg_tws]
-            ea, vm_a = chunked_encode_and_extract(
+            # Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
+            # Special tokens excluded so only number+object tokens shape the sentence vector.
+            ea = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
-                a_ids, a_mask, list(text_batch["target_word"]), args.text_chunk_size,
+                a_ids, a_mask, args.text_chunk_size,
             )
-            ep, vm_p = chunked_encode_and_extract(
+            ep = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
-                p_ids, p_mask, list(text_batch["target_word"]), args.text_chunk_size,
+                p_ids, p_mask, args.text_chunk_size,
             )
-            en_flat, vm_n_flat = chunked_encode_and_extract(
+            en_flat = chunked_encode_and_extract(
                 text_encoder, transformer, tokenizer,
-                n_ids, n_mask, flat_target_words, args.text_chunk_size,
+                n_ids, n_mask, args.text_chunk_size,
             )
 
             # Free input token tensors — no longer needed after feature extraction
@@ -621,25 +629,14 @@ def main(args: argparse.Namespace) -> None:
             B_ctr = ea.shape[0]
             K = args.num_negatives
             en = en_flat.view(B_ctr, K, -1)
-            vm_n = vm_n_flat.view(B_ctr, K).all(dim=1)
-            valid = vm_a & vm_p & vm_n
-            valid_rate = valid.float().mean().item()
-
-            if valid.sum() == 0:
-                if is_main and global_step % 2 == 0:
-                    print(f"[Step {global_step}] WARNING: valid_rate=0, all target tokens missing. "
-                          f"vm_a={vm_a.float().mean():.2f} vm_p={vm_p.float().mean():.2f} vm_n={vm_n.float().mean():.2f}")
-                continue
-
-            ea_v, ep_v, en_v = ea[valid], ep[valid], en[valid]
 
             # Diagnostic: pos_sim and neg_sim to check if model is learning
             with torch.no_grad():
-                pos_sim = (ea_v.float() * ep_v.float()).sum(dim=-1).mean().item()
-                neg_sim = (ea_v.float().unsqueeze(1) * en_v.float()).sum(dim=-1).mean().item()
+                pos_sim = (ea.float() * ep.float()).sum(dim=-1).mean().item()
+                neg_sim = (ea.float().unsqueeze(1) * en.float()).sum(dim=-1).mean().item()
 
-            loss_ctr = infonce_loss(ea_v, ep_v, en_v, temperature=args.temperature)
-            del ea, ep, en_flat, en, vm_a, vm_p, vm_n_flat, vm_n, valid, ea_v, ep_v, en_v
+            loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature)
+            del ea, ep, en_flat, en
 
             # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
             # Use anchor text from the image batch for diffusion conditioning
@@ -681,7 +678,7 @@ def main(args: argparse.Namespace) -> None:
             if global_step == 0 and is_main:
                 print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
                       f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
-                      f"valid_rate={valid_rate:.2f}  pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  "
+                      f"pos_sim={pos_sim:.4f}  neg_sim={neg_sim:.4f}  "
                       f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
             optimizer.zero_grad(set_to_none=True)
@@ -701,7 +698,6 @@ def main(args: argparse.Namespace) -> None:
                         "L_diff": f"{loss_diff.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
                         "p-n": f"{pos_sim - neg_sim:+.3f}",
-                        "vld": f"{valid_rate:.2f}",
                     }
                 )
                 if use_wandb:
@@ -713,7 +709,6 @@ def main(args: argparse.Namespace) -> None:
                             "train/pos_sim": pos_sim,
                             "train/neg_sim": neg_sim,
                             "train/pos_neg_gap": pos_sim - neg_sim,
-                            "train/valid_rate": valid_rate,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                         },
