@@ -698,7 +698,7 @@ def main(args: argparse.Namespace) -> None:
             accelerator.backward(loss)
 
             # ── print gradients right after backward (step 0 only) ───────────────
-            if global_step == 0 and is_main:
+            if global_step % 10 == 0 and is_main:
                 _model = accelerator.unwrap_model(transformer)
                 print("\n[Grad check] context_refiner parameter gradients:")
                 has_any_grad = False
@@ -719,7 +719,7 @@ def main(args: argparse.Namespace) -> None:
             optimizer.step()
 
             # ── check param actually changed after first step ─────────────────────
-            if global_step == 0 and is_main and _param_before is not None:
+            if global_step % 10 == 0 and is_main and _param_before is not None:
                 _model = accelerator.unwrap_model(transformer)
                 _param_after = next(
                     (p for n, p in _model.named_parameters() if "context_refiner" in n),
