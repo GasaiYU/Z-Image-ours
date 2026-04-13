@@ -88,6 +88,28 @@ def extract_token_feature(hidden_states: torch.Tensor, token_indices: list[int])
     return torch.stack(feats, dim=0), torch.tensor(valid, device=hidden_states.device, dtype=torch.bool)
 
 
+class ContrastiveProjectionHead(torch.nn.Module):
+    """SimCLR-style projection head for contrastive learning.
+
+    Maps refiner mean-pool vectors to a low-dim discriminative space.
+    Only used during training for the contrastive loss; never used at inference time.
+    The input norm (~1 after L2-normalize) ensures the L2-normalize Jacobian inside
+    the head is O(1) rather than O(1/||h||), fixing the gradient shrinkage issue.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int = 512, out_dim: int = 256):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, hidden_dim, bias=False),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_dim, out_dim, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(x.float()), dim=-1)
+
+
 def chunked_encode_and_extract(
     text_encoder,
     transformer: torch.nn.Module,
@@ -493,9 +515,23 @@ def main(args: argparse.Namespace) -> None:
     vae.eval()
 
     trainable_names = unfreeze_transformer_refiner_layers(transformer)
-    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+
+    # Get transformer hidden dim before accelerator wraps it
+    _raw_transformer = transformer.module if hasattr(transformer, "module") else transformer
+    _transformer_dim = _raw_transformer.dim
+
+    proj_head = ContrastiveProjectionHead(
+        in_dim=_transformer_dim,
+        hidden_dim=args.proj_hidden_dim,
+        out_dim=args.proj_out_dim,
+    ).to(device)
+
+    trainable_params = [p for p in transformer.parameters() if p.requires_grad] + list(proj_head.parameters())
     if is_main:
-        print(f"[Init] trainable transformer params: {sum(p.numel() for p in trainable_params):,}")
+        n_refiner = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+        n_proj = sum(p.numel() for p in proj_head.parameters())
+        print(f"[Init] trainable transformer params: {n_refiner:,}")
+        print(f"[Init] projection head params: {n_proj:,}  (in={_transformer_dim} → hid={args.proj_hidden_dim} → out={args.proj_out_dim})")
     if args.print_trainable and is_main:
         print("[Init] trainable parameter names:")
         for name in trainable_names[:50]:
@@ -522,8 +558,8 @@ def main(args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
-    # accelerate wraps transformer (trainable) + optimizer + loader
-    transformer, optimizer, loader = accelerator.prepare(transformer, optimizer, loader)
+    # accelerate wraps transformer + proj_head (trainable) + optimizer + loader
+    transformer, proj_head, optimizer, loader = accelerator.prepare(transformer, proj_head, optimizer, loader)
 
     vis_dir = Path(args.output_dir) / "vis"
     if is_main:
@@ -628,15 +664,20 @@ def main(args: argparse.Namespace) -> None:
 
             B_ctr = ea.shape[0]
             K = args.num_negatives
-            en = en_flat.view(B_ctr, K, -1)
 
-            # Diagnostic: pos_sim and neg_sim to check if model is learning
+            # SimCLR projection head: map refiner mean-pool → discriminative low-dim space
+            ea_proj = proj_head(ea)
+            ep_proj = proj_head(ep)
+            en_proj = proj_head(en_flat).view(B_ctr, K, -1)
+            del ea, ep, en_flat
+
+            # Diagnostic: pos_sim and neg_sim in projected space
             with torch.no_grad():
-                pos_sim = (ea.float() * ep.float()).sum(dim=-1).mean().item()
-                neg_sim = (ea.float().unsqueeze(1) * en.float()).sum(dim=-1).mean().item()
+                pos_sim = (ea_proj * ep_proj).sum(dim=-1).mean().item()
+                neg_sim = (ea_proj.unsqueeze(1) * en_proj).sum(dim=-1).mean().item()
 
-            loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature)
-            del ea, ep, en_flat, en
+            loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
+            del ea_proj, ep_proj, en_proj
 
             # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
             # Use anchor text from the image batch for diffusion conditioning
@@ -697,7 +738,7 @@ def main(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
 
-            # ── print gradients right after backward (step 0 only) ───────────────
+            # ── print gradients right after backward ──────────────────────────────
             if global_step % 10 == 0 and is_main:
                 _model = accelerator.unwrap_model(transformer)
                 print("\n[Grad check] context_refiner parameter gradients:")
@@ -713,6 +754,15 @@ def main(args: argparse.Namespace) -> None:
                         print(f"  {name}: grad_norm={gnorm:.6f}")
                 if not has_any_grad:
                     print("  [WARNING] ALL context_refiner params have grad=None!")
+
+                _proj = accelerator.unwrap_model(proj_head)
+                print("[Grad check] proj_head parameter gradients:")
+                for name, param in _proj.named_parameters():
+                    if param.grad is None:
+                        print(f"  proj_head.{name}: grad=None  ← NO GRADIENT")
+                    else:
+                        gnorm = param.grad.float().norm().item()
+                        print(f"  proj_head.{name}: grad_norm={gnorm:.6f}")
                 print()
 
             accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -765,11 +815,13 @@ def main(args: argparse.Namespace) -> None:
             if is_main and args.save_every > 0 and global_step % args.save_every == 0:
                 save_path = Path(args.output_dir) / f"transformer_refiner_step{global_step}.pt"
                 unwrapped = accelerator.unwrap_model(transformer)
+                unwrapped_proj = accelerator.unwrap_model(proj_head)
                 torch.save(
                     {
                         "step": global_step,
                         "epoch": epoch,
                         "transformer_state_dict": unwrapped.state_dict(),
+                        "proj_head_state_dict": unwrapped_proj.state_dict(),
                         "args": vars(args),
                     },
                     save_path,
@@ -844,6 +896,10 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--contrastive_weight", type=float, default=1.0)
     p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")
+    p.add_argument("--proj_hidden_dim", type=int, default=512,
+                   help="SimCLR projection head hidden dim (in_dim → hidden_dim → out_dim)")
+    p.add_argument("--proj_out_dim", type=int, default=256,
+                   help="SimCLR projection head output dim (the space where InfoNCE is computed)")
 
     p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--vis_every", type=int, default=500,
