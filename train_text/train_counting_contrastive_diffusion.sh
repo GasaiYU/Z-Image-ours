@@ -23,7 +23,7 @@ BATCH_SIZE=${BATCH_SIZE:-1}                  # per-GPU image batch size (diffusi
 CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}  # text-only batch size (contrastive loss, very cheap)
 TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}       # chunk size for text encoder / context_refiner (controls peak memory)
 NUM_WORKERS=${NUM_WORKERS:-2}
-LR=${LR:-1e-3}          # proj_head lr (from scratch)
+LR=${LR:-5e-4}          # proj_head lr (from scratch)
 REFINER_LR=${REFINER_LR:-2e-4}  # context_refiner lr (pre-trained fine-tune)
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
@@ -39,7 +39,7 @@ DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}
 SAVE_EVERY=${SAVE_EVERY:-100}
 VIS_EVERY=${VIS_EVERY:-100}
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
-WANDB_RUN=${WANDB_RUN:-text_refiner_counting}
+WANDB_RUN=${WANDB_RUN:-text_refiner_counting_2e-4}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 accelerate launch \
