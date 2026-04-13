@@ -285,6 +285,14 @@ class CountingVerdictDataset(Dataset):
             if anchor:
                 same_word_texts[target_word].add(anchor)
 
+        # Reverse map: text → its own target_word (number word appearing in that text).
+        # Used to tag local_pool negatives with their correct number word.
+        self.text_to_tw: dict[str, str] = {}
+        for tw, texts in same_word_texts.items():
+            for text in texts:
+                if text:
+                    self.text_to_tw[text] = tw
+
         # Build global negative text pool for each target_word.
         # Each entry is (text, neg_target_word) so callers know which number word to locate.
         all_target_words = sorted(same_word_texts.keys())
@@ -343,19 +351,31 @@ class CountingVerdictDataset(Dataset):
         return len(self.samples)
 
     def _sample_negatives(self, local_pool: list[str], target_word: str) -> tuple[list[str], list[str]]:
-        """Return (neg_texts, neg_target_words) — each negative paired with its own number word."""
-        # local_pool texts share different number words; use global pool to tag them.
-        # Build a tagged pool: (text, neg_tw) from the global pool.
-        tagged: list[tuple[str, str]] = self.global_negatives_by_target.get(target_word, [])
+        """Return (neg_texts, neg_target_words) — each negative paired with its own number word.
 
-        # Supplement with local_pool items if needed (tagged with a placeholder; will still work
-        # because find_target_idx falls back to scanning when the word isn't in the text).
-        # Local pool texts already come from triplets where their target_word differs from anchor's.
-        # To keep it correct, only use the global tagged pool.
+        Priority: local_pool (hard negatives — same object, different number) first,
+        then global pool to fill up to num_negatives.
+        """
+        # Tag local pool entries with their own target_word via the reverse map.
+        tagged: list[tuple[str, str]] = []
+        for text in local_pool:
+            neg_tw = self.text_to_tw.get(text)
+            if neg_tw and neg_tw != target_word:
+                tagged.append((text, neg_tw))
+
+        # Supplement from global pool if local pool is too small.
+        if len(tagged) < self.num_negatives:
+            global_pool = self.global_negatives_by_target.get(target_word, [])
+            existing_texts = {t for t, _ in tagged}
+            extras = [(t, tw) for t, tw in global_pool if t not in existing_texts]
+            needed = self.num_negatives - len(tagged)
+            if len(extras) >= needed:
+                tagged += random.sample(extras, needed)
+            else:
+                tagged += [random.choice(extras) for _ in range(needed)] if extras else []
+
         if not tagged:
-            texts = [s.anchor for _ in range(self.num_negatives)]
-            words = [target_word] * self.num_negatives
-            return texts, words
+            return [target_word] * self.num_negatives, [target_word] * self.num_negatives
 
         if len(tagged) >= self.num_negatives:
             chosen = random.sample(tagged, self.num_negatives)
