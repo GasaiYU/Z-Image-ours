@@ -722,6 +722,23 @@ def main(args: argparse.Namespace) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
+
+            if is_main and global_step % 10 == 0:
+                def _gnorm(p):
+                    return p.grad.norm().item() if p.grad is not None else 0.0
+                raw = accelerator.unwrap_model(transformer)
+                layers = list(raw.context_refiner)
+                g0 = {n: _gnorm(p) for n, p in layers[0].named_parameters()}
+                gL = {n: _gnorm(p) for n, p in layers[-1].named_parameters()}
+                g0_str = "  ".join(f"{k}={v:.2e}" for k, v in g0.items())
+                gL_str = "  ".join(f"{k}={v:.2e}" for k, v in gL.items())
+                print(f"[Grad step={global_step}] refiner[0]:  {g0_str}")
+                print(f"[Grad step={global_step}] refiner[-1]: {gL_str}")
+                raw_proj = accelerator.unwrap_model(proj_head)
+                gp = {n: _gnorm(p) for n, p in raw_proj.named_parameters()}
+                gp_str = "  ".join(f"{k}={v:.2e}" for k, v in gp.items())
+                print(f"[Grad step={global_step}] proj_head:   {gp_str}")
+
             accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 

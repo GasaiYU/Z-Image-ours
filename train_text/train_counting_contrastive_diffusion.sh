@@ -36,7 +36,7 @@ CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-0.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}   # diffusion on narrow counting data causes rapid collapse of frozen joint-attn
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
-SAVE_EVERY=${SAVE_EVERY:-50}          # frequent checkpoints to detect collapse early
+SAVE_EVERY=${SAVE_EVERY:-200}          # frequent checkpoints to detect collapse early
 VIS_EVERY=${VIS_EVERY:-50}           # check generation quality every 50 steps
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
 WANDB_RUN=${WANDB_RUN:-counting_text_refiner_diffusion_baseline}
