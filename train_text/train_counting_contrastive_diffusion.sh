@@ -21,8 +21,8 @@ BATCH_SIZE=${BATCH_SIZE:-1}
 CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}
 TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}
 NUM_WORKERS=${NUM_WORKERS:-2}
-LR=${LR:-1e-4}
-REFINER_LR=${REFINER_LR:-1e-4}        # diffusion_weight=0: no collapse risk; need ≥5 bf16 quanta per step to carry gradient direction
+LR=${LR:-1e-3}
+REFINER_LR=${REFINER_LR:5e-4}        # diffusion_weight=0: no collapse risk; need ≥5 bf16 quanta per step to carry gradient direction
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
 PROJ_HIDDEN_DIM=${PROJ_HIDDEN_DIM:-512}   # unused (single-layer proj, no hidden dim)
 PROJ_OUT_DIM=${PROJ_OUT_DIM:-256}         # linear proj output dim: refiner_dim → proj_out_dim
