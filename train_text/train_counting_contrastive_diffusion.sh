@@ -31,8 +31,8 @@ SEED=${SEED:-42}
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
-LOSS_TYPE=${LOSS_TYPE:-infonce}
-TEMPERATURE=${TEMPERATURE:-0.3}
+LOSS_TYPE=${LOSS_TYPE:-dcl}
+TEMPERATURE=${TEMPERATURE:-0.07}
 TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.2}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}   # diffusion on narrow counting data causes rapid collapse; contrastive-only is safe

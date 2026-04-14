@@ -185,6 +185,21 @@ def triplet_margin_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, ma
     return F.relu(pos_dist - hardest_neg_dist + margin).mean()
 
 
+def dcl_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
+    """
+    Decoupled Contrastive Learning (DCL) loss.
+    Removes the positive sample from the denominator.
+    L = - (ea * ep)/tau + log( sum( exp(ea * en / tau) ) )
+    """
+    ea, ep, en = ea.float(), ep.float(), en.float()
+    pos_logits = (ea * ep).sum(dim=-1) / temperature            # [B]
+    neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1) / temperature # [B, K]
+    
+    # DCL: -pos_logits + logsumexp(neg_logits)
+    loss = -pos_logits + torch.logsumexp(neg_logits, dim=-1)    # [B]
+    return loss.mean()
+
+
 def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[str]:
     """Freeze all transformer params, then unfreeze only context_refiner (text conditioning side)."""
     for p in transformer.parameters():
@@ -681,6 +696,8 @@ def main(args: argparse.Namespace) -> None:
 
                 if args.loss_type == "infonce":
                     loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
+                elif args.loss_type == "dcl":
+                    loss_ctr = dcl_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
                 else:
                     loss_ctr = triplet_margin_loss(ea_proj, ep_proj, en_proj, margin=args.triplet_margin)
                 del ea_proj, ep_proj, en_proj
@@ -890,8 +907,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner (pre-trained, fine-tuned)")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_negatives", type=int, default=12, help="Negatives per anchor for contrastive loss (1:K)")
-    p.add_argument("--loss_type", type=str, default="infonce", choices=["infonce", "triplet"],
-                   help="Contrastive loss type: infonce or batch-hard triplet")
+    p.add_argument("--loss_type", type=str, default="infonce", choices=["infonce", "triplet", "dcl"],
+                   help="Contrastive loss type: infonce, dcl (Decoupled Contrastive Learning), or batch-hard triplet")
     p.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature (used when loss_type=infonce)")
     p.add_argument("--triplet_margin", type=float, default=0.2, help="Triplet margin (used when loss_type=triplet)")
 
