@@ -173,6 +173,18 @@ def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperatu
     return F.cross_entropy(logits, labels)
 
 
+def triplet_margin_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, margin: float) -> torch.Tensor:
+    """
+    Batch-hard triplet loss on L2-normalised features.
+    ea: [B, D], ep: [B, D], en: [B, K, D]
+    """
+    ea, ep, en = ea.float(), ep.float(), en.float()
+    pos_dist = 1.0 - (ea * ep).sum(dim=-1)                      # [B]
+    neg_dist = 1.0 - (ea.unsqueeze(1) * en).sum(dim=-1)         # [B, K]
+    hardest_neg_dist = neg_dist.min(dim=1).values               # [B]
+    return F.relu(pos_dist - hardest_neg_dist + margin).mean()
+
+
 def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[str]:
     """Freeze all transformer params, then unfreeze only context_refiner (text conditioning side)."""
     for p in transformer.parameters():
@@ -667,7 +679,10 @@ def main(args: argparse.Namespace) -> None:
                     pos_sim = (ea_proj * ep_proj).sum(dim=-1).mean().item()
                     neg_sim = (ea_proj.unsqueeze(1) * en_proj).sum(dim=-1).mean().item()
 
-                loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
+                if args.loss_type == "infonce":
+                    loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
+                else:
+                    loss_ctr = triplet_margin_loss(ea_proj, ep_proj, en_proj, margin=args.triplet_margin)
                 del ea_proj, ep_proj, en_proj
             else:
                 loss_ctr = torch.tensor(0.0, device=device)
@@ -874,8 +889,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for projection head (trained from scratch)")
     p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner (pre-trained, fine-tuned)")
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--num_negatives", type=int, default=12, help="InfoNCE negatives per anchor (1:K)")
-    p.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature")
+    p.add_argument("--num_negatives", type=int, default=12, help="Negatives per anchor for contrastive loss (1:K)")
+    p.add_argument("--loss_type", type=str, default="infonce", choices=["infonce", "triplet"],
+                   help="Contrastive loss type: infonce or batch-hard triplet")
+    p.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature (used when loss_type=infonce)")
+    p.add_argument("--triplet_margin", type=float, default=0.2, help="Triplet margin (used when loss_type=triplet)")
 
     p.add_argument("--contrastive_weight", type=float, default=1.0)
     p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")
