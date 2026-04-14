@@ -21,8 +21,8 @@ BATCH_SIZE=${BATCH_SIZE:-1}
 CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}
 TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}
 NUM_WORKERS=${NUM_WORKERS:-2}
-LR=${LR:-1e-3}
-REFINER_LR=${REFINER_LR:-5e-4}        # needs to be large enough to overcome bf16 quantization floor (1.22e-4); contrastive acts as regularizer
+LR=${LR:-1e-4}
+REFINER_LR=${REFINER_LR:-1e-4}        # diffusion_weight=0: no collapse risk; need ≥5 bf16 quanta per step to carry gradient direction
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-4}
 PROJ_HIDDEN_DIM=${PROJ_HIDDEN_DIM:-512}   # unused (single-layer proj, no hidden dim)
 PROJ_OUT_DIM=${PROJ_OUT_DIM:-256}         # linear proj output dim: refiner_dim → proj_out_dim
@@ -32,8 +32,8 @@ SEED=${SEED:-42}
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
 TEMPERATURE=${TEMPERATURE:-0.07}
-CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-0.2}
-DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}   # diffusion on narrow counting data causes rapid collapse of frozen joint-attn
+CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
+DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}   # diffusion on narrow counting data causes rapid collapse; contrastive-only is safe
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
 SAVE_EVERY=${SAVE_EVERY:-200}          # frequent checkpoints to detect collapse early
