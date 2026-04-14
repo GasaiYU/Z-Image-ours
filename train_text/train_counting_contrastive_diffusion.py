@@ -723,7 +723,8 @@ def main(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
 
-            if is_main and global_step % 10 == 0:
+            _do_diag = is_main and global_step % 10 == 0
+            if _do_diag:
                 def _gnorm(p):
                     return p.grad.norm().item() if p.grad is not None else 0.0
                 raw = accelerator.unwrap_model(transformer)
@@ -738,9 +739,25 @@ def main(args: argparse.Namespace) -> None:
                 gp = {n: _gnorm(p) for n, p in raw_proj.named_parameters()}
                 gp_str = "  ".join(f"{k}={v:.2e}" for k, v in gp.items())
                 print(f"[Grad step={global_step}] proj_head:   {gp_str}")
+                # snapshot params before update
+                snap_r0 = {n: p.data.clone() for n, p in layers[0].named_parameters()}
+                snap_rL = {n: p.data.clone() for n, p in layers[-1].named_parameters()}
+                snap_proj = {n: p.data.clone() for n, p in raw_proj.named_parameters()}
 
             accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
+
+            if _do_diag:
+                # delta = |param_after - param_before|.max()
+                d0 = {n: (layers[0].get_parameter(n).data - snap_r0[n]).abs().max().item() for n in snap_r0}
+                dL = {n: (layers[-1].get_parameter(n).data - snap_rL[n]).abs().max().item() for n in snap_rL}
+                dp = {n: (raw_proj.get_parameter(n).data - snap_proj[n]).abs().max().item() for n in snap_proj}
+                d0_str = "  ".join(f"{k}={v:.2e}" for k, v in d0.items())
+                dL_str = "  ".join(f"{k}={v:.2e}" for k, v in dL.items())
+                dp_str = "  ".join(f"{k}={v:.2e}" for k, v in dp.items())
+                print(f"[Delta step={global_step}] refiner[0]:  {d0_str}")
+                print(f"[Delta step={global_step}] refiner[-1]: {dL_str}")
+                print(f"[Delta step={global_step}] proj_head:   {dp_str}")
 
             global_step += 1
             steps += 1
