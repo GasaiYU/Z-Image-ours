@@ -515,7 +515,7 @@ def main(args: argparse.Namespace) -> None:
             out     = orig_forward(*a, **kw)
             fused, _, _ = raw_router(out.hidden_states)
             hs_list = list(out.hidden_states)
-            hs_list[-2] = fused
+            hs_list[-2] = fused.to(out.hidden_states[-2].dtype)
             out.hidden_states = tuple(hs_list)
             return out
 
