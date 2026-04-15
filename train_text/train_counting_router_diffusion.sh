@@ -11,7 +11,7 @@ MASTER_PORT=${MASTER_PORT:-29500}
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/counting_triplets_filtered.jsonl}
 GENERATED_ROOT=${GENERATED_ROOT:-data/generated_images}
-OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_router_dcl}
+OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_router_dcl_avg_init}
 
 # Training
 EPOCHS=${EPOCHS:-20}
@@ -40,7 +40,7 @@ DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-5.0}  # set >0 to enable diffusion loss
 SAVE_EVERY=${SAVE_EVERY:-200}
 VIS_EVERY=${VIS_EVERY:-100}
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-router-counting}
-WANDB_RUN=${WANDB_RUN:-router_counting_dcl}
+WANDB_RUN=${WANDB_RUN:-router_counting_dcl_avg_init}
 
 accelerate launch \
   --num_processes "$NUM_GPUS" \
