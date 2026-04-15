@@ -46,7 +46,7 @@ accelerate launch \
   --num_processes "$NUM_GPUS" \
   --main_process_port "$MASTER_PORT" \
   --mixed_precision bf16 \
-  train_text/train_counting_router.py \
+  train_text/train_counting_router_diffusion.py \
     --model_dir              "$MODEL_DIR" \
     --triplets_jsonl         "$TRIPLETS_JSONL" \
     --generated_root         "$GENERATED_ROOT" \
