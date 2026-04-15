@@ -116,11 +116,11 @@ class DynamicTokenRouter(nn.Module):
       semantically rich enough for the DiT to interpret correctly.
       This physical constraint replaces entropy regularisation entirely.
 
-    Initialisation — deep-biased within the range:
-      bias[-1] = +5 → softmax ≈ 1 on hidden_states[route_end-1] (deepest in
-      range). At t=0, fused ≈ hidden_states[route_end-1] for every token.
-      SupCon shifts routing only for target-token positions; all other tokens
-      receive no gradient and stay at the deep-within-range initialisation.
+    Initialisation — uniform over routing range:
+      final linear layer is zero-initialised (weight=0, bias=0), so
+      routing_logits are all zeros at t=0 and softmax is uniform.
+      Therefore each token starts from an equal-weight average over
+      hidden_states[route_start:route_end], rather than a deep-layer prior.
     """
 
     def __init__(
@@ -151,11 +151,10 @@ class DynamicTokenRouter(nn.Module):
             nn.Linear(mid_dim // 2, self.n_route),
         )
 
-        # Deep-biased init within the routing range:
-        #   bias[-1] = +5  →  weight ≈ 1 on hidden_states[route_end-1]
+        # Uniform init within routing range:
+        # logits=0 for all routing bins -> softmax uniform.
+        nn.init.zeros_(self.router_mlp[-1].weight)
         nn.init.zeros_(self.router_mlp[-1].bias)
-        self.router_mlp[-1].bias.data[-1] = 5.0
-        nn.init.normal_(self.router_mlp[-1].weight, std=0.01)
 
     def forward(self, all_hidden_states: tuple, attention_mask: torch.Tensor = None):
         """
