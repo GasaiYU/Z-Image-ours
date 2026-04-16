@@ -633,6 +633,12 @@ def main(args: argparse.Namespace) -> None:
             return
         unwrapped = accelerator.unwrap_model(transformer)
         unwrapped.eval()
+        
+        # Use a fixed generator for visualization so noise is exactly the same every time
+        gen = torch.Generator(device=device)
+        if args.seed is not None:
+            gen.manual_seed(args.seed + 2026)
+            
         images = pipeline_generate(
             transformer=unwrapped,
             vae=vae,
@@ -644,6 +650,7 @@ def main(args: argparse.Namespace) -> None:
             width=args.resolution,
             num_inference_steps=8,
             guidance_scale=0.0,
+            generator=gen,
         )
         for i, (img, prompt) in enumerate(zip(images, VIS_PROMPTS)):
             fname = vis_dir / f"step{step:06d}_p{i}.png"

@@ -8,7 +8,7 @@ NUM_GPUS=${NUM_GPUS:-8}
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/counting_triplets_filtered.jsonl}
 GENERATED_ROOT=${GENERATED_ROOT:-data/generated_images}
-OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_avg10_20_zscore_decay_target_token}
+OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_avg10_20_zscore_target_token}
 
 # ── Data / model ──────────────────────────────────────────────────────────────
 VERDICT_THRESHOLD=${VERDICT_THRESHOLD:-0.8}
@@ -20,7 +20,7 @@ TEXT_SOURCE_RANGE_START=${TEXT_SOURCE_RANGE_START:-10}
 TEXT_SOURCE_RANGE_END=${TEXT_SOURCE_RANGE_END:-20}
 
 # ── Training ──────────────────────────────────────────────────────────────────
-EPOCHS=${EPOCHS:-10}                  # short: prevent catastrophic forgetting on narrow counting data
+EPOCHS=${EPOCHS:-100}                  # short: prevent catastrophic forgetting on narrow counting data
 BATCH_SIZE=${BATCH_SIZE:-1}
 CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}
 TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}
@@ -61,7 +61,7 @@ fi
 SAVE_EVERY=${SAVE_EVERY:-200}          # frequent checkpoints to detect collapse early
 VIS_EVERY=${VIS_EVERY:-50}           # check generation quality every 50 steps
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
-WANDB_RUN=${WANDB_RUN:-counting_text_refiner_avg10_20_zscore_decay_target_token}
+WANDB_RUN=${WANDB_RUN:-counting_text_refiner_avg10_20_zscore_target_token}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 accelerate launch \
