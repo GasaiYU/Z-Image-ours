@@ -601,6 +601,10 @@ def main(args: argparse.Namespace) -> None:
         "five apples on a table",
         "two dogs running in a park",
         "seven birds on a wire",
+        "a photo of three baseballs",
+        "a photo of four computer keyboards",
+        "four oranges on a white table",
+        "three red flowers in a vase",
     ]
 
     def visualize(step: int) -> None:
@@ -696,14 +700,14 @@ def main(args: argparse.Namespace) -> None:
                 B_ctr = ea.shape[0]
                 K = args.num_negatives
 
-                if args.apply_zscore_before_loss:
-                    ea, ep, en_flat = zscore_then_l2(ea, ep, en_flat, eps=args.zscore_eps)
-
                 with torch.no_grad():
                     en_diag = en_flat.view(B_ctr, K, -1)
                     pos_sim = (ea * ep).sum(dim=-1).mean().item()
                     neg_sim = (ea.unsqueeze(1) * en_diag).sum(dim=-1).mean().item()
                     del en_diag
+
+                if args.apply_zscore_before_loss:
+                    ea, ep, en_flat = zscore_then_l2(ea, ep, en_flat, eps=args.zscore_eps)
 
                 en = en_flat.view(B_ctr, K, -1)
                 loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature)
@@ -766,33 +770,8 @@ def main(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
 
-            _do_diag = is_main and global_step % 10 == 0
-            if _do_diag:
-                def _gnorm(p):
-                    return p.grad.norm().item() if p.grad is not None else 0.0
-                raw = accelerator.unwrap_model(transformer)
-                layers = list(raw.context_refiner)
-                g0 = {n: _gnorm(p) for n, p in layers[0].named_parameters()}
-                gL = {n: _gnorm(p) for n, p in layers[-1].named_parameters()}
-                g0_str = "  ".join(f"{k}={v:.2e}" for k, v in g0.items())
-                gL_str = "  ".join(f"{k}={v:.2e}" for k, v in gL.items())
-                print(f"[Grad step={global_step}] refiner[0]:  {g0_str}")
-                print(f"[Grad step={global_step}] refiner[-1]: {gL_str}")
-                # snapshot params before update
-                snap_r0 = {n: p.data.clone() for n, p in layers[0].named_parameters()}
-                snap_rL = {n: p.data.clone() for n, p in layers[-1].named_parameters()}
-
             accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
-
-            if _do_diag:
-                # delta = |param_after - param_before|.max()
-                d0 = {n: (layers[0].get_parameter(n).data - snap_r0[n]).abs().max().item() for n in snap_r0}
-                dL = {n: (layers[-1].get_parameter(n).data - snap_rL[n]).abs().max().item() for n in snap_rL}
-                d0_str = "  ".join(f"{k}={v:.2e}" for k, v in d0.items())
-                dL_str = "  ".join(f"{k}={v:.2e}" for k, v in dL.items())
-                print(f"[Delta step={global_step}] refiner[0]:  {d0_str}")
-                print(f"[Delta step={global_step}] refiner[-1]: {dL_str}")
 
             global_step += 1
             steps += 1
