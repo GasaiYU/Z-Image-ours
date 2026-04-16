@@ -19,8 +19,26 @@ import torch.nn.functional as F
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 from utils import load_from_local_dir  # noqa: E402
 
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
-from test_refiner_similarity import run_context_refiner  # noqa: E402
+def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Project text features to transformer dim, then run context_refiner blocks."""
+    model = transformer.module if hasattr(transformer, "module") else transformer
+    bsz, seq_len, _ = token_hidden.shape
+    device = token_hidden.device
+    dtype = next(model.parameters()).dtype
+    attn_mask = attention_mask.bool()
+
+    cap_feats = model.cap_embedder(token_hidden.to(dtype))
+    cap_feats = cap_feats.clone()
+    cap_feats[~attn_mask] = model.cap_pad_token.to(dtype)
+
+    pos_ids = torch.zeros((bsz, seq_len, 3), dtype=torch.int32, device=device)
+    pos_ids[:, :, 0] = torch.arange(1, seq_len + 1, dtype=torch.int32, device=device).unsqueeze(0).expand(bsz, -1)
+    cap_freqs = model.rope_embedder(pos_ids.view(-1, 3)).view(bsz, seq_len, -1)
+
+    refined = cap_feats
+    for layer in model.context_refiner:
+        refined = layer(refined, attn_mask, cap_freqs)
+    return refined
 
 
 NUMBER_WORDS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
