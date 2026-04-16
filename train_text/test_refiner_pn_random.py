@@ -294,6 +294,17 @@ def main(args: argparse.Namespace) -> None:
     rand_proj = None
     source_desc = ""
 
+    def apply_template(text: str) -> str:
+        if not args.use_chat_template:
+            return text
+        messages = [{"role": "user", "content": text}]
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+
     for t in range(args.trials):
         triplets = [build_triplet(args.prompt_mode) for _ in range(args.batch_size)]
         anchors = [x[0] for x in triplets]
@@ -302,7 +313,7 @@ def main(args: argparse.Namespace) -> None:
         anchor_words = [x[3] for x in triplets]
         neg_words = [x[4] for x in triplets]
 
-        texts = anchors + positives + negatives
+        texts = [apply_template(t) for t in anchors + positives + negatives]
         enc = tokenizer(
             texts,
             padding="max_length",
@@ -686,6 +697,11 @@ def parse_args() -> argparse.Namespace:
         default="counting",
         choices=["counting", "gibberish"],
         help="Triplet construction mode: counting matches training-style templates.",
+    )
+    p.add_argument(
+        "--use_chat_template",
+        action="store_true",
+        help="Wrap texts with the tokenizer's chat template (matches training with --use_chat_template).",
     )
     return p.parse_args()
 
