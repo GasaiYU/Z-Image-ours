@@ -112,6 +112,10 @@ def chunked_encode_and_extract(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     chunk_size: int,
+    source_mode: str,
+    source_layer_idx: int,
+    source_range_start: int,
+    source_range_end: int,
 ) -> torch.Tensor:
     """
     Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
@@ -141,7 +145,13 @@ def chunked_encode_and_extract(
         # Step 1: frozen text encoder — use full attention_mask for the encoder itself
         with torch.no_grad():
             out = text_encoder(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True)
-        h = out.hidden_states[-2].detach().clone()
+        h = select_text_source_hidden(
+            out.hidden_states,
+            source_mode=source_mode,
+            layer_idx=source_layer_idx,
+            range_start=source_range_start,
+            range_end=source_range_end,
+        ).detach().clone()
         del out
 
         # Step 2: context_refiner — trainable, gradients flow; full mask for padding
@@ -158,6 +168,46 @@ def chunked_encode_and_extract(
         all_feats.append(pooled)
 
     return torch.cat(all_feats, dim=0)
+
+
+def select_text_source_hidden(
+    hidden_states: tuple[torch.Tensor, ...],
+    source_mode: str,
+    layer_idx: int,
+    range_start: int,
+    range_end: int,
+) -> torch.Tensor:
+    if source_mode == "layer":
+        idx = layer_idx
+        if idx < 0:
+            idx = len(hidden_states) + idx
+        idx = max(0, min(idx, len(hidden_states) - 1))
+        return hidden_states[idx]
+    if source_mode == "avg_range":
+        s = max(0, range_start)
+        e = min(len(hidden_states) - 1, range_end)
+        if e < s:
+            raise ValueError(f"Invalid text source range [{range_start}, {range_end}]")
+        picked = hidden_states[s : e + 1]
+        if len(picked) == 0:
+            raise ValueError(f"Empty text source range [{range_start}, {range_end}]")
+        stacked = torch.stack([h.float() for h in picked], dim=0)
+        return stacked.mean(dim=0).to(hidden_states[s].dtype)
+    raise ValueError(f"Unknown source_mode: {source_mode}")
+
+
+def zscore_then_l2(
+    ea: torch.Tensor,
+    ep: torch.Tensor,
+    en_flat: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    merged = torch.cat([ea.float(), ep.float(), en_flat.float()], dim=0)
+    merged = merged - merged.mean(dim=0, keepdim=True)
+    merged = merged / (merged.std(dim=0, keepdim=True, unbiased=False) + eps)
+    merged = F.normalize(merged, dim=-1)
+    b = ea.shape[0]
+    return merged[:b], merged[b : 2 * b], merged[2 * b :]
 
 
 def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -527,6 +577,11 @@ def main(args: argparse.Namespace) -> None:
         n_proj = sum(p.numel() for p in proj_head.parameters())
         print(f"[Init] trainable transformer params: {n_refiner:,}")
         print(f"[Init] projection head params: {n_proj:,}  (in={_transformer_dim} → hid={args.proj_hidden_dim} → out={args.proj_out_dim})")
+        if args.text_source_mode == "avg_range":
+            print(f"[Init] refiner input source: avg layers [{args.text_source_range_start}, {args.text_source_range_end}]")
+        else:
+            print(f"[Init] refiner input source: layer {args.text_source_layer_idx}")
+        print(f"[Init] zscore before contrastive loss: {args.apply_zscore_before_loss} (eps={args.zscore_eps})")
     if args.print_trainable and is_main:
         print("[Init] trainable parameter names:")
         for name in trainable_names[:50]:
@@ -643,13 +698,34 @@ def main(args: argparse.Namespace) -> None:
                 p_ids = p_ids.to(device);  p_mask = p_mask.to(device)
                 n_ids = n_ids.to(device);  n_mask = n_mask.to(device)
 
-                ea = chunked_encode_and_extract(text_encoder, transformer, tokenizer, a_ids, a_mask, args.text_chunk_size)
-                ep = chunked_encode_and_extract(text_encoder, transformer, tokenizer, p_ids, p_mask, args.text_chunk_size)
-                en_flat = chunked_encode_and_extract(text_encoder, transformer, tokenizer, n_ids, n_mask, args.text_chunk_size)
+                ea = chunked_encode_and_extract(
+                    text_encoder, transformer, tokenizer, a_ids, a_mask, args.text_chunk_size,
+                    source_mode=args.text_source_mode,
+                    source_layer_idx=args.text_source_layer_idx,
+                    source_range_start=args.text_source_range_start,
+                    source_range_end=args.text_source_range_end,
+                )
+                ep = chunked_encode_and_extract(
+                    text_encoder, transformer, tokenizer, p_ids, p_mask, args.text_chunk_size,
+                    source_mode=args.text_source_mode,
+                    source_layer_idx=args.text_source_layer_idx,
+                    source_range_start=args.text_source_range_start,
+                    source_range_end=args.text_source_range_end,
+                )
+                en_flat = chunked_encode_and_extract(
+                    text_encoder, transformer, tokenizer, n_ids, n_mask, args.text_chunk_size,
+                    source_mode=args.text_source_mode,
+                    source_layer_idx=args.text_source_layer_idx,
+                    source_range_start=args.text_source_range_start,
+                    source_range_end=args.text_source_range_end,
+                )
                 del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
 
                 B_ctr = ea.shape[0]
                 K = args.num_negatives
+
+                if args.apply_zscore_before_loss:
+                    ea, ep, en_flat = zscore_then_l2(ea, ep, en_flat, eps=args.zscore_eps)
 
                 # Diagnostic: p-n in refiner space (before projection)
                 with torch.no_grad():
@@ -685,7 +761,13 @@ def main(args: argparse.Namespace) -> None:
 
             with torch.no_grad():
                 da_out = text_encoder(input_ids=da_ids, attention_mask=da_mask.bool(), output_hidden_states=True)
-                da_h = da_out.hidden_states[-2].detach().clone()
+                da_h = select_text_source_hidden(
+                    da_out.hidden_states,
+                    source_mode=args.text_source_mode,
+                    layer_idx=args.text_source_layer_idx,
+                    range_start=args.text_source_range_start,
+                    range_end=args.text_source_range_end,
+                ).detach().clone()
                 del da_out
 
             pixel_values = batch["pixel_values"].to(device, dtype=vae.dtype)
@@ -863,6 +945,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resolution", type=int, default=1024)
     p.add_argument("--max_length", type=int, default=128)
     p.add_argument("--use_chat_template", action="store_true")
+    p.add_argument(
+        "--text_source_mode",
+        type=str,
+        default="avg_range",
+        choices=["layer", "avg_range"],
+        help="Text encoder feature source fed into refiner.",
+    )
+    p.add_argument(
+        "--text_source_layer_idx",
+        type=int,
+        default=-2,
+        help="Used when text_source_mode=layer (supports negative index).",
+    )
+    p.add_argument(
+        "--text_source_range_start",
+        type=int,
+        default=10,
+        help="Used when text_source_mode=avg_range (inclusive).",
+    )
+    p.add_argument(
+        "--text_source_range_end",
+        type=int,
+        default=20,
+        help="Used when text_source_mode=avg_range (inclusive).",
+    )
 
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=1, help="Per-GPU image batch size for diffusion loss")
@@ -876,6 +983,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_negatives", type=int, default=12, help="InfoNCE negatives per anchor (1:K)")
     p.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature")
+    p.add_argument(
+        "--apply_zscore_before_loss",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply (x-mean)/std + L2 to [anchor,positive,negative] features before contrastive loss.",
+    )
+    p.add_argument("--zscore_eps", type=float, default=1e-6)
 
     p.add_argument("--contrastive_weight", type=float, default=1.0)
     p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")

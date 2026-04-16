@@ -8,12 +8,16 @@ NUM_GPUS=${NUM_GPUS:-8}
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/counting_triplets_filtered.jsonl}
 GENERATED_ROOT=${GENERATED_ROOT:-data/generated_images}
-OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_linear_encoder}
+OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_avg10_20_zscore}
 
 # ── Data / model ──────────────────────────────────────────────────────────────
 VERDICT_THRESHOLD=${VERDICT_THRESHOLD:-0.8}
 RESOLUTION=${RESOLUTION:-1024}
 MAX_LENGTH=${MAX_LENGTH:-128}
+TEXT_SOURCE_MODE=${TEXT_SOURCE_MODE:-avg_range}
+TEXT_SOURCE_LAYER_IDX=${TEXT_SOURCE_LAYER_IDX:--2}
+TEXT_SOURCE_RANGE_START=${TEXT_SOURCE_RANGE_START:-10}
+TEXT_SOURCE_RANGE_END=${TEXT_SOURCE_RANGE_END:-20}
 
 # ── Training ──────────────────────────────────────────────────────────────────
 EPOCHS=${EPOCHS:-10}                  # short: prevent catastrophic forgetting on narrow counting data
@@ -36,6 +40,8 @@ TEMPERATURE=${TEMPERATURE:-0.07}
 TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.2}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}   # diffusion on narrow counting data causes rapid collapse; contrastive-only is safe
+APPLY_ZSCORE_BEFORE_LOSS=${APPLY_ZSCORE_BEFORE_LOSS:-true}
+ZSCORE_EPS=${ZSCORE_EPS:-1e-6}
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
 SAVE_EVERY=${SAVE_EVERY:-200}          # frequent checkpoints to detect collapse early
@@ -55,6 +61,10 @@ accelerate launch \
     --verdict_threshold "$VERDICT_THRESHOLD" \
     --resolution "$RESOLUTION" \
     --max_length "$MAX_LENGTH" \
+    --text_source_mode "$TEXT_SOURCE_MODE" \
+    --text_source_layer_idx "$TEXT_SOURCE_LAYER_IDX" \
+    --text_source_range_start "$TEXT_SOURCE_RANGE_START" \
+    --text_source_range_end "$TEXT_SOURCE_RANGE_END" \
     --epochs "$EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --contrastive_batch_size "$CONTRASTIVE_BATCH_SIZE" \
@@ -73,6 +83,8 @@ accelerate launch \
     --triplet_margin "$TRIPLET_MARGIN" \
     --contrastive_weight "$CONTRASTIVE_WEIGHT" \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
+    --apply_zscore_before_loss "$APPLY_ZSCORE_BEFORE_LOSS" \
+    --zscore_eps "$ZSCORE_EPS" \
     --save_every "$SAVE_EVERY" \
     --vis_every "$VIS_EVERY" \
     --use_chat_template \
