@@ -597,13 +597,9 @@ def main(args: argparse.Namespace) -> None:
 
     # Fixed prompts for periodic visualization
     VIS_PROMPTS = [
-        "three cats sitting on a sofa",
         "five apples on a table",
-        "two dogs running in a park",
         "seven birds on a wire",
-        "a photo of three baseballs",
         "a photo of four computer keyboards",
-        "four oranges on a white table",
         "three red flowers in a vase",
     ]
 
