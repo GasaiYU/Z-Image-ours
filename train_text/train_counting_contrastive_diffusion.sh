@@ -36,8 +36,9 @@ SEED=${SEED:-42}
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
 TEMPERATURE=${TEMPERATURE:-0.07}
-CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
-DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}   # diffusion on narrow counting data causes rapid collapse; contrastive-only is safe
+CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}   # initial weight, linearly decays to 0
+DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}       # fixed throughout training
+CTR_DECAY_STEPS=${CTR_DECAY_STEPS:-1000}           # 0 = decay over all training steps
 APPLY_ZSCORE_BEFORE_LOSS=${APPLY_ZSCORE_BEFORE_LOSS:-true}   # true / false
 ZSCORE_EPS=${ZSCORE_EPS:-1e-6}
 
@@ -85,6 +86,7 @@ accelerate launch \
     --temperature "$TEMPERATURE" \
     --contrastive_weight "$CONTRASTIVE_WEIGHT" \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
+    --ctr_decay_steps "$CTR_DECAY_STEPS" \
     $ZSCORE_FLAG \
     --zscore_eps "$ZSCORE_EPS" \
     --save_every "$SAVE_EVERY" \

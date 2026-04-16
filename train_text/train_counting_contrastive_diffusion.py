@@ -638,7 +638,17 @@ def main(args: argparse.Namespace) -> None:
 
     global_step = 0
     transformer_dtype = next(transformer.parameters()).dtype
-    # trainable_params includes context_refiner parameters only
+
+    total_steps = args.epochs * len(loader)
+    ctr_decay_steps = args.ctr_decay_steps if args.ctr_decay_steps > 0 else total_steps
+    if is_main:
+        print(f"[Init] contrastive weight: {args.contrastive_weight:.3f} → 0.0 over {ctr_decay_steps} steps")
+        print(f"[Init] diffusion weight: {args.diffusion_weight:.3f} (fixed)")
+
+    def get_ctr_weight(step: int) -> float:
+        if step >= ctr_decay_steps:
+            return 0.0
+        return args.contrastive_weight * (1.0 - step / ctr_decay_steps)
 
     # Baseline visualization before any training
     if args.vis_every > 0:
@@ -759,7 +769,8 @@ def main(args: argparse.Namespace) -> None:
             pred = torch.stack(pred_list, dim=0).squeeze(2).float()
 
             loss_diff = F.mse_loss(pred.float(), target.float(), reduction="mean")
-            loss = args.diffusion_weight * loss_diff + args.contrastive_weight * loss_ctr
+            ctr_w = get_ctr_weight(global_step)
+            loss = args.diffusion_weight * loss_diff + ctr_w * loss_ctr
 
             if global_step == 0 and is_main:
                 print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
@@ -796,6 +807,7 @@ def main(args: argparse.Namespace) -> None:
                             "train/pos_sim": pos_sim,
                             "train/neg_sim": neg_sim,
                             "train/pos_neg_gap": pos_sim - neg_sim,
+                            "train/ctr_weight": ctr_w,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                         },
@@ -915,8 +927,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--zscore_eps", type=float, default=1e-6)
 
-    p.add_argument("--contrastive_weight", type=float, default=1.0)
-    p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")
+    p.add_argument("--contrastive_weight", type=float, default=1.0,
+                   help="Initial contrastive loss weight (linearly decays to 0 over ctr_decay_steps).")
+    p.add_argument("--diffusion_weight", type=float, default=1.0, help="Diffusion loss weight (fixed).")
+    p.add_argument("--ctr_decay_steps", type=int, default=0,
+                   help="Steps over which contrastive weight decays to 0. 0 = decay over all training steps.")
     p.add_argument("--proj_hidden_dim", type=int, default=512,
                    help="(Deprecated) kept for launch-script compatibility; unused.")
     p.add_argument("--proj_out_dim", type=int, default=256,
