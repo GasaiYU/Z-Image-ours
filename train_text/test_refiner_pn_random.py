@@ -164,6 +164,10 @@ def main(args: argparse.Namespace) -> None:
     all_post_an = []
     all_pre_tok = []
     all_post_tok = []
+    all_pre_tok_ap = []
+    all_pre_tok_an = []
+    all_post_tok_ap = []
+    all_post_tok_an = []
     stage_metrics: dict[str, dict[str, list[torch.Tensor]]] = {}
 
     for t in range(args.trials):
@@ -233,8 +237,14 @@ def main(args: argparse.Namespace) -> None:
 
         valid_pre = vm_a_pre & vm_p_pre & vm_n_pre
         valid_post = vm_a_post & vm_p_post & vm_n_post
-        tok_pn_pre = (a_pre_tok[valid_pre] * p_pre_tok[valid_pre]).sum(dim=-1) - (a_pre_tok[valid_pre] * n_pre_tok[valid_pre]).sum(dim=-1)
-        tok_pn_post = (a_post_tok[valid_post] * p_post_tok[valid_post]).sum(dim=-1) - (a_post_tok[valid_post] * n_post_tok[valid_post]).sum(dim=-1)
+        
+        tok_sim_ap_pre = (a_pre_tok[valid_pre] * p_pre_tok[valid_pre]).sum(dim=-1)
+        tok_sim_an_pre = (a_pre_tok[valid_pre] * n_pre_tok[valid_pre]).sum(dim=-1)
+        tok_sim_ap_post = (a_post_tok[valid_post] * p_post_tok[valid_post]).sum(dim=-1)
+        tok_sim_an_post = (a_post_tok[valid_post] * n_post_tok[valid_post]).sum(dim=-1)
+        
+        tok_pn_pre = tok_sim_ap_pre - tok_sim_an_pre
+        tok_pn_post = tok_sim_ap_post - tok_sim_an_post
 
         all_pre.append(pn_pre.cpu())
         all_post.append(pn_post.cpu())
@@ -246,8 +256,12 @@ def main(args: argparse.Namespace) -> None:
         all_post_an.append(sim_an_post.cpu())
         if tok_pn_pre.numel() > 0:
             all_pre_tok.append(tok_pn_pre.cpu())
+            all_pre_tok_ap.append(tok_sim_ap_pre.cpu())
+            all_pre_tok_an.append(tok_sim_an_pre.cpu())
         if tok_pn_post.numel() > 0:
             all_post_tok.append(tok_pn_post.cpu())
+            all_post_tok_ap.append(tok_sim_ap_post.cpu())
+            all_post_tok_an.append(tok_sim_an_post.cpu())
 
         # Stage-wise sentence-level similarity stats:
         # text_encoder(-2), cap_embedder, and each context_refiner block output.
@@ -309,9 +323,19 @@ def main(args: argparse.Namespace) -> None:
     if all_pre_tok and all_post_tok:
         pre_tok_all = torch.cat(all_pre_tok, dim=0)
         post_tok_all = torch.cat(all_post_tok, dim=0)
+        pre_tok_ap_all = torch.cat(all_pre_tok_ap, dim=0)
+        pre_tok_an_all = torch.cat(all_pre_tok_an, dim=0)
+        post_tok_ap_all = torch.cat(all_post_tok_ap, dim=0)
+        post_tok_an_all = torch.cat(all_post_tok_an, dim=0)
         pre_tok_stats = mean_std_min_max(pre_tok_all)
         post_tok_stats = mean_std_min_max(post_tok_all)
         print("\n=== Token-level p-n (target token only) ===")
+        print(
+            f"PRE  token_sim(a,p) mean={pre_tok_ap_all.mean().item():.6f}  token_sim(a,n) mean={pre_tok_an_all.mean().item():.6f}"
+        )
+        print(
+            f"POST token_sim(a,p) mean={post_tok_ap_all.mean().item():.6f}  token_sim(a,n) mean={post_tok_an_all.mean().item():.6f}"
+        )
         print(
             f"PRE  token_p-n mean={pre_tok_stats[0]:+.6f} std={pre_tok_stats[1]:.6f} "
             f"min={pre_tok_stats[2]:+.6f} max={pre_tok_stats[3]:+.6f} "
