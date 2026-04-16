@@ -49,6 +49,16 @@ def run_context_refiner(
 
 
 CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
+NUMBER_WORDS = [
+    "one", "two", "three", "four", "five",
+    "six", "seven", "eight", "nine", "ten",
+]
+OBJECT_WORDS = [
+    "apple", "banana", "backpack", "bicycle", "bird",
+    "book", "bottle", "camera", "chair", "cup",
+    "dog", "elephant", "flower", "hammer", "laptop",
+    "pencil", "phone", "shoe", "table", "tree",
+]
 
 
 def rand_gibberish(min_len: int = 6, max_len: int = 14) -> str:
@@ -56,7 +66,31 @@ def rand_gibberish(min_len: int = 6, max_len: int = 14) -> str:
     return "".join(random.choice(CHARSET) for _ in range(n))
 
 
-def build_triplet() -> tuple[str, str, str, str, str]:
+def make_anchor_variants(anchor: str) -> list[str]:
+    base = anchor.strip()
+    candidates = [
+        base,
+        f"a photo of {base}",
+        f"an image of {base}",
+        f"a picture of {base}",
+        f"a realistic photo of {base}",
+        f"a high-quality photo of {base}",
+        f"{base} on a plain background",
+        f"{base}, studio photography",
+        f"a detailed image of {base}",
+        f"a clear photo of {base}",
+    ]
+    seen = set()
+    out = []
+    for c in candidates:
+        k = c.strip().lower()
+        if k and k not in seen:
+            out.append(c)
+            seen.add(k)
+    return out
+
+
+def build_gibberish_triplet() -> tuple[str, str, str, str, str]:
     """
     Build a noisy/gibberish triplet for stress testing anisotropy:
       anchor:   "xxxdasda qwe12"
@@ -71,6 +105,28 @@ def build_triplet() -> tuple[str, str, str, str, str]:
     positive = f"{core_a}"
     negative = f"{core_n}"
     return anchor, positive, negative, anchor_word, neg_word
+
+
+def build_counting_triplet() -> tuple[str, str, str, str, str]:
+    count = random.choice(NUMBER_WORDS)
+    neg_count = random.choice([w for w in NUMBER_WORDS if w != count])
+    obj = random.choice(OBJECT_WORDS)
+    anchor = f"{count} {obj}"
+
+    pos_candidates = [v for v in make_anchor_variants(anchor) if v.strip().lower() != anchor.lower()]
+    positive = random.choice(pos_candidates) if pos_candidates else anchor
+
+    neg_base = anchor.replace(count, neg_count, 1)
+    neg_candidates = make_anchor_variants(neg_base)
+    negative = random.choice(neg_candidates) if neg_candidates else neg_base
+
+    return anchor, positive, negative, count, neg_count
+
+
+def build_triplet(mode: str) -> tuple[str, str, str, str, str]:
+    if mode == "gibberish":
+        return build_gibberish_triplet()
+    return build_counting_triplet()
 
 
 def pool_content(token_hidden: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor, special_ids: set[int]) -> torch.Tensor:
@@ -189,7 +245,7 @@ def main(args: argparse.Namespace) -> None:
     rand_proj = None
 
     for t in range(args.trials):
-        triplets = [build_triplet() for _ in range(args.batch_size)]
+        triplets = [build_triplet(args.prompt_mode) for _ in range(args.batch_size)]
         anchors = [x[0] for x in triplets]
         positives = [x[1] for x in triplets]
         negatives = [x[2] for x in triplets]
@@ -443,6 +499,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_length", type=int, default=128)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--proj_dim", type=int, default=256, help="Output dim for frozen random projection")
+    p.add_argument(
+        "--prompt_mode",
+        type=str,
+        default="counting",
+        choices=["counting", "gibberish"],
+        help="Triplet construction mode: counting matches training-style templates.",
+    )
     return p.parse_args()
 
 
