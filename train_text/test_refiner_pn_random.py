@@ -57,7 +57,7 @@ def build_triplet() -> tuple[str, str, str]:
       negative: "a photo of asd98zx qqq77"       (different gibberish core)
     """
     core_a = f"{rand_gibberish()} {rand_gibberish()}"
-    core_n = f"{rand_gibberish()} {rand_gibberish()}"
+    core_n = f"{rand_gibberish()} {rand_gibberish()}{rand_gibberish()}{rand_gibberish()}"
     anchor = core_a
     positive = f"a photo of {core_a}"
     negative = f"a photo of {core_n}"
