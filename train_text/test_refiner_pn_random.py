@@ -154,6 +154,13 @@ def random_project_and_normalize(x: torch.Tensor, proj: torch.Tensor) -> torch.T
     return F.normalize(x.float() @ proj, dim=-1)
 
 
+def mean_center_and_normalize(x: torch.Tensor) -> torch.Tensor:
+    """Subtract batch mean and then apply L2 normalization."""
+    x = x.float()
+    x = x - x.mean(dim=0, keepdim=True)
+    return F.normalize(x, dim=-1)
+
+
 def update_stage_metrics(
     metrics: dict[str, dict[str, list[torch.Tensor]]],
     stage_name: str,
@@ -221,20 +228,19 @@ def main(args: argparse.Namespace) -> None:
         p.requires_grad_(False)
 
     special_ids = set(tokenizer.all_special_ids)
-    all_pre = []
     all_post = []
-    all_pre_l2 = []
     all_post_l2 = []
-    all_pre_ap = []
-    all_pre_an = []
     all_post_ap = []
     all_post_an = []
-    all_pre_tok = []
     all_post_tok = []
-    all_pre_tok_ap = []
-    all_pre_tok_an = []
     all_post_tok_ap = []
     all_post_tok_an = []
+    all_post_mc = []
+    all_post_mc_ap = []
+    all_post_mc_an = []
+    all_post_tok_mc = []
+    all_post_tok_mc_ap = []
+    all_post_tok_mc_an = []
     all_post_rand = []
     all_post_rand_ap = []
     all_post_rand_an = []
@@ -268,34 +274,38 @@ def main(args: argparse.Namespace) -> None:
             pre_tok = out.hidden_states[-2]
             post_tok, stage_outputs = run_context_refiner(transformer, pre_tok, attention_mask)
 
-            pre_vec = pool_content(pre_tok, input_ids, attention_mask, special_ids)
             post_vec = pool_content(post_tok, input_ids, attention_mask, special_ids)
 
         b = args.batch_size
         if rand_proj is None:
             rand_proj = build_frozen_random_projection(post_vec.shape[-1], args.proj_dim, args.seed + 2026, device)
-        ea_pre, ep_pre, en_pre = pre_vec[:b], pre_vec[b:2 * b], pre_vec[2 * b:]
         ea_post, ep_post, en_post = post_vec[:b], post_vec[b:2 * b], post_vec[2 * b:]
+
+        combined_post = torch.cat([ea_post, ep_post, en_post], dim=0)
+        combined_post_mc = mean_center_and_normalize(combined_post)
+        ea_post_mc = combined_post_mc[:b]
+        ep_post_mc = combined_post_mc[b:2 * b]
+        en_post_mc = combined_post_mc[2 * b:]
+
         ea_post_rand = random_project_and_normalize(ea_post, rand_proj)
         ep_post_rand = random_project_and_normalize(ep_post, rand_proj)
         en_post_rand = random_project_and_normalize(en_post, rand_proj)
 
-        sim_ap_pre = (ea_pre * ep_pre).sum(dim=-1)
-        sim_an_pre = (ea_pre * en_pre).sum(dim=-1)
         sim_ap_post = (ea_post * ep_post).sum(dim=-1)
         sim_an_post = (ea_post * en_post).sum(dim=-1)
-        pn_pre = sim_ap_pre - sim_an_pre
         pn_post = sim_ap_post - sim_an_post
+
+        sim_ap_post_mc = (ea_post_mc * ep_post_mc).sum(dim=-1)
+        sim_an_post_mc = (ea_post_mc * en_post_mc).sum(dim=-1)
+        pn_post_mc = sim_ap_post_mc - sim_an_post_mc
+
         sim_ap_post_rand = (ea_post_rand * ep_post_rand).sum(dim=-1)
         sim_an_post_rand = (ea_post_rand * en_post_rand).sum(dim=-1)
         pn_post_rand = sim_ap_post_rand - sim_an_post_rand
 
         # Euclidean distance margin: >0 means positive is closer than negative.
-        dist_ap_pre = torch.norm(ea_pre - ep_pre, p=2, dim=-1)
-        dist_an_pre = torch.norm(ea_pre - en_pre, p=2, dim=-1)
         dist_ap_post = torch.norm(ea_post - ep_post, p=2, dim=-1)
         dist_an_post = torch.norm(ea_post - en_post, p=2, dim=-1)
-        l2_margin_pre = dist_an_pre - dist_ap_pre
         l2_margin_post = dist_an_post - dist_ap_post
 
         # Token-level p-n: use anchor target token vs positive same token / negative token.
@@ -310,23 +320,35 @@ def main(args: argparse.Namespace) -> None:
         p_tidx = [find_target_idx(tokenizer, p_ids[i], p_mask[i], anchor_words[i]) for i in range(b)]
         n_tidx = [find_target_idx(tokenizer, n_ids[i], n_mask[i], neg_words[i]) for i in range(b)]
 
-        a_pre_tok, vm_a_pre = extract_token_features(pre_tok[:b], a_tidx)
-        p_pre_tok, vm_p_pre = extract_token_features(pre_tok[b:2 * b], p_tidx)
-        n_pre_tok, vm_n_pre = extract_token_features(pre_tok[2 * b:], n_tidx)
         a_post_tok, vm_a_post = extract_token_features(post_tok[:b], a_tidx)
         p_post_tok, vm_p_post = extract_token_features(post_tok[b:2 * b], p_tidx)
         n_post_tok, vm_n_post = extract_token_features(post_tok[2 * b:], n_tidx)
 
-        valid_pre = vm_a_pre & vm_p_pre & vm_n_pre
         valid_post = vm_a_post & vm_p_post & vm_n_post
-        
-        tok_sim_ap_pre = (a_pre_tok[valid_pre] * p_pre_tok[valid_pre]).sum(dim=-1)
-        tok_sim_an_pre = (a_pre_tok[valid_pre] * n_pre_tok[valid_pre]).sum(dim=-1)
+
         tok_sim_ap_post = (a_post_tok[valid_post] * p_post_tok[valid_post]).sum(dim=-1)
         tok_sim_an_post = (a_post_tok[valid_post] * n_post_tok[valid_post]).sum(dim=-1)
-        
-        tok_pn_pre = tok_sim_ap_pre - tok_sim_an_pre
+
         tok_pn_post = tok_sim_ap_post - tok_sim_an_post
+
+        combined_post_tok = torch.cat(
+            [a_post_tok[valid_post], p_post_tok[valid_post], n_post_tok[valid_post]],
+            dim=0,
+        )
+        if combined_post_tok.numel() > 0:
+            combined_post_tok_mc = mean_center_and_normalize(combined_post_tok)
+            nv = int(valid_post.sum().item())
+            a_post_tok_mc = combined_post_tok_mc[:nv]
+            p_post_tok_mc = combined_post_tok_mc[nv : 2 * nv]
+            n_post_tok_mc = combined_post_tok_mc[2 * nv :]
+            tok_sim_ap_post_mc = (a_post_tok_mc * p_post_tok_mc).sum(dim=-1)
+            tok_sim_an_post_mc = (a_post_tok_mc * n_post_tok_mc).sum(dim=-1)
+            tok_pn_post_mc = tok_sim_ap_post_mc - tok_sim_an_post_mc
+        else:
+            tok_sim_ap_post_mc = torch.empty(0, device=device)
+            tok_sim_an_post_mc = torch.empty(0, device=device)
+            tok_pn_post_mc = torch.empty(0, device=device)
+
         a_post_tok_rand = random_project_and_normalize(a_post_tok[valid_post], rand_proj)
         p_post_tok_rand = random_project_and_normalize(p_post_tok[valid_post], rand_proj)
         n_post_tok_rand = random_project_and_normalize(n_post_tok[valid_post], rand_proj)
@@ -334,78 +356,61 @@ def main(args: argparse.Namespace) -> None:
         tok_sim_an_post_rand = (a_post_tok_rand * n_post_tok_rand).sum(dim=-1)
         tok_pn_post_rand = tok_sim_ap_post_rand - tok_sim_an_post_rand
 
-        all_pre.append(pn_pre.cpu())
         all_post.append(pn_post.cpu())
-        all_pre_l2.append(l2_margin_pre.cpu())
         all_post_l2.append(l2_margin_post.cpu())
-        all_pre_ap.append(sim_ap_pre.cpu())
-        all_pre_an.append(sim_an_pre.cpu())
         all_post_ap.append(sim_ap_post.cpu())
         all_post_an.append(sim_an_post.cpu())
+        all_post_mc.append(pn_post_mc.cpu())
+        all_post_mc_ap.append(sim_ap_post_mc.cpu())
+        all_post_mc_an.append(sim_an_post_mc.cpu())
         all_post_rand.append(pn_post_rand.cpu())
         all_post_rand_ap.append(sim_ap_post_rand.cpu())
         all_post_rand_an.append(sim_an_post_rand.cpu())
-        if tok_pn_pre.numel() > 0:
-            all_pre_tok.append(tok_pn_pre.cpu())
-            all_pre_tok_ap.append(tok_sim_ap_pre.cpu())
-            all_pre_tok_an.append(tok_sim_an_pre.cpu())
         if tok_pn_post.numel() > 0:
             all_post_tok.append(tok_pn_post.cpu())
             all_post_tok_ap.append(tok_sim_ap_post.cpu())
             all_post_tok_an.append(tok_sim_an_post.cpu())
+            all_post_tok_mc.append(tok_pn_post_mc.cpu())
+            all_post_tok_mc_ap.append(tok_sim_ap_post_mc.cpu())
+            all_post_tok_mc_an.append(tok_sim_an_post_mc.cpu())
             all_post_tok_rand.append(tok_pn_post_rand.cpu())
             all_post_tok_rand_ap.append(tok_sim_ap_post_rand.cpu())
             all_post_tok_rand_an.append(tok_sim_an_post_rand.cpu())
 
-        # Stage-wise sentence-level similarity stats:
-        # text_encoder(-2), cap_embedder, and each context_refiner block output.
-        update_stage_metrics(stage_metrics, "text_encoder_pre_refiner", pre_tok, input_ids, attention_mask, special_ids, b)
-        update_stage_metrics(stage_metrics, "cap_embedder", stage_outputs["cap_embedder"], input_ids, attention_mask, special_ids, b)
+        # Stage-wise sentence-level similarity stats: context_refiner block outputs only.
         for k, v in stage_outputs.items():
             if k.startswith("context_refiner_"):
                 update_stage_metrics(stage_metrics, k, v, input_ids, attention_mask, special_ids, b)
 
-        pre_stats = mean_std_min_max(pn_pre)
         post_stats = mean_std_min_max(pn_post)
+        post_mc_stats = mean_std_min_max(pn_post_mc)
         post_rand_stats = mean_std_min_max(pn_post_rand)
-        pre_l2_stats = mean_std_min_max(l2_margin_pre)
         post_l2_stats = mean_std_min_max(l2_margin_post)
         print(
             f"[trial {t+1:02d}/{args.trials}] "
-            f"pre_p-n mean={pre_stats[0]:+.6f} std={pre_stats[1]:.6f} min={pre_stats[2]:+.6f} max={pre_stats[3]:+.6f} | "
             f"post_p-n mean={post_stats[0]:+.6f} std={post_stats[1]:.6f} min={post_stats[2]:+.6f} max={post_stats[3]:+.6f} | "
+            f"mc_post_p-n mean={post_mc_stats[0]:+.6f} | "
             f"rand_post_p-n mean={post_rand_stats[0]:+.6f} | "
-            f"pre_l2_margin mean={pre_l2_stats[0]:+.6f} post_l2_margin mean={post_l2_stats[0]:+.6f} | "
-            f"token_valid pre={int(valid_pre.sum())}/{b} post={int(valid_post.sum())}/{b}"
+            f"post_l2_margin mean={post_l2_stats[0]:+.6f} | "
+            f"token_valid post={int(valid_post.sum())}/{b}"
         )
 
-    all_pre_t = torch.cat(all_pre, dim=0)
     all_post_t = torch.cat(all_post, dim=0)
-    all_pre_l2_t = torch.cat(all_pre_l2, dim=0)
     all_post_l2_t = torch.cat(all_post_l2, dim=0)
-    all_pre_ap_t = torch.cat(all_pre_ap, dim=0)
-    all_pre_an_t = torch.cat(all_pre_an, dim=0)
     all_post_ap_t = torch.cat(all_post_ap, dim=0)
     all_post_an_t = torch.cat(all_post_an, dim=0)
+    all_post_mc_t = torch.cat(all_post_mc, dim=0)
+    all_post_mc_ap_t = torch.cat(all_post_mc_ap, dim=0)
+    all_post_mc_an_t = torch.cat(all_post_mc_an, dim=0)
     all_post_rand_t = torch.cat(all_post_rand, dim=0)
     all_post_rand_ap_t = torch.cat(all_post_rand_ap, dim=0)
     all_post_rand_an_t = torch.cat(all_post_rand_an, dim=0)
-    pre_all = mean_std_min_max(all_pre_t)
     post_all = mean_std_min_max(all_post_t)
 
     print("\n=== Overall ===")
     print(
-        f"PRE  p-n mean={pre_all[0]:+.6f} std={pre_all[1]:.6f} min={pre_all[2]:+.6f} max={pre_all[3]:+.6f} "
-        f"pos_rate={(all_pre_t > 0).float().mean().item() * 100:.2f}%"
-    )
-    print(
         f"POST p-n mean={post_all[0]:+.6f} std={post_all[1]:.6f} min={post_all[2]:+.6f} max={post_all[3]:+.6f} "
         f"pos_rate={(all_post_t > 0).float().mean().item() * 100:.2f}%"
-    )
-    print(
-        f"PRE  l2_margin mean={all_pre_l2_t.mean().item():+.6f} std={all_pre_l2_t.std().item():.6f} "
-        f"min={all_pre_l2_t.min().item():+.6f} max={all_pre_l2_t.max().item():+.6f} "
-        f"pos_rate={(all_pre_l2_t > 0).float().mean().item() * 100:.2f}%"
     )
     print(
         f"POST l2_margin mean={all_post_l2_t.mean().item():+.6f} std={all_post_l2_t.std().item():.6f} "
@@ -413,10 +418,16 @@ def main(args: argparse.Namespace) -> None:
         f"pos_rate={(all_post_l2_t > 0).float().mean().item() * 100:.2f}%"
     )
     print(
-        f"PRE  sim(a,p) mean={all_pre_ap_t.mean().item():.6f}  sim(a,n) mean={all_pre_an_t.mean().item():.6f}"
+        f"POST sim(a,p) mean={all_post_ap_t.mean().item():.6f}  sim(a,n) mean={all_post_an_t.mean().item():.6f}"
+    )
+    print("\n=== Mean Centered ===")
+    print(
+        f"POST mc_p-n mean={all_post_mc_t.mean().item():+.6f} std={all_post_mc_t.std().item():.6f} "
+        f"min={all_post_mc_t.min().item():+.6f} max={all_post_mc_t.max().item():+.6f} "
+        f"pos_rate={(all_post_mc_t > 0).float().mean().item() * 100:.2f}%"
     )
     print(
-        f"POST sim(a,p) mean={all_post_ap_t.mean().item():.6f}  sim(a,n) mean={all_post_an_t.mean().item():.6f}"
+        f"POST mc_sim(a,p) mean={all_post_mc_ap_t.mean().item():.6f}  mc_sim(a,n) mean={all_post_mc_an_t.mean().item():.6f}"
     )
     print(f"\n=== Frozen random projection (dim={args.proj_dim}) ===")
     print(
@@ -428,34 +439,34 @@ def main(args: argparse.Namespace) -> None:
         f"POST rand_sim(a,p) mean={all_post_rand_ap_t.mean().item():.6f}  rand_sim(a,n) mean={all_post_rand_an_t.mean().item():.6f}"
     )
 
-    if all_pre_tok and all_post_tok:
-        pre_tok_all = torch.cat(all_pre_tok, dim=0)
+    if all_post_tok:
         post_tok_all = torch.cat(all_post_tok, dim=0)
-        pre_tok_ap_all = torch.cat(all_pre_tok_ap, dim=0)
-        pre_tok_an_all = torch.cat(all_pre_tok_an, dim=0)
         post_tok_ap_all = torch.cat(all_post_tok_ap, dim=0)
         post_tok_an_all = torch.cat(all_post_tok_an, dim=0)
+        post_tok_mc_all = torch.cat(all_post_tok_mc, dim=0)
+        post_tok_mc_ap_all = torch.cat(all_post_tok_mc_ap, dim=0)
+        post_tok_mc_an_all = torch.cat(all_post_tok_mc_an, dim=0)
         post_tok_rand_all = torch.cat(all_post_tok_rand, dim=0)
         post_tok_rand_ap_all = torch.cat(all_post_tok_rand_ap, dim=0)
         post_tok_rand_an_all = torch.cat(all_post_tok_rand_an, dim=0)
-        pre_tok_stats = mean_std_min_max(pre_tok_all)
         post_tok_stats = mean_std_min_max(post_tok_all)
         print("\n=== Token-level p-n (target token only) ===")
         print(
-            f"PRE  token_sim(a,p) mean={pre_tok_ap_all.mean().item():.6f}  token_sim(a,n) mean={pre_tok_an_all.mean().item():.6f}"
-        )
-        print(
             f"POST token_sim(a,p) mean={post_tok_ap_all.mean().item():.6f}  token_sim(a,n) mean={post_tok_an_all.mean().item():.6f}"
-        )
-        print(
-            f"PRE  token_p-n mean={pre_tok_stats[0]:+.6f} std={pre_tok_stats[1]:.6f} "
-            f"min={pre_tok_stats[2]:+.6f} max={pre_tok_stats[3]:+.6f} "
-            f"pos_rate={(pre_tok_all > 0).float().mean().item() * 100:.2f}%"
         )
         print(
             f"POST token_p-n mean={post_tok_stats[0]:+.6f} std={post_tok_stats[1]:.6f} "
             f"min={post_tok_stats[2]:+.6f} max={post_tok_stats[3]:+.6f} "
             f"pos_rate={(post_tok_all > 0).float().mean().item() * 100:.2f}%"
+        )
+        print("\n=== Token-level Mean Centered ===")
+        print(
+            f"POST mc_token_sim(a,p) mean={post_tok_mc_ap_all.mean().item():.6f}  mc_token_sim(a,n) mean={post_tok_mc_an_all.mean().item():.6f}"
+        )
+        print(
+            f"POST mc_token_p-n mean={post_tok_mc_all.mean().item():+.6f} std={post_tok_mc_all.std().item():.6f} "
+            f"min={post_tok_mc_all.min().item():+.6f} max={post_tok_mc_all.max().item():+.6f} "
+            f"pos_rate={(post_tok_mc_all > 0).float().mean().item() * 100:.2f}%"
         )
         print(f"\n=== Token-level Frozen random projection (dim={args.proj_dim}) ===")
         print(
@@ -467,9 +478,9 @@ def main(args: argparse.Namespace) -> None:
             f"pos_rate={(post_tok_rand_all > 0).float().mean().item() * 100:.2f}%"
         )
 
-    # Layer-wise similarity summary (including cap_embedder)
+    # Layer-wise similarity summary (context_refiner outputs only)
     print("\n=== Layer-wise sentence similarity (overall) ===")
-    order = ["text_encoder_pre_refiner", "cap_embedder"] + sorted(
+    order = sorted(
         [k for k in stage_metrics.keys() if k.startswith("context_refiner_")],
         key=lambda x: int(x.split("_")[-1]),
     )
@@ -487,7 +498,6 @@ def main(args: argparse.Namespace) -> None:
             f"pn_pos_rate={(pn > 0).float().mean().item() * 100:.2f}%"
         )
 
-    print("\nfirst 10 PRE p-n :", [round(float(x), 6) for x in all_pre_t[:10]])
     print("first 10 POST p-n:", [round(float(x), 6) for x in all_post_t[:10]])
 
 
