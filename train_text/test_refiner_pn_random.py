@@ -49,19 +49,21 @@ def rand_gibberish(min_len: int = 6, max_len: int = 14) -> str:
     return "".join(random.choice(CHARSET) for _ in range(n))
 
 
-def build_triplet() -> tuple[str, str, str]:
+def build_triplet() -> tuple[str, str, str, str, str]:
     """
     Build a noisy/gibberish triplet for stress testing anisotropy:
       anchor:   "xxxdasda qwe12"
       positive: "a photo of xxxdasda qwe12"      (keeps anchor core)
       negative: "a photo of asd98zx qqq77"       (different gibberish core)
     """
-    core_a = f"{rand_gibberish()} {rand_gibberish()}"
-    core_n = f"{rand_gibberish()} {rand_gibberish()}{rand_gibberish()}{rand_gibberish()}"
+    anchor_word = rand_gibberish()
+    neg_word = rand_gibberish()
+    core_a = f"{anchor_word} {rand_gibberish()}"
+    core_n = f"{neg_word} {rand_gibberish()}{rand_gibberish()}{rand_gibberish()}"
     anchor = core_a
     positive = f"a photo of {core_a}"
     negative = f"a photo of {core_n}"
-    return anchor, positive, negative
+    return anchor, positive, negative, anchor_word, neg_word
 
 
 def pool_content(token_hidden: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor, special_ids: set[int]) -> torch.Tensor:
@@ -76,6 +78,30 @@ def pool_content(token_hidden: torch.Tensor, input_ids: torch.Tensor, attention_
 
 def mean_std_min_max(x: torch.Tensor) -> tuple[float, float, float, float]:
     return float(x.mean()), float(x.std()), float(x.min()), float(x.max())
+
+
+def find_target_idx(tokenizer, input_ids: torch.Tensor, attention_mask: torch.Tensor, target_word: str) -> int:
+    valid_ids = input_ids[attention_mask.bool()].tolist()
+    tw = target_word.lower().strip()
+    for idx, tid in enumerate(valid_ids):
+        token_str = tokenizer.decode([tid], skip_special_tokens=True).lower().strip()
+        if tw in token_str or token_str in tw:
+            return idx
+    return -1
+
+
+def extract_token_features(hidden: torch.Tensor, indices: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    feats = []
+    valid = []
+    seq_len = hidden.shape[1]
+    for i, tidx in enumerate(indices):
+        if 0 <= tidx < seq_len:
+            feats.append(F.normalize(hidden[i, tidx, :].float(), dim=-1))
+            valid.append(True)
+        else:
+            feats.append(torch.zeros(hidden.shape[-1], device=hidden.device, dtype=torch.float32))
+            valid.append(False)
+    return torch.stack(feats, dim=0), torch.tensor(valid, device=hidden.device, dtype=torch.bool)
 
 
 def main(args: argparse.Namespace) -> None:
@@ -101,12 +127,20 @@ def main(args: argparse.Namespace) -> None:
     special_ids = set(tokenizer.all_special_ids)
     all_pre = []
     all_post = []
+    all_pre_ap = []
+    all_pre_an = []
+    all_post_ap = []
+    all_post_an = []
+    all_pre_tok = []
+    all_post_tok = []
 
     for t in range(args.trials):
         triplets = [build_triplet() for _ in range(args.batch_size)]
         anchors = [x[0] for x in triplets]
         positives = [x[1] for x in triplets]
         negatives = [x[2] for x in triplets]
+        anchor_words = [x[3] for x in triplets]
+        neg_words = [x[4] for x in triplets]
 
         texts = anchors + positives + negatives
         enc = tokenizer(
@@ -131,22 +165,63 @@ def main(args: argparse.Namespace) -> None:
         ea_pre, ep_pre, en_pre = pre_vec[:b], pre_vec[b:2 * b], pre_vec[2 * b:]
         ea_post, ep_post, en_post = post_vec[:b], post_vec[b:2 * b], post_vec[2 * b:]
 
-        pn_pre = (ea_pre * ep_pre).sum(dim=-1) - (ea_pre * en_pre).sum(dim=-1)
-        pn_post = (ea_post * ep_post).sum(dim=-1) - (ea_post * en_post).sum(dim=-1)
+        sim_ap_pre = (ea_pre * ep_pre).sum(dim=-1)
+        sim_an_pre = (ea_pre * en_pre).sum(dim=-1)
+        sim_ap_post = (ea_post * ep_post).sum(dim=-1)
+        sim_an_post = (ea_post * en_post).sum(dim=-1)
+        pn_pre = sim_ap_pre - sim_an_pre
+        pn_post = sim_ap_post - sim_an_post
+
+        # Token-level p-n: use anchor target token vs positive same token / negative token.
+        a_ids = input_ids[:b]
+        p_ids = input_ids[b:2 * b]
+        n_ids = input_ids[2 * b:]
+        a_mask = attention_mask[:b]
+        p_mask = attention_mask[b:2 * b]
+        n_mask = attention_mask[2 * b:]
+
+        a_tidx = [find_target_idx(tokenizer, a_ids[i], a_mask[i], anchor_words[i]) for i in range(b)]
+        p_tidx = [find_target_idx(tokenizer, p_ids[i], p_mask[i], anchor_words[i]) for i in range(b)]
+        n_tidx = [find_target_idx(tokenizer, n_ids[i], n_mask[i], neg_words[i]) for i in range(b)]
+
+        a_pre_tok, vm_a_pre = extract_token_features(pre_tok[:b], a_tidx)
+        p_pre_tok, vm_p_pre = extract_token_features(pre_tok[b:2 * b], p_tidx)
+        n_pre_tok, vm_n_pre = extract_token_features(pre_tok[2 * b:], n_tidx)
+        a_post_tok, vm_a_post = extract_token_features(post_tok[:b], a_tidx)
+        p_post_tok, vm_p_post = extract_token_features(post_tok[b:2 * b], p_tidx)
+        n_post_tok, vm_n_post = extract_token_features(post_tok[2 * b:], n_tidx)
+
+        valid_pre = vm_a_pre & vm_p_pre & vm_n_pre
+        valid_post = vm_a_post & vm_p_post & vm_n_post
+        tok_pn_pre = (a_pre_tok[valid_pre] * p_pre_tok[valid_pre]).sum(dim=-1) - (a_pre_tok[valid_pre] * n_pre_tok[valid_pre]).sum(dim=-1)
+        tok_pn_post = (a_post_tok[valid_post] * p_post_tok[valid_post]).sum(dim=-1) - (a_post_tok[valid_post] * n_post_tok[valid_post]).sum(dim=-1)
 
         all_pre.append(pn_pre.cpu())
         all_post.append(pn_post.cpu())
+        all_pre_ap.append(sim_ap_pre.cpu())
+        all_pre_an.append(sim_an_pre.cpu())
+        all_post_ap.append(sim_ap_post.cpu())
+        all_post_an.append(sim_an_post.cpu())
+        if tok_pn_pre.numel() > 0:
+            all_pre_tok.append(tok_pn_pre.cpu())
+        if tok_pn_post.numel() > 0:
+            all_post_tok.append(tok_pn_post.cpu())
 
         pre_stats = mean_std_min_max(pn_pre)
         post_stats = mean_std_min_max(pn_post)
         print(
             f"[trial {t+1:02d}/{args.trials}] "
             f"pre_p-n mean={pre_stats[0]:+.6f} std={pre_stats[1]:.6f} min={pre_stats[2]:+.6f} max={pre_stats[3]:+.6f} | "
-            f"post_p-n mean={post_stats[0]:+.6f} std={post_stats[1]:.6f} min={post_stats[2]:+.6f} max={post_stats[3]:+.6f}"
+            f"post_p-n mean={post_stats[0]:+.6f} std={post_stats[1]:.6f} min={post_stats[2]:+.6f} max={post_stats[3]:+.6f} | "
+            f"token_valid pre={int(valid_pre.sum())}/{b} post={int(valid_post.sum())}/{b}"
         )
 
     all_pre_t = torch.cat(all_pre, dim=0)
     all_post_t = torch.cat(all_post, dim=0)
+    all_pre_ap_t = torch.cat(all_pre_ap, dim=0)
+    all_pre_an_t = torch.cat(all_pre_an, dim=0)
+    all_post_ap_t = torch.cat(all_post_ap, dim=0)
+    all_post_an_t = torch.cat(all_post_an, dim=0)
     pre_all = mean_std_min_max(all_pre_t)
     post_all = mean_std_min_max(all_post_t)
 
@@ -159,6 +234,29 @@ def main(args: argparse.Namespace) -> None:
         f"POST p-n mean={post_all[0]:+.6f} std={post_all[1]:.6f} min={post_all[2]:+.6f} max={post_all[3]:+.6f} "
         f"pos_rate={(all_post_t > 0).float().mean().item() * 100:.2f}%"
     )
+    print(
+        f"PRE  sim(a,p) mean={all_pre_ap_t.mean().item():.6f}  sim(a,n) mean={all_pre_an_t.mean().item():.6f}"
+    )
+    print(
+        f"POST sim(a,p) mean={all_post_ap_t.mean().item():.6f}  sim(a,n) mean={all_post_an_t.mean().item():.6f}"
+    )
+
+    if all_pre_tok and all_post_tok:
+        pre_tok_all = torch.cat(all_pre_tok, dim=0)
+        post_tok_all = torch.cat(all_post_tok, dim=0)
+        pre_tok_stats = mean_std_min_max(pre_tok_all)
+        post_tok_stats = mean_std_min_max(post_tok_all)
+        print("\n=== Token-level p-n (target token only) ===")
+        print(
+            f"PRE  token_p-n mean={pre_tok_stats[0]:+.6f} std={pre_tok_stats[1]:.6f} "
+            f"min={pre_tok_stats[2]:+.6f} max={pre_tok_stats[3]:+.6f} "
+            f"pos_rate={(pre_tok_all > 0).float().mean().item() * 100:.2f}%"
+        )
+        print(
+            f"POST token_p-n mean={post_tok_stats[0]:+.6f} std={post_tok_stats[1]:.6f} "
+            f"min={post_tok_stats[2]:+.6f} max={post_tok_stats[3]:+.6f} "
+            f"pos_rate={(post_tok_all > 0).float().mean().item() * 100:.2f}%"
+        )
 
     print("\nfirst 10 PRE p-n :", [round(float(x), 6) for x in all_pre_t[:10]])
     print("first 10 POST p-n:", [round(float(x), 6) for x in all_post_t[:10]])
