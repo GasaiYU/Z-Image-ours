@@ -41,22 +41,26 @@ def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor
     return refined
 
 
-NUMBER_WORDS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
-OBJECT_WORDS = [
-    "cats", "dogs", "apples", "cars", "chairs", "tables", "books", "bicycles", "cups",
-    "candles", "kites", "flowers", "hammers", "backpacks", "bottles", "socks", "pencils",
-    "oranges", "birds", "umbrellas", "laptops", "shoes",
-]
+CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def rand_gibberish(min_len: int = 6, max_len: int = 14) -> str:
+    n = random.randint(min_len, max_len)
+    return "".join(random.choice(CHARSET) for _ in range(n))
 
 
 def build_triplet() -> tuple[str, str, str]:
-    n = random.choice(NUMBER_WORDS)
-    obj = random.choice(OBJECT_WORDS)
-    n_neg = random.choice([x for x in NUMBER_WORDS if x != n])
-
-    anchor = f"{n} {obj}"
-    positive = f"a photo of {n} {obj}"
-    negative = f"a photo of {n_neg} {obj}"
+    """
+    Build a noisy/gibberish triplet for stress testing anisotropy:
+      anchor:   "xxxdasda qwe12"
+      positive: "a photo of xxxdasda qwe12"      (keeps anchor core)
+      negative: "a photo of asd98zx qqq77"       (different gibberish core)
+    """
+    core_a = f"{rand_gibberish()} {rand_gibberish()}"
+    core_n = f"{rand_gibberish()} {rand_gibberish()}"
+    anchor = core_a
+    positive = f"a photo of {core_a}"
+    negative = f"a photo of {core_n}"
     return anchor, positive, negative
 
 
