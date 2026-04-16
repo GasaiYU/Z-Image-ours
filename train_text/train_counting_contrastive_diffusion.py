@@ -88,23 +88,6 @@ def extract_token_feature(hidden_states: torch.Tensor, token_indices: list[int])
     return torch.stack(feats, dim=0), torch.tensor(valid, device=hidden_states.device, dtype=torch.bool)
 
 
-class ContrastiveProjectionHead(torch.nn.Module):
-    """Single-layer linear projection head for contrastive learning.
-
-    Simpler than MLP: shorter gradient path back to refiner, less capacity to
-    "cheat" by solving the contrastive task without the refiner changing.
-    Maps refiner mean-pool vectors [in_dim] → projected space [out_dim], L2-normalised.
-    hidden_dim is kept in __init__ for API compatibility but is ignored.
-    """
-
-    def __init__(self, in_dim: int, hidden_dim: int = 512, out_dim: int = 256):
-        super().__init__()
-        self.net = torch.nn.Linear(in_dim, out_dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.net(x.float()), dim=-1)
-
-
 def chunked_encode_and_extract(
     text_encoder,
     transformer: torch.nn.Module,
@@ -565,18 +548,11 @@ def main(args: argparse.Namespace) -> None:
     _raw_transformer = transformer.module if hasattr(transformer, "module") else transformer
     _transformer_dim = _raw_transformer.dim
 
-    proj_head = ContrastiveProjectionHead(
-        in_dim=_transformer_dim,
-        hidden_dim=args.proj_hidden_dim,
-        out_dim=args.proj_out_dim,
-    ).to(device)
-
-    trainable_params = [p for p in transformer.parameters() if p.requires_grad] + list(proj_head.parameters())
+    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
     if is_main:
         n_refiner = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-        n_proj = sum(p.numel() for p in proj_head.parameters())
         print(f"[Init] trainable transformer params: {n_refiner:,}")
-        print(f"[Init] projection head params: {n_proj:,}  (in={_transformer_dim} → hid={args.proj_hidden_dim} → out={args.proj_out_dim})")
+        print(f"[Init] projection head: disabled")
         if args.text_source_mode == "avg_range":
             print(f"[Init] refiner input source: avg layers [{args.text_source_range_start}, {args.text_source_range_end}]")
         else:
@@ -607,15 +583,12 @@ def main(args: argparse.Namespace) -> None:
     )
 
     optimizer = torch.optim.AdamW(
-        [
-            {"params": [p for p in transformer.parameters() if p.requires_grad], "lr": args.refiner_lr},
-            {"params": list(proj_head.parameters()), "lr": args.lr},
-        ],
+        [{"params": [p for p in transformer.parameters() if p.requires_grad], "lr": args.refiner_lr}],
         weight_decay=args.weight_decay,
     )
 
-    # accelerate wraps transformer + proj_head (trainable) + optimizer + loader
-    transformer, proj_head, optimizer, loader = accelerator.prepare(transformer, proj_head, optimizer, loader)
+    # accelerate wraps transformer (trainable) + optimizer + loader
+    transformer, optimizer, loader = accelerator.prepare(transformer, optimizer, loader)
 
     vis_dir = Path(args.output_dir) / "vis"
     if is_main:
@@ -661,7 +634,7 @@ def main(args: argparse.Namespace) -> None:
 
     global_step = 0
     transformer_dtype = next(transformer.parameters()).dtype
-    # trainable_params already defined above to include both transformer refiner + proj_head
+    # trainable_params includes context_refiner parameters only
 
     # Baseline visualization before any training
     if args.vis_every > 0:
@@ -669,7 +642,6 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(1, args.epochs + 1):
         transformer.train()
-        proj_head.train()
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         running_total = 0.0
         running_diff = 0.0
@@ -727,28 +699,18 @@ def main(args: argparse.Namespace) -> None:
                 if args.apply_zscore_before_loss:
                     ea, ep, en_flat = zscore_then_l2(ea, ep, en_flat, eps=args.zscore_eps)
 
-                # Diagnostic: p-n in refiner space (before projection)
                 with torch.no_grad():
                     en_diag = en_flat.view(B_ctr, K, -1)
-                    pre_pos_sim = (ea * ep).sum(dim=-1).mean().item()
-                    pre_neg_sim = (ea.unsqueeze(1) * en_diag).sum(dim=-1).mean().item()
+                    pos_sim = (ea * ep).sum(dim=-1).mean().item()
+                    neg_sim = (ea.unsqueeze(1) * en_diag).sum(dim=-1).mean().item()
                     del en_diag
 
-                ea_proj = proj_head(ea)
-                ep_proj = proj_head(ep)
-                en_proj = proj_head(en_flat).view(B_ctr, K, -1)
-                del ea, ep, en_flat
-
-                with torch.no_grad():
-                    pos_sim = (ea_proj * ep_proj).sum(dim=-1).mean().item()
-                    neg_sim = (ea_proj.unsqueeze(1) * en_proj).sum(dim=-1).mean().item()
-
-                loss_ctr = infonce_loss(ea_proj, ep_proj, en_proj, temperature=args.temperature)
-                del ea_proj, ep_proj, en_proj
+                en = en_flat.view(B_ctr, K, -1)
+                loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature)
+                del ea, ep, en, en_flat
             else:
                 loss_ctr = torch.tensor(0.0, device=device)
                 pos_sim = neg_sim = 0.0
-                pre_pos_sim = pre_neg_sim = 0.0
                 B_ctr = args.contrastive_batch_size
                 K = args.num_negatives
 
@@ -798,8 +760,7 @@ def main(args: argparse.Namespace) -> None:
             if global_step == 0 and is_main:
                 print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
                       f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
-                      f"pre_p-n={pre_pos_sim - pre_neg_sim:+.4f}  "
-                      f"post_p-n={pos_sim - neg_sim:+.4f}  "
+                      f"p-n={pos_sim - neg_sim:+.4f}  "
                       f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
             optimizer.zero_grad(set_to_none=True)
@@ -817,14 +778,9 @@ def main(args: argparse.Namespace) -> None:
                 gL_str = "  ".join(f"{k}={v:.2e}" for k, v in gL.items())
                 print(f"[Grad step={global_step}] refiner[0]:  {g0_str}")
                 print(f"[Grad step={global_step}] refiner[-1]: {gL_str}")
-                raw_proj = accelerator.unwrap_model(proj_head)
-                gp = {n: _gnorm(p) for n, p in raw_proj.named_parameters()}
-                gp_str = "  ".join(f"{k}={v:.2e}" for k, v in gp.items())
-                print(f"[Grad step={global_step}] proj_head:   {gp_str}")
                 # snapshot params before update
                 snap_r0 = {n: p.data.clone() for n, p in layers[0].named_parameters()}
                 snap_rL = {n: p.data.clone() for n, p in layers[-1].named_parameters()}
-                snap_proj = {n: p.data.clone() for n, p in raw_proj.named_parameters()}
 
             accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
@@ -833,13 +789,10 @@ def main(args: argparse.Namespace) -> None:
                 # delta = |param_after - param_before|.max()
                 d0 = {n: (layers[0].get_parameter(n).data - snap_r0[n]).abs().max().item() for n in snap_r0}
                 dL = {n: (layers[-1].get_parameter(n).data - snap_rL[n]).abs().max().item() for n in snap_rL}
-                dp = {n: (raw_proj.get_parameter(n).data - snap_proj[n]).abs().max().item() for n in snap_proj}
                 d0_str = "  ".join(f"{k}={v:.2e}" for k, v in d0.items())
                 dL_str = "  ".join(f"{k}={v:.2e}" for k, v in dL.items())
-                dp_str = "  ".join(f"{k}={v:.2e}" for k, v in dp.items())
                 print(f"[Delta step={global_step}] refiner[0]:  {d0_str}")
                 print(f"[Delta step={global_step}] refiner[-1]: {dL_str}")
-                print(f"[Delta step={global_step}] proj_head:   {dp_str}")
 
             global_step += 1
             steps += 1
@@ -852,8 +805,7 @@ def main(args: argparse.Namespace) -> None:
                     {
                         "L_diff": f"{loss_diff.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
-                        "pre": f"{pre_pos_sim - pre_neg_sim:+.3f}",
-                        "post": f"{pos_sim - neg_sim:+.3f}",
+                        "p-n": f"{pos_sim - neg_sim:+.3f}",
                     }
                 )
                 if use_wandb:
@@ -862,12 +814,9 @@ def main(args: argparse.Namespace) -> None:
                             "train/loss_total": loss.item(),
                             "train/loss_diff": loss_diff.item(),
                             "train/loss_ctr": loss_ctr.item(),
-                            "train/pre_pos_sim": pre_pos_sim,
-                            "train/pre_neg_sim": pre_neg_sim,
-                            "train/pre_pos_neg_gap": pre_pos_sim - pre_neg_sim,
-                            "train/post_pos_sim": pos_sim,
-                            "train/post_neg_sim": neg_sim,
-                            "train/post_pos_neg_gap": pos_sim - neg_sim,
+                            "train/pos_sim": pos_sim,
+                            "train/neg_sim": neg_sim,
+                            "train/pos_neg_gap": pos_sim - neg_sim,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                         },
@@ -877,13 +826,11 @@ def main(args: argparse.Namespace) -> None:
             if is_main and args.save_every > 0 and global_step % args.save_every == 0:
                 save_path = Path(args.output_dir) / f"transformer_refiner_step{global_step}.pt"
                 unwrapped = accelerator.unwrap_model(transformer)
-                unwrapped_proj = accelerator.unwrap_model(proj_head)
                 torch.save(
                     {
                         "step": global_step,
                         "epoch": epoch,
                         "transformer_state_dict": unwrapped.state_dict(),
-                        "proj_head_state_dict": unwrapped_proj.state_dict(),
                         "args": vars(args),
                     },
                     save_path,
@@ -918,13 +865,11 @@ def main(args: argparse.Namespace) -> None:
     if is_main:
         final_path = Path(args.output_dir) / "transformer_refiner_final.pt"
         unwrapped = accelerator.unwrap_model(transformer)
-        unwrapped_proj = accelerator.unwrap_model(proj_head)
         torch.save(
             {
                 "step": global_step,
                 "epoch": args.epochs,
                 "transformer_state_dict": unwrapped.state_dict(),
-                "proj_head_state_dict": unwrapped_proj.state_dict(),
                 "args": vars(args),
             },
             final_path,
@@ -978,7 +923,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--text_chunk_size", type=int, default=16,
                    help="Chunk size for text encoder / context_refiner forward pass (controls peak memory)")
     p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for projection head (trained from scratch)")
+    p.add_argument("--lr", type=float, default=1e-3, help="(Deprecated) kept for launch-script compatibility; unused.")
     p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner (pre-trained, fine-tuned)")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_negatives", type=int, default=12, help="InfoNCE negatives per anchor (1:K)")
@@ -994,9 +939,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--contrastive_weight", type=float, default=1.0)
     p.add_argument("--diffusion_weight", type=float, default=3.0, help="Set larger than contrastive as requested")
     p.add_argument("--proj_hidden_dim", type=int, default=512,
-                   help="SimCLR projection head hidden dim (in_dim → hidden_dim → out_dim)")
+                   help="(Deprecated) kept for launch-script compatibility; unused.")
     p.add_argument("--proj_out_dim", type=int, default=256,
-                   help="SimCLR projection head output dim (the space where InfoNCE is computed)")
+                   help="(Deprecated) kept for launch-script compatibility; unused.")
 
     p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--vis_every", type=int, default=500,
