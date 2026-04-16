@@ -219,6 +219,13 @@ def select_source_hidden(hidden_states: tuple[torch.Tensor, ...], args: argparse
     if args.llm_input_mode == "single":
         idx = args.llm_input_layer_idx
         return hidden_states[idx], f"single:{idx}"
+    if args.llm_input_mode == "avg_all":
+        start = 0 if args.avg_all_include_embedding else 1
+        picked = hidden_states[start:]
+        if len(picked) == 0:
+            raise ValueError("avg_all produced empty layer set")
+        stacked = torch.stack([h.float() for h in picked], dim=0)
+        return stacked.mean(dim=0).to(hidden_states[start].dtype), f"avg_all:{start}-{len(hidden_states)-1}"
     start = args.llm_layer_start
     end = args.llm_layer_end
     if end < start:
@@ -662,11 +669,16 @@ def parse_args() -> argparse.Namespace:
         "--llm_input_mode",
         type=str,
         default="single",
-        choices=["single", "avg_range"],
-        help="single: use one hidden layer; avg_range: average a layer range before refiner.",
+        choices=["single", "avg_range", "avg_all"],
+        help="single: use one layer; avg_range: average [start,end]; avg_all: average all transformer layers.",
     )
     p.add_argument("--llm_layer_start", type=int, default=10, help="Start layer idx (inclusive) for avg_range mode.")
     p.add_argument("--llm_layer_end", type=int, default=20, help="End layer idx (inclusive) for avg_range mode.")
+    p.add_argument(
+        "--avg_all_include_embedding",
+        action="store_true",
+        help="In avg_all mode, include hidden_states[0] embedding output in the average.",
+    )
     p.add_argument("--proj_dim", type=int, default=256, help="Output dim for frozen random projection")
     p.add_argument(
         "--prompt_mode",
