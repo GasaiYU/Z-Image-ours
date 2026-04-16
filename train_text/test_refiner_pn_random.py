@@ -161,6 +161,14 @@ def mean_center_and_normalize(x: torch.Tensor) -> torch.Tensor:
     return F.normalize(x, dim=-1)
 
 
+def mean_center_std_and_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Subtract batch mean, divide by batch std, then L2 normalize."""
+    x = x.float()
+    x = x - x.mean(dim=0, keepdim=True)
+    x = x / (x.std(dim=0, keepdim=True, unbiased=False) + eps)
+    return F.normalize(x, dim=-1)
+
+
 def update_stage_metrics(
     metrics: dict[str, dict[str, list[torch.Tensor]]],
     stage_name: str,
@@ -238,9 +246,15 @@ def main(args: argparse.Namespace) -> None:
     all_post_mc = []
     all_post_mc_ap = []
     all_post_mc_an = []
+    all_post_zs = []
+    all_post_zs_ap = []
+    all_post_zs_an = []
     all_post_tok_mc = []
     all_post_tok_mc_ap = []
     all_post_tok_mc_an = []
+    all_post_tok_zs = []
+    all_post_tok_zs_ap = []
+    all_post_tok_zs_an = []
     all_post_rand = []
     all_post_rand_ap = []
     all_post_rand_an = []
@@ -286,6 +300,10 @@ def main(args: argparse.Namespace) -> None:
         ea_post_mc = combined_post_mc[:b]
         ep_post_mc = combined_post_mc[b:2 * b]
         en_post_mc = combined_post_mc[2 * b:]
+        combined_post_zs = mean_center_std_and_normalize(combined_post)
+        ea_post_zs = combined_post_zs[:b]
+        ep_post_zs = combined_post_zs[b:2 * b]
+        en_post_zs = combined_post_zs[2 * b:]
 
         ea_post_rand = random_project_and_normalize(ea_post, rand_proj)
         ep_post_rand = random_project_and_normalize(ep_post, rand_proj)
@@ -298,6 +316,9 @@ def main(args: argparse.Namespace) -> None:
         sim_ap_post_mc = (ea_post_mc * ep_post_mc).sum(dim=-1)
         sim_an_post_mc = (ea_post_mc * en_post_mc).sum(dim=-1)
         pn_post_mc = sim_ap_post_mc - sim_an_post_mc
+        sim_ap_post_zs = (ea_post_zs * ep_post_zs).sum(dim=-1)
+        sim_an_post_zs = (ea_post_zs * en_post_zs).sum(dim=-1)
+        pn_post_zs = sim_ap_post_zs - sim_an_post_zs
 
         sim_ap_post_rand = (ea_post_rand * ep_post_rand).sum(dim=-1)
         sim_an_post_rand = (ea_post_rand * en_post_rand).sum(dim=-1)
@@ -344,10 +365,21 @@ def main(args: argparse.Namespace) -> None:
             tok_sim_ap_post_mc = (a_post_tok_mc * p_post_tok_mc).sum(dim=-1)
             tok_sim_an_post_mc = (a_post_tok_mc * n_post_tok_mc).sum(dim=-1)
             tok_pn_post_mc = tok_sim_ap_post_mc - tok_sim_an_post_mc
+
+            combined_post_tok_zs = mean_center_std_and_normalize(combined_post_tok)
+            a_post_tok_zs = combined_post_tok_zs[:nv]
+            p_post_tok_zs = combined_post_tok_zs[nv : 2 * nv]
+            n_post_tok_zs = combined_post_tok_zs[2 * nv :]
+            tok_sim_ap_post_zs = (a_post_tok_zs * p_post_tok_zs).sum(dim=-1)
+            tok_sim_an_post_zs = (a_post_tok_zs * n_post_tok_zs).sum(dim=-1)
+            tok_pn_post_zs = tok_sim_ap_post_zs - tok_sim_an_post_zs
         else:
             tok_sim_ap_post_mc = torch.empty(0, device=device)
             tok_sim_an_post_mc = torch.empty(0, device=device)
             tok_pn_post_mc = torch.empty(0, device=device)
+            tok_sim_ap_post_zs = torch.empty(0, device=device)
+            tok_sim_an_post_zs = torch.empty(0, device=device)
+            tok_pn_post_zs = torch.empty(0, device=device)
 
         a_post_tok_rand = random_project_and_normalize(a_post_tok[valid_post], rand_proj)
         p_post_tok_rand = random_project_and_normalize(p_post_tok[valid_post], rand_proj)
@@ -363,6 +395,9 @@ def main(args: argparse.Namespace) -> None:
         all_post_mc.append(pn_post_mc.cpu())
         all_post_mc_ap.append(sim_ap_post_mc.cpu())
         all_post_mc_an.append(sim_an_post_mc.cpu())
+        all_post_zs.append(pn_post_zs.cpu())
+        all_post_zs_ap.append(sim_ap_post_zs.cpu())
+        all_post_zs_an.append(sim_an_post_zs.cpu())
         all_post_rand.append(pn_post_rand.cpu())
         all_post_rand_ap.append(sim_ap_post_rand.cpu())
         all_post_rand_an.append(sim_an_post_rand.cpu())
@@ -373,6 +408,9 @@ def main(args: argparse.Namespace) -> None:
             all_post_tok_mc.append(tok_pn_post_mc.cpu())
             all_post_tok_mc_ap.append(tok_sim_ap_post_mc.cpu())
             all_post_tok_mc_an.append(tok_sim_an_post_mc.cpu())
+            all_post_tok_zs.append(tok_pn_post_zs.cpu())
+            all_post_tok_zs_ap.append(tok_sim_ap_post_zs.cpu())
+            all_post_tok_zs_an.append(tok_sim_an_post_zs.cpu())
             all_post_tok_rand.append(tok_pn_post_rand.cpu())
             all_post_tok_rand_ap.append(tok_sim_ap_post_rand.cpu())
             all_post_tok_rand_an.append(tok_sim_an_post_rand.cpu())
@@ -384,12 +422,14 @@ def main(args: argparse.Namespace) -> None:
 
         post_stats = mean_std_min_max(pn_post)
         post_mc_stats = mean_std_min_max(pn_post_mc)
+        post_zs_stats = mean_std_min_max(pn_post_zs)
         post_rand_stats = mean_std_min_max(pn_post_rand)
         post_l2_stats = mean_std_min_max(l2_margin_post)
         print(
             f"[trial {t+1:02d}/{args.trials}] "
             f"post_p-n mean={post_stats[0]:+.6f} std={post_stats[1]:.6f} min={post_stats[2]:+.6f} max={post_stats[3]:+.6f} | "
             f"mc_post_p-n mean={post_mc_stats[0]:+.6f} | "
+            f"zs_post_p-n mean={post_zs_stats[0]:+.6f} | "
             f"rand_post_p-n mean={post_rand_stats[0]:+.6f} | "
             f"post_l2_margin mean={post_l2_stats[0]:+.6f} | "
             f"token_valid post={int(valid_post.sum())}/{b}"
@@ -402,6 +442,9 @@ def main(args: argparse.Namespace) -> None:
     all_post_mc_t = torch.cat(all_post_mc, dim=0)
     all_post_mc_ap_t = torch.cat(all_post_mc_ap, dim=0)
     all_post_mc_an_t = torch.cat(all_post_mc_an, dim=0)
+    all_post_zs_t = torch.cat(all_post_zs, dim=0)
+    all_post_zs_ap_t = torch.cat(all_post_zs_ap, dim=0)
+    all_post_zs_an_t = torch.cat(all_post_zs_an, dim=0)
     all_post_rand_t = torch.cat(all_post_rand, dim=0)
     all_post_rand_ap_t = torch.cat(all_post_rand_ap, dim=0)
     all_post_rand_an_t = torch.cat(all_post_rand_an, dim=0)
@@ -429,6 +472,15 @@ def main(args: argparse.Namespace) -> None:
     print(
         f"POST mc_sim(a,p) mean={all_post_mc_ap_t.mean().item():.6f}  mc_sim(a,n) mean={all_post_mc_an_t.mean().item():.6f}"
     )
+    print("\n=== Mean Centered + /std ===")
+    print(
+        f"POST zs_p-n mean={all_post_zs_t.mean().item():+.6f} std={all_post_zs_t.std().item():.6f} "
+        f"min={all_post_zs_t.min().item():+.6f} max={all_post_zs_t.max().item():+.6f} "
+        f"pos_rate={(all_post_zs_t > 0).float().mean().item() * 100:.2f}%"
+    )
+    print(
+        f"POST zs_sim(a,p) mean={all_post_zs_ap_t.mean().item():.6f}  zs_sim(a,n) mean={all_post_zs_an_t.mean().item():.6f}"
+    )
     print(f"\n=== Frozen random projection (dim={args.proj_dim}) ===")
     print(
         f"POST rand_p-n mean={all_post_rand_t.mean().item():+.6f} std={all_post_rand_t.std().item():.6f} "
@@ -446,6 +498,9 @@ def main(args: argparse.Namespace) -> None:
         post_tok_mc_all = torch.cat(all_post_tok_mc, dim=0)
         post_tok_mc_ap_all = torch.cat(all_post_tok_mc_ap, dim=0)
         post_tok_mc_an_all = torch.cat(all_post_tok_mc_an, dim=0)
+        post_tok_zs_all = torch.cat(all_post_tok_zs, dim=0)
+        post_tok_zs_ap_all = torch.cat(all_post_tok_zs_ap, dim=0)
+        post_tok_zs_an_all = torch.cat(all_post_tok_zs_an, dim=0)
         post_tok_rand_all = torch.cat(all_post_tok_rand, dim=0)
         post_tok_rand_ap_all = torch.cat(all_post_tok_rand_ap, dim=0)
         post_tok_rand_an_all = torch.cat(all_post_tok_rand_an, dim=0)
@@ -467,6 +522,15 @@ def main(args: argparse.Namespace) -> None:
             f"POST mc_token_p-n mean={post_tok_mc_all.mean().item():+.6f} std={post_tok_mc_all.std().item():.6f} "
             f"min={post_tok_mc_all.min().item():+.6f} max={post_tok_mc_all.max().item():+.6f} "
             f"pos_rate={(post_tok_mc_all > 0).float().mean().item() * 100:.2f}%"
+        )
+        print("\n=== Token-level Mean Centered + /std ===")
+        print(
+            f"POST zs_token_sim(a,p) mean={post_tok_zs_ap_all.mean().item():.6f}  zs_token_sim(a,n) mean={post_tok_zs_an_all.mean().item():.6f}"
+        )
+        print(
+            f"POST zs_token_p-n mean={post_tok_zs_all.mean().item():+.6f} std={post_tok_zs_all.std().item():.6f} "
+            f"min={post_tok_zs_all.min().item():+.6f} max={post_tok_zs_all.max().item():+.6f} "
+            f"pos_rate={(post_tok_zs_all > 0).float().mean().item() * 100:.2f}%"
         )
         print(f"\n=== Token-level Frozen random projection (dim={args.proj_dim}) ===")
         print(
