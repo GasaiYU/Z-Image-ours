@@ -40,8 +40,14 @@ TEMPERATURE=${TEMPERATURE:-0.07}
 TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.2}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}   # diffusion on narrow counting data causes rapid collapse; contrastive-only is safe
-APPLY_ZSCORE_BEFORE_LOSS=${APPLY_ZSCORE_BEFORE_LOSS:-true}
+APPLY_ZSCORE_BEFORE_LOSS=${APPLY_ZSCORE_BEFORE_LOSS:-true}   # true / false
 ZSCORE_EPS=${ZSCORE_EPS:-1e-6}
+
+if [ "${APPLY_ZSCORE_BEFORE_LOSS}" = "true" ]; then
+    ZSCORE_FLAG="--apply_zscore_before_loss"
+else
+    ZSCORE_FLAG="--no-apply_zscore_before_loss"
+fi
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
 SAVE_EVERY=${SAVE_EVERY:-200}          # frequent checkpoints to detect collapse early
@@ -83,7 +89,7 @@ accelerate launch \
     --triplet_margin "$TRIPLET_MARGIN" \
     --contrastive_weight "$CONTRASTIVE_WEIGHT" \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
-    --apply_zscore_before_loss "$APPLY_ZSCORE_BEFORE_LOSS" \
+    $ZSCORE_FLAG \
     --zscore_eps "$ZSCORE_EPS" \
     --save_every "$SAVE_EVERY" \
     --vis_every "$VIS_EVERY" \

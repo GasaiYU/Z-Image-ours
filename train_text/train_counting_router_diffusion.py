@@ -113,9 +113,8 @@ class DynamicTokenRouter(nn.Module):
             nn.Linear(mid_dim // 2, self.n_route),
         )
 
-        # Deep-biased init: route to deepest layer in range at t=0
+        # Uniform init: route evenly to all layers at t=0
         nn.init.zeros_(self.router_mlp[-1].bias)
-        self.router_mlp[-1].bias.data[-1] = 5.0
         nn.init.normal_(self.router_mlp[-1].weight, std=0.01)
 
     def forward(
