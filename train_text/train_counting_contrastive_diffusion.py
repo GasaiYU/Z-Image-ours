@@ -217,6 +217,19 @@ def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperatu
     return F.cross_entropy(logits, labels)
 
 
+def dcl_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
+    """
+    Decoupled Contrastive Learning (DCL) loss.
+    Removes the positive sample from the denominator, providing stronger negative gradients
+    even when similarities are high.
+    L = -(ea·ep)/tau + logsumexp((ea·en)/tau)
+    """
+    ea, ep, en = ea.float(), ep.float(), en.float()
+    pos_logits = (ea * ep).sum(dim=-1) / temperature
+    neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1) / temperature
+    return (-pos_logits + torch.logsumexp(neg_logits, dim=-1)).mean()
+
+
 def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[str]:
     """Freeze all transformer params, then unfreeze only context_refiner (text conditioning side)."""
     for p in transformer.parameters():
@@ -745,7 +758,10 @@ def main(args: argparse.Namespace) -> None:
                     ea, ep, en_flat = zscore_then_l2(ea, ep, en_flat, eps=args.zscore_eps)
 
                 en = en_flat.view(B_ctr, K, -1)
-                loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature)
+                if args.loss_type == "dcl":
+                    loss_ctr = dcl_loss(ea, ep, en, temperature=args.temperature)
+                else:
+                    loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature)
                 del ea, ep, en, en_flat
             else:
                 loss_ctr = torch.tensor(0.0, device=device)
@@ -943,6 +959,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner (pre-trained, fine-tuned)")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_negatives", type=int, default=12, help="InfoNCE negatives per anchor (1:K)")
+    p.add_argument("--loss_type", type=str, default="infonce", choices=["infonce", "dcl"], help="Contrastive loss type")
     p.add_argument("--temperature", type=float, default=0.07, help="InfoNCE temperature")
     p.add_argument(
         "--apply_zscore_before_loss",

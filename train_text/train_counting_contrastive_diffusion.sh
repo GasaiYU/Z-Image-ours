@@ -35,6 +35,7 @@ SEED=${SEED:-42}
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
+LOSS_TYPE=${LOSS_TYPE:-dcl}
 TEMPERATURE=${TEMPERATURE:-0.07}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}   # initial weight, linearly decays to 0
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}       # fixed throughout training
@@ -91,6 +92,7 @@ accelerate launch \
     --mixed_precision "$MIXED_PRECISION" \
     --seed "$SEED" \
     --num_negatives "$NUM_NEGATIVES" \
+    --loss_type "$LOSS_TYPE" \
     --temperature "$TEMPERATURE" \
     --contrastive_weight "$CONTRASTIVE_WEIGHT" \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
