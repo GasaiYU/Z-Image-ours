@@ -35,9 +35,7 @@ SEED=${SEED:-42}
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
-LOSS_TYPE=${LOSS_TYPE:-dcl}
 TEMPERATURE=${TEMPERATURE:-0.07}
-TRIPLET_MARGIN=${TRIPLET_MARGIN:-0.2}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}   # diffusion on narrow counting data causes rapid collapse; contrastive-only is safe
 APPLY_ZSCORE_BEFORE_LOSS=${APPLY_ZSCORE_BEFORE_LOSS:-true}   # true / false
@@ -84,9 +82,7 @@ accelerate launch \
     --mixed_precision "$MIXED_PRECISION" \
     --seed "$SEED" \
     --num_negatives "$NUM_NEGATIVES" \
-    --loss_type "$LOSS_TYPE" \
     --temperature "$TEMPERATURE" \
-    --triplet_margin "$TRIPLET_MARGIN" \
     --contrastive_weight "$CONTRASTIVE_WEIGHT" \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
     $ZSCORE_FLAG \
