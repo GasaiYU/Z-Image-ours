@@ -127,6 +127,8 @@ def main(args: argparse.Namespace) -> None:
     special_ids = set(tokenizer.all_special_ids)
     all_pre = []
     all_post = []
+    all_pre_l2 = []
+    all_post_l2 = []
     all_pre_ap = []
     all_pre_an = []
     all_post_ap = []
@@ -172,6 +174,14 @@ def main(args: argparse.Namespace) -> None:
         pn_pre = sim_ap_pre - sim_an_pre
         pn_post = sim_ap_post - sim_an_post
 
+        # Euclidean distance margin: >0 means positive is closer than negative.
+        dist_ap_pre = torch.norm(ea_pre - ep_pre, p=2, dim=-1)
+        dist_an_pre = torch.norm(ea_pre - en_pre, p=2, dim=-1)
+        dist_ap_post = torch.norm(ea_post - ep_post, p=2, dim=-1)
+        dist_an_post = torch.norm(ea_post - en_post, p=2, dim=-1)
+        l2_margin_pre = dist_an_pre - dist_ap_pre
+        l2_margin_post = dist_an_post - dist_ap_post
+
         # Token-level p-n: use anchor target token vs positive same token / negative token.
         a_ids = input_ids[:b]
         p_ids = input_ids[b:2 * b]
@@ -198,6 +208,8 @@ def main(args: argparse.Namespace) -> None:
 
         all_pre.append(pn_pre.cpu())
         all_post.append(pn_post.cpu())
+        all_pre_l2.append(l2_margin_pre.cpu())
+        all_post_l2.append(l2_margin_post.cpu())
         all_pre_ap.append(sim_ap_pre.cpu())
         all_pre_an.append(sim_an_pre.cpu())
         all_post_ap.append(sim_ap_post.cpu())
@@ -209,15 +221,20 @@ def main(args: argparse.Namespace) -> None:
 
         pre_stats = mean_std_min_max(pn_pre)
         post_stats = mean_std_min_max(pn_post)
+        pre_l2_stats = mean_std_min_max(l2_margin_pre)
+        post_l2_stats = mean_std_min_max(l2_margin_post)
         print(
             f"[trial {t+1:02d}/{args.trials}] "
             f"pre_p-n mean={pre_stats[0]:+.6f} std={pre_stats[1]:.6f} min={pre_stats[2]:+.6f} max={pre_stats[3]:+.6f} | "
             f"post_p-n mean={post_stats[0]:+.6f} std={post_stats[1]:.6f} min={post_stats[2]:+.6f} max={post_stats[3]:+.6f} | "
+            f"pre_l2_margin mean={pre_l2_stats[0]:+.6f} post_l2_margin mean={post_l2_stats[0]:+.6f} | "
             f"token_valid pre={int(valid_pre.sum())}/{b} post={int(valid_post.sum())}/{b}"
         )
 
     all_pre_t = torch.cat(all_pre, dim=0)
     all_post_t = torch.cat(all_post, dim=0)
+    all_pre_l2_t = torch.cat(all_pre_l2, dim=0)
+    all_post_l2_t = torch.cat(all_post_l2, dim=0)
     all_pre_ap_t = torch.cat(all_pre_ap, dim=0)
     all_pre_an_t = torch.cat(all_pre_an, dim=0)
     all_post_ap_t = torch.cat(all_post_ap, dim=0)
@@ -233,6 +250,16 @@ def main(args: argparse.Namespace) -> None:
     print(
         f"POST p-n mean={post_all[0]:+.6f} std={post_all[1]:.6f} min={post_all[2]:+.6f} max={post_all[3]:+.6f} "
         f"pos_rate={(all_post_t > 0).float().mean().item() * 100:.2f}%"
+    )
+    print(
+        f"PRE  l2_margin mean={all_pre_l2_t.mean().item():+.6f} std={all_pre_l2_t.std().item():.6f} "
+        f"min={all_pre_l2_t.min().item():+.6f} max={all_pre_l2_t.max().item():+.6f} "
+        f"pos_rate={(all_pre_l2_t > 0).float().mean().item() * 100:.2f}%"
+    )
+    print(
+        f"POST l2_margin mean={all_post_l2_t.mean().item():+.6f} std={all_post_l2_t.std().item():.6f} "
+        f"min={all_post_l2_t.min().item():+.6f} max={all_post_l2_t.max().item():+.6f} "
+        f"pos_rate={(all_post_l2_t > 0).float().mean().item() * 100:.2f}%"
     )
     print(
         f"PRE  sim(a,p) mean={all_pre_ap_t.mean().item():.6f}  sim(a,n) mean={all_pre_an_t.mean().item():.6f}"
