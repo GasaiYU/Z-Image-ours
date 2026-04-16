@@ -215,6 +215,21 @@ def extract_token_features(hidden: torch.Tensor, indices: list[int]) -> tuple[to
     return torch.stack(feats, dim=0), torch.tensor(valid, device=hidden.device, dtype=torch.bool)
 
 
+def select_source_hidden(hidden_states: tuple[torch.Tensor, ...], args: argparse.Namespace) -> tuple[torch.Tensor, str]:
+    if args.llm_input_mode == "single":
+        idx = args.llm_input_layer_idx
+        return hidden_states[idx], f"single:{idx}"
+    start = args.llm_layer_start
+    end = args.llm_layer_end
+    if end < start:
+        raise ValueError(f"Invalid range: llm_layer_end({end}) < llm_layer_start({start})")
+    picked = hidden_states[start : end + 1]
+    if len(picked) == 0:
+        raise ValueError(f"Empty layer range: [{start}, {end}]")
+    stacked = torch.stack([h.float() for h in picked], dim=0)
+    return stacked.mean(dim=0).to(hidden_states[start].dtype), f"avg:{start}-{end}"
+
+
 def main(args: argparse.Namespace) -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -270,6 +285,7 @@ def main(args: argparse.Namespace) -> None:
     all_post_tok_rand_an = []
     stage_metrics: dict[str, dict[str, list[torch.Tensor]]] = {}
     rand_proj = None
+    source_desc = ""
 
     for t in range(args.trials):
         triplets = [build_triplet(args.prompt_mode) for _ in range(args.batch_size)]
@@ -292,7 +308,7 @@ def main(args: argparse.Namespace) -> None:
 
         with torch.no_grad():
             out = text_encoder(input_ids=input_ids, attention_mask=attention_mask.bool(), output_hidden_states=True)
-            source_tok = out.hidden_states[args.llm_input_layer_idx]
+            source_tok, source_desc = select_source_hidden(out.hidden_states, args)
             post_tok, stage_outputs = run_context_refiner(transformer, source_tok, attention_mask)
 
             source_vec = pool_content(source_tok, input_ids, attention_mask, special_ids)
@@ -489,7 +505,7 @@ def main(args: argparse.Namespace) -> None:
     post_all = mean_std_min_max(all_post_t)
 
     print("\n=== Overall ===")
-    print(f"[Source LLM layer idx] {args.llm_input_layer_idx}")
+    print(f"[Source LLM] {source_desc}")
     print(
         f"SRC  p-n mean={src_all[0]:+.6f} std={src_all[1]:.6f} min={src_all[2]:+.6f} max={src_all[3]:+.6f} "
         f"pos_rate={(all_src_t > 0).float().mean().item() * 100:.2f}%"
@@ -642,6 +658,15 @@ def parse_args() -> argparse.Namespace:
         help="Which text_encoder hidden_states layer is fed into refiner. "
              "0=embedding output, 1=first transformer layer, -2=penultimate layer.",
     )
+    p.add_argument(
+        "--llm_input_mode",
+        type=str,
+        default="single",
+        choices=["single", "avg_range"],
+        help="single: use one hidden layer; avg_range: average a layer range before refiner.",
+    )
+    p.add_argument("--llm_layer_start", type=int, default=10, help="Start layer idx (inclusive) for avg_range mode.")
+    p.add_argument("--llm_layer_end", type=int, default=20, help="End layer idx (inclusive) for avg_range mode.")
     p.add_argument("--proj_dim", type=int, default=256, help="Output dim for frozen random projection")
     p.add_argument(
         "--prompt_mode",
