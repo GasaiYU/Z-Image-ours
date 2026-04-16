@@ -640,12 +640,20 @@ def main(args: argparse.Namespace) -> None:
     transformer_dtype = next(transformer.parameters()).dtype
 
     total_steps = args.epochs * len(loader)
-    ctr_decay_steps = args.ctr_decay_steps if args.ctr_decay_steps > 0 else total_steps
+    if args.no_ctr_decay:
+        ctr_decay_steps = -1
+    else:
+        ctr_decay_steps = args.ctr_decay_steps if args.ctr_decay_steps > 0 else total_steps
     if is_main:
-        print(f"[Init] contrastive weight: {args.contrastive_weight:.3f} → 0.0 over {ctr_decay_steps} steps")
+        if args.no_ctr_decay:
+            print(f"[Init] contrastive weight: {args.contrastive_weight:.3f} (fixed, no decay)")
+        else:
+            print(f"[Init] contrastive weight: {args.contrastive_weight:.3f} → 0.0 over {ctr_decay_steps} steps")
         print(f"[Init] diffusion weight: {args.diffusion_weight:.3f} (fixed)")
 
     def get_ctr_weight(step: int) -> float:
+        if args.no_ctr_decay:
+            return args.contrastive_weight
         if step >= ctr_decay_steps:
             return 0.0
         return args.contrastive_weight * (1.0 - step / ctr_decay_steps)
@@ -932,6 +940,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--diffusion_weight", type=float, default=1.0, help="Diffusion loss weight (fixed).")
     p.add_argument("--ctr_decay_steps", type=int, default=0,
                    help="Steps over which contrastive weight decays to 0. 0 = decay over all training steps.")
+    p.add_argument("--no_ctr_decay", action="store_true",
+                   help="Disable contrastive weight decay; keep contrastive_weight fixed throughout training.")
     p.add_argument("--proj_hidden_dim", type=int, default=512,
                    help="(Deprecated) kept for launch-script compatibility; unused.")
     p.add_argument("--proj_out_dim", type=int, default=256,

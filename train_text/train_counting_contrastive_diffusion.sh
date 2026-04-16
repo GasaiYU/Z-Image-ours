@@ -38,7 +38,8 @@ NUM_NEGATIVES=${NUM_NEGATIVES:-12}
 TEMPERATURE=${TEMPERATURE:-0.07}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}   # initial weight, linearly decays to 0
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}       # fixed throughout training
-CTR_DECAY_STEPS=${CTR_DECAY_STEPS:-1000}           # 0 = decay over all training steps
+CTR_DECAY_STEPS=${CTR_DECAY_STEPS:-0}           # 0 = decay over all training steps
+NO_CTR_DECAY=${NO_CTR_DECAY:-false}            # true = keep contrastive weight fixed (no decay)
 APPLY_ZSCORE_BEFORE_LOSS=${APPLY_ZSCORE_BEFORE_LOSS:-true}   # true / false
 ZSCORE_EPS=${ZSCORE_EPS:-1e-6}
 
@@ -46,6 +47,12 @@ if [ "${APPLY_ZSCORE_BEFORE_LOSS}" = "true" ]; then
     ZSCORE_FLAG="--apply_zscore_before_loss"
 else
     ZSCORE_FLAG="--no-apply_zscore_before_loss"
+fi
+
+if [ "${NO_CTR_DECAY}" = "true" ]; then
+    NO_CTR_DECAY_FLAG="--no_ctr_decay"
+else
+    NO_CTR_DECAY_FLAG=""
 fi
 
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
@@ -87,6 +94,7 @@ accelerate launch \
     --contrastive_weight "$CONTRASTIVE_WEIGHT" \
     --diffusion_weight "$DIFFUSION_WEIGHT" \
     --ctr_decay_steps "$CTR_DECAY_STEPS" \
+    $NO_CTR_DECAY_FLAG \
     $ZSCORE_FLAG \
     --zscore_eps "$ZSCORE_EPS" \
     --save_every "$SAVE_EVERY" \
