@@ -19,26 +19,33 @@ import torch.nn.functional as F
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 from utils import load_from_local_dir  # noqa: E402
 
-def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Project text features to transformer dim, then run context_refiner blocks."""
+def run_context_refiner(
+    transformer: torch.nn.Module,
+    token_hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Project to transformer dim and run context_refiner, returning all stage outputs."""
     model = transformer.module if hasattr(transformer, "module") else transformer
     bsz, seq_len, _ = token_hidden.shape
     device = token_hidden.device
     dtype = next(model.parameters()).dtype
     attn_mask = attention_mask.bool()
+    stage_outputs: dict[str, torch.Tensor] = {}
 
     cap_feats = model.cap_embedder(token_hidden.to(dtype))
     cap_feats = cap_feats.clone()
     cap_feats[~attn_mask] = model.cap_pad_token.to(dtype)
+    stage_outputs["cap_embedder"] = cap_feats
 
     pos_ids = torch.zeros((bsz, seq_len, 3), dtype=torch.int32, device=device)
     pos_ids[:, :, 0] = torch.arange(1, seq_len + 1, dtype=torch.int32, device=device).unsqueeze(0).expand(bsz, -1)
     cap_freqs = model.rope_embedder(pos_ids.view(-1, 3)).view(bsz, seq_len, -1)
 
     refined = cap_feats
-    for layer in model.context_refiner:
+    for i, layer in enumerate(model.context_refiner):
         refined = layer(refined, attn_mask, cap_freqs)
-    return refined
+        stage_outputs[f"context_refiner_{i}"] = refined
+    return refined, stage_outputs
 
 
 CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -78,6 +85,28 @@ def pool_content(token_hidden: torch.Tensor, input_ids: torch.Tensor, attention_
 
 def mean_std_min_max(x: torch.Tensor) -> tuple[float, float, float, float]:
     return float(x.mean()), float(x.std()), float(x.min()), float(x.max())
+
+
+def update_stage_metrics(
+    metrics: dict[str, dict[str, list[torch.Tensor]]],
+    stage_name: str,
+    stage_hidden: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    special_ids: set[int],
+    bsz: int,
+) -> None:
+    vec = pool_content(stage_hidden, input_ids, attention_mask, special_ids)
+    ea, ep, en = vec[:bsz], vec[bsz : 2 * bsz], vec[2 * bsz :]
+    sim_ap = (ea * ep).sum(dim=-1)
+    sim_an = (ea * en).sum(dim=-1)
+    pn = sim_ap - sim_an
+
+    if stage_name not in metrics:
+        metrics[stage_name] = {"sim_ap": [], "sim_an": [], "pn": []}
+    metrics[stage_name]["sim_ap"].append(sim_ap.detach().cpu())
+    metrics[stage_name]["sim_an"].append(sim_an.detach().cpu())
+    metrics[stage_name]["pn"].append(pn.detach().cpu())
 
 
 def find_target_idx(tokenizer, input_ids: torch.Tensor, attention_mask: torch.Tensor, target_word: str) -> int:
@@ -135,6 +164,7 @@ def main(args: argparse.Namespace) -> None:
     all_post_an = []
     all_pre_tok = []
     all_post_tok = []
+    stage_metrics: dict[str, dict[str, list[torch.Tensor]]] = {}
 
     for t in range(args.trials):
         triplets = [build_triplet() for _ in range(args.batch_size)]
@@ -158,7 +188,7 @@ def main(args: argparse.Namespace) -> None:
         with torch.no_grad():
             out = text_encoder(input_ids=input_ids, attention_mask=attention_mask.bool(), output_hidden_states=True)
             pre_tok = out.hidden_states[-2]
-            post_tok = run_context_refiner(transformer, pre_tok, attention_mask)
+            post_tok, stage_outputs = run_context_refiner(transformer, pre_tok, attention_mask)
 
             pre_vec = pool_content(pre_tok, input_ids, attention_mask, special_ids)
             post_vec = pool_content(post_tok, input_ids, attention_mask, special_ids)
@@ -218,6 +248,14 @@ def main(args: argparse.Namespace) -> None:
             all_pre_tok.append(tok_pn_pre.cpu())
         if tok_pn_post.numel() > 0:
             all_post_tok.append(tok_pn_post.cpu())
+
+        # Stage-wise sentence-level similarity stats:
+        # text_encoder(-2), cap_embedder, and each context_refiner block output.
+        update_stage_metrics(stage_metrics, "text_encoder_pre_refiner", pre_tok, input_ids, attention_mask, special_ids, b)
+        update_stage_metrics(stage_metrics, "cap_embedder", stage_outputs["cap_embedder"], input_ids, attention_mask, special_ids, b)
+        for k, v in stage_outputs.items():
+            if k.startswith("context_refiner_"):
+                update_stage_metrics(stage_metrics, k, v, input_ids, attention_mask, special_ids, b)
 
         pre_stats = mean_std_min_max(pn_pre)
         post_stats = mean_std_min_max(pn_post)
@@ -283,6 +321,26 @@ def main(args: argparse.Namespace) -> None:
             f"POST token_p-n mean={post_tok_stats[0]:+.6f} std={post_tok_stats[1]:.6f} "
             f"min={post_tok_stats[2]:+.6f} max={post_tok_stats[3]:+.6f} "
             f"pos_rate={(post_tok_all > 0).float().mean().item() * 100:.2f}%"
+        )
+
+    # Layer-wise similarity summary (including cap_embedder)
+    print("\n=== Layer-wise sentence similarity (overall) ===")
+    order = ["text_encoder_pre_refiner", "cap_embedder"] + sorted(
+        [k for k in stage_metrics.keys() if k.startswith("context_refiner_")],
+        key=lambda x: int(x.split("_")[-1]),
+    )
+    for name in order:
+        if name not in stage_metrics:
+            continue
+        sim_ap = torch.cat(stage_metrics[name]["sim_ap"], dim=0)
+        sim_an = torch.cat(stage_metrics[name]["sim_an"], dim=0)
+        pn = torch.cat(stage_metrics[name]["pn"], dim=0)
+        print(
+            f"{name:<28} "
+            f"sim(a,p)={sim_ap.mean().item():.6f}  "
+            f"sim(a,n)={sim_an.mean().item():.6f}  "
+            f"p-n={pn.mean().item():+.6f}  "
+            f"pn_pos_rate={(pn > 0).float().mean().item() * 100:.2f}%"
         )
 
     print("\nfirst 10 PRE p-n :", [round(float(x), 6) for x in all_pre_t[:10]])
