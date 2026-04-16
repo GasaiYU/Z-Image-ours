@@ -8,7 +8,7 @@ NUM_GPUS=${NUM_GPUS:-8}
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/counting_triplets_filtered.jsonl}
 GENERATED_ROOT=${GENERATED_ROOT:-data/generated_images}
-OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_avg10_20_zscore}
+OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_avg10_20_zscore_decay}
 
 # ── Data / model ──────────────────────────────────────────────────────────────
 VERDICT_THRESHOLD=${VERDICT_THRESHOLD:-0.8}
@@ -59,7 +59,7 @@ fi
 SAVE_EVERY=${SAVE_EVERY:-200}          # frequent checkpoints to detect collapse early
 VIS_EVERY=${VIS_EVERY:-50}           # check generation quality every 50 steps
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
-WANDB_RUN=${WANDB_RUN:-counting_text_refiner_linear_encoder}
+WANDB_RUN=${WANDB_RUN:-counting_text_refiner_avg10_20_zscore_decay}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 accelerate launch \
