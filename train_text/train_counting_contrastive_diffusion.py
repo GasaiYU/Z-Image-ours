@@ -99,17 +99,14 @@ def chunked_encode_and_extract(
     source_layer_idx: int,
     source_range_start: int,
     source_range_end: int,
+    target_words: list[str] = None,
+    target_token_weight: float = 1.0,
 ) -> torch.Tensor:
     """
-    Pipeline: encode → refine → content-only mean pooling, chunk by chunk.
+    Pipeline: encode → refine → extract features, chunk by chunk.
 
-    Chat-template special tokens (<|im_start|>, <|im_end|>, role words, etc.) are excluded
-    from the pool so the sentence vector reflects only real content tokens (number + object).
-    This way "seven canes" and "one canes" differ because both the number token AND the
-    "canes" token (which is aware of its neighbour via bidirectional attention) contribute.
-
-    Peak memory = chunk_size × seq_len × D (full-sequence tensors freed after pooling).
-    Returns L2-normalised sentence vectors [N, D].
+    If target_words is provided and target_token_weight != 1.0, applies a higher
+    weight to the specific target token (e.g. "three") during mean pooling.
     """
     special_ids = set(tokenizer.all_special_ids)
     all_feats: list[torch.Tensor] = []
@@ -124,6 +121,14 @@ def chunked_encode_and_extract(
         for sid in special_ids:
             is_special |= (ids == sid)
         content_mask = mask.bool() & ~is_special          # [chunk, seq_len]
+        float_mask = content_mask.float()
+
+        if target_words is not None and target_token_weight != 1.0:
+            chunk_tws = target_words[i : i + chunk_size]
+            tidx = [find_target_idx(tokenizer, ids[j], mask[j], chunk_tws[j]) for j in range(len(ids))]
+            for j, idx in enumerate(tidx):
+                if idx >= 0 and content_mask[j, idx]:
+                    float_mask[j, idx] = target_token_weight
 
         # Step 1: frozen text encoder — use full attention_mask for the encoder itself
         with torch.no_grad():
@@ -141,9 +146,9 @@ def chunked_encode_and_extract(
         h_ref = run_context_refiner(transformer, h, mask)
         del h
 
-        # Step 3: mean pool over content tokens only, then L2-normalise
-        float_mask = content_mask.unsqueeze(-1).float()
-        denom = float_mask.sum(dim=1).clamp(min=1.0)
+        # Step 3: weighted mean pool over content tokens, then L2-normalise
+        float_mask = float_mask.unsqueeze(-1)
+        denom = float_mask.sum(dim=1).clamp(min=1e-6)
         pooled = (h_ref * float_mask).sum(dim=1) / denom
         pooled = F.normalize(pooled.float(), dim=-1)
         del h_ref
@@ -186,8 +191,14 @@ def zscore_then_l2(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     merged = torch.cat([ea.float(), ep.float(), en_flat.float()], dim=0)
-    merged = merged - merged.mean(dim=0, keepdim=True)
-    merged = merged / (merged.std(dim=0, keepdim=True, unbiased=False) + eps)
+    
+    # 核心修改：detach() 阻断梯度！
+    # 这样模型就不能通过改变整体的 mean 和 std 来“作弊”降低 loss 了，
+    # 它必须真刀真枪地在原始空间里把 ea, ep, en 推开。
+    mu = merged.mean(dim=0, keepdim=True).detach()
+    sigma = merged.std(dim=0, keepdim=True, unbiased=False).detach()
+    
+    merged = (merged - mu) / (sigma + eps)
     merged = F.normalize(merged, dim=-1)
     b = ea.shape[0]
     return merged[:b], merged[b : 2 * b], merged[2 * b :]
@@ -688,12 +699,18 @@ def main(args: argparse.Namespace) -> None:
                 p_ids = p_ids.to(device);  p_mask = p_mask.to(device)
                 n_ids = n_ids.to(device);  n_mask = n_mask.to(device)
 
+                a_tws = text_batch["target_word"]
+                p_tws = text_batch["target_word"]
+                flat_neg_tws = [x for negs in text_batch["neg_target_words"] for x in negs]
+
                 ea = chunked_encode_and_extract(
                     text_encoder, transformer, tokenizer, a_ids, a_mask, args.text_chunk_size,
                     source_mode=args.text_source_mode,
                     source_layer_idx=args.text_source_layer_idx,
                     source_range_start=args.text_source_range_start,
                     source_range_end=args.text_source_range_end,
+                    target_words=a_tws,
+                    target_token_weight=args.target_token_weight,
                 )
                 ep = chunked_encode_and_extract(
                     text_encoder, transformer, tokenizer, p_ids, p_mask, args.text_chunk_size,
@@ -701,6 +718,8 @@ def main(args: argparse.Namespace) -> None:
                     source_layer_idx=args.text_source_layer_idx,
                     source_range_start=args.text_source_range_start,
                     source_range_end=args.text_source_range_end,
+                    target_words=p_tws,
+                    target_token_weight=args.target_token_weight,
                 )
                 en_flat = chunked_encode_and_extract(
                     text_encoder, transformer, tokenizer, n_ids, n_mask, args.text_chunk_size,
@@ -708,6 +727,8 @@ def main(args: argparse.Namespace) -> None:
                     source_layer_idx=args.text_source_layer_idx,
                     source_range_start=args.text_source_range_start,
                     source_range_end=args.text_source_range_end,
+                    target_words=flat_neg_tws,
+                    target_token_weight=args.target_token_weight,
                 )
                 del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
 
@@ -928,6 +949,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Apply (x-mean)/std + L2 to [anchor,positive,negative] features before contrastive loss.",
+    )
+    p.add_argument(
+        "--target_token_weight",
+        type=float,
+        default=2.5,
+        help="Weight for the target token during mean pooling (e.g., 2.5). 1.0 means standard mean pooling.",
     )
     p.add_argument("--zscore_eps", type=float, default=1e-6)
 

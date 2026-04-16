@@ -8,7 +8,7 @@ NUM_GPUS=${NUM_GPUS:-8}
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/counting_triplets_filtered.jsonl}
 GENERATED_ROOT=${GENERATED_ROOT:-data/generated_images}
-OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_avg10_20_zscore_decay}
+OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_avg10_20_zscore_decay_target_token}
 
 # ── Data / model ──────────────────────────────────────────────────────────────
 VERDICT_THRESHOLD=${VERDICT_THRESHOLD:-0.8}
@@ -39,8 +39,9 @@ TEMPERATURE=${TEMPERATURE:-0.07}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}   # initial weight, linearly decays to 0
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}       # fixed throughout training
 CTR_DECAY_STEPS=${CTR_DECAY_STEPS:-0}           # 0 = decay over all training steps
-NO_CTR_DECAY=${NO_CTR_DECAY:-false}            # true = keep contrastive weight fixed (no decay)
+NO_CTR_DECAY=${NO_CTR_DECAY:-true}            # true = keep contrastive weight fixed (no decay)
 APPLY_ZSCORE_BEFORE_LOSS=${APPLY_ZSCORE_BEFORE_LOSS:-true}   # true / false
+TARGET_TOKEN_WEIGHT=${TARGET_TOKEN_WEIGHT:-2.5}
 ZSCORE_EPS=${ZSCORE_EPS:-1e-6}
 
 if [ "${APPLY_ZSCORE_BEFORE_LOSS}" = "true" ]; then
@@ -59,7 +60,7 @@ fi
 SAVE_EVERY=${SAVE_EVERY:-200}          # frequent checkpoints to detect collapse early
 VIS_EVERY=${VIS_EVERY:-50}           # check generation quality every 50 steps
 WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
-WANDB_RUN=${WANDB_RUN:-counting_text_refiner_avg10_20_zscore_decay}
+WANDB_RUN=${WANDB_RUN:-counting_text_refiner_avg10_20_zscore_decay_target_token}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 accelerate launch \
@@ -96,6 +97,7 @@ accelerate launch \
     --ctr_decay_steps "$CTR_DECAY_STEPS" \
     $NO_CTR_DECAY_FLAG \
     $ZSCORE_FLAG \
+    --target_token_weight "$TARGET_TOKEN_WEIGHT" \
     --zscore_eps "$ZSCORE_EPS" \
     --save_every "$SAVE_EVERY" \
     --vis_every "$VIS_EVERY" \
