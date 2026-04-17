@@ -431,8 +431,8 @@ class CountingVerdictDataset(Dataset):
             "target_word": s.target_word,
             "pixel_values_w": winner_img,
             "pixel_values_l": loser_img,
-            "pixel_values_p": winner_path,
-            "pixel_values_n": loser_path,
+            "pixel_values_w_path": winner_path,
+            "pixel_values_l_path": loser_path,
         }
 
     def sample_text_batch(self, n: int) -> list[dict[str, Any]]:
@@ -458,6 +458,8 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "target_word": [b["target_word"] for b in batch],
         "pixel_values_w": torch.stack([b["pixel_values_w"] for b in batch], dim=0),
         "pixel_values_l": torch.stack([b["pixel_values_l"] for b in batch], dim=0),
+        "pixel_values_w_path": [b["pixel_values_w_path"] for b in batch],
+        "pixel_values_l_path": [b["pixel_values_l_path"] for b in batch],
     }
 
 
