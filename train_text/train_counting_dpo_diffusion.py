@@ -259,6 +259,16 @@ NUMBER_WORDS = [
 ]
 
 
+def extract_noun(anchor: str, target_word: str) -> str:
+    """
+    Strip the leading number word from an anchor prompt and return the noun phrase.
+    e.g. "three cat trees", "three" -> "cat trees"
+    """
+    tw = target_word.strip().lower()
+    noun = re.sub(r"^" + re.escape(tw) + r"\s+", "", anchor.strip(), flags=re.IGNORECASE).strip()
+    return noun if noun else anchor.strip()
+
+
 def make_anchor_negatives(anchor: str, target_word: str) -> list[tuple[str, str]]:
     tw = target_word.strip().lower()
     negatives: list[tuple[str, str]] = []
@@ -285,6 +295,7 @@ class CountingSample:
     positive_pool: list[str]
     negative_pool: list[str]
     target_word: str
+    noun: str          # noun phrase extracted from anchor (e.g. "cat trees")
     image_paths: list[Path]
 
 
@@ -329,7 +340,7 @@ class CountingVerdictDataset(Dataset):
         image_cache: dict[str, list[Path]] = {}
         same_word_texts: dict[str, set[str]] = defaultdict(set)
         grouped: dict[str, dict[str, Any]] = defaultdict(
-            lambda: {"target_word": "", "positive_pool": set(), "negative_pool": set()}
+            lambda: {"target_word": "", "noun": "", "positive_pool": set(), "negative_pool": set()}
         )
         for obj in rows:
             anchor = obj["anchor"].strip()
@@ -338,6 +349,11 @@ class CountingVerdictDataset(Dataset):
             negative = obj["negative"].strip()
 
             grouped[anchor]["target_word"] = target_word
+            # Use pre-computed noun from the cleaned JSONL when available;
+            # fall back to extract_noun so the dataset still works with the
+            # original (non-cleaned) file.
+            if not grouped[anchor]["noun"]:
+                grouped[anchor]["noun"] = obj.get("noun", "") or extract_noun(anchor, target_word)
             if positive:
                 grouped[anchor]["positive_pool"].add(positive)
                 same_word_texts[target_word].add(positive)
@@ -362,13 +378,21 @@ class CountingVerdictDataset(Dataset):
                     positive_pool=[x for x in item["positive_pool"] if x],
                     negative_pool=[x for x in item["negative_pool"] if x],
                     target_word=tw,
+                    noun=item["noun"],
                     image_paths=image_paths,
                 )
             )
 
+        # noun -> list of sample indices that share the same noun phrase.
+        # Used by _sample_loser to find hard negatives (same object, different count).
+        self.noun_to_indices: dict[str, list[int]] = defaultdict(list)
+        for i, s in enumerate(self.samples):
+            self.noun_to_indices[s.noun].append(i)
+
         print(f"[Dataset] Total counting triplets: {len(rows)}")
         print(f"[Dataset] Unique anchors: {len(grouped)}")
         print(f"[Dataset] Kept with available images: {len(self.samples)}")
+        print(f"[Dataset] Unique nouns: {len(self.noun_to_indices)}")
   
     def _collect_anchor_images(self, anchor: str) -> list[Path]:
         sample_dir = self.generated_root / "counting" / sanitize(anchor)
@@ -433,41 +457,47 @@ class CountingVerdictDataset(Dataset):
 
     def _sample_loser(self, idx: int) -> tuple["Path", "CountingSample"]:
         """
-        Sample a loser (negative) from other anchors in the dataset.
-        Prefers anchors with a different target_word (different number).
-        Every sample in self.samples is guaranteed to have at least one image,
-        so this never fails.
-        """
-        n = len(self.samples)
-        # Try up to 20 times to find a sample with a different target_word
-        current_tw = self.samples[idx].target_word
-        for _ in range(20):
-            neg_idx = random.randrange(n)
-            if neg_idx == idx:
-                continue
-            neg_sample = self.samples[neg_idx]
-            if neg_sample.target_word != current_tw:
-                return random.choice(neg_sample.image_paths), neg_sample
-        # Fallback: any sample that is not the same index
-        for _ in range(20):
-            neg_idx = random.randrange(n)
-            if neg_idx != idx:
-                return random.choice(self.samples[neg_idx].image_paths), self.samples[neg_idx]
-        # Last resort: return winner itself (degenerate but safe)
-        return random.choice(self.samples[idx].image_paths), self.samples[idx]
+        Sample a loser (hard negative) using the noun_to_indices index.
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        """Returns image samples for DPO/CPO loss (includes pixel_values_w and pixel_values_l)."""
+        Priority:
+          1. Same noun, different target_word  →  hardest negative
+             (same object type, wrong count — exactly what DPO should learn to reject)
+          2. Different noun, different target_word  →  easy negative (fallback)
+          3. Different index, any  →  last-resort fallback
+        Every sample in self.samples is guaranteed >= 1 valid image, so this
+        function never fails.
+        """
+        current = self.samples[idx]
+        current_noun = current.noun
+        current_tw = current.target_word
+
+        # ── Priority 1: same noun, different number ────────────────────────────
+        candidates = [
+            i for i in self.noun_to_indices.get(current_noun, [])
+            if i != idx and self.samples[i].target_word != current_tw
+        ]
+        if candidates:
+            neg_idx = random.choice(candidates)
+            neg = self.samples[neg_idx]
+            return random.choice(neg.image_paths), neg
+
+        # No same-noun hard negative found → caller should skip this sample
+        return None, None
+
+    def __getitem__(self, idx: int) -> dict[str, Any] | None:
+        """Returns image samples for DPO/CPO loss (includes pixel_values_w and pixel_values_l).
+        Returns None if no same-noun hard negative exists for this anchor (collate_fn will drop it)."""
         s = self.samples[idx]
-        
+
         # 1. Winner Image: from the current anchor (score > threshold guaranteed)
         winner_path = random.choice(s.image_paths)
         winner_img = self.image_tf(Image.open(winner_path).convert("RGB"))
-        
-        # 2. Loser Image: from a different anchor with a different count word.
-        #    All images in self.samples already passed score > threshold, so no
-        #    need to re-check; this also guarantees we always find a loser.
+
+        # 2. Loser Image: must be same noun, different count (hard negative).
+        #    If no such anchor exists, skip this sample entirely.
         loser_path, _loser_sample = self._sample_loser(idx)
+        if loser_path is None:
+            return None
         loser_img = self.image_tf(Image.open(loser_path).convert("RGB"))
 
         return {
@@ -496,7 +526,11 @@ class CountingVerdictDataset(Dataset):
 
 
 def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate image batch (for DPO/CPO loss)."""
+    """Collate image batch (for DPO/CPO loss).
+    Drops None entries returned by __getitem__ when no hard negative was found."""
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return {}
     return {
         "anchor": [b["anchor"] for b in batch],
         "target_word": [b["target_word"] for b in batch],
@@ -701,6 +735,9 @@ def main(args: argparse.Namespace) -> None:
         steps = 0
 
         for batch in pbar:
+            # Skip batches where every sample lacked a same-noun hard negative
+            if not batch:
+                continue
             # ── Contrastive loss (large text-only batch, no images) ──────────────
             if args.contrastive_weight > 0:
                 text_items = dataset.sample_text_batch(args.contrastive_batch_size)
