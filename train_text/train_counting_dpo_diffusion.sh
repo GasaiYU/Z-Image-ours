@@ -65,16 +65,6 @@ else
     GRADIENT_CHECKPOINTING_FLAG=""
 fi
 
-# ── Recon debug (optional) ────────────────────────────────────────────────────
-RECON_TEST_EVERY=${RECON_TEST_EVERY:-0}
-RECON_TEST_SAVE_IMAGES=${RECON_TEST_SAVE_IMAGES:-false}
-
-if [ "${RECON_TEST_SAVE_IMAGES}" = "true" ]; then
-    RECON_TEST_SAVE_IMAGES_FLAG="--recon_test_save_images"
-else
-    RECON_TEST_SAVE_IMAGES_FLAG=""
-fi
-
 # ── Logging / checkpoints ─────────────────────────────────────────────────────
 SAVE_EVERY=${SAVE_EVERY:-200}
 VIS_EVERY=${VIS_EVERY:-50}
@@ -135,8 +125,6 @@ accelerate launch \
     $GRADIENT_CHECKPOINTING_FLAG \
     --target_token_weight "$TARGET_TOKEN_WEIGHT" \
     --zscore_eps "$ZSCORE_EPS" \
-    --recon_test_every "$RECON_TEST_EVERY" \
-    $RECON_TEST_SAVE_IMAGES_FLAG \
     --save_every "$SAVE_EVERY" \
     --vis_every "$VIS_EVERY" \
     $USE_CHAT_TEMPLATE_FLAG \

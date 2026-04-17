@@ -1,6 +1,5 @@
 import argparse
 import json
-import math
 import os
 import random
 import re
@@ -28,30 +27,6 @@ except ImportError:
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 from utils import load_from_local_dir  # noqa: E402
 from zimage.pipeline import generate as pipeline_generate  # noqa: E402
-
-
-def decode_latents_to_pixels(vae, latents: torch.Tensor) -> torch.Tensor:
-    latents = latents / vae.config.scaling_factor
-    z = vae.post_quant_conv(latents) if vae.post_quant_conv is not None else latents
-    x = vae.decoder(z)
-    return (x.float() / 2.0 + 0.5).clamp(0.0, 1.0)
-
-
-def tensor_to_pil_rgb(x: torch.Tensor) -> Image.Image:
-    arr = (x.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).round().astype("uint8")
-    return Image.fromarray(arr)
-
-
-def save_recon_triplet(path: Path, x_in: torch.Tensor, x_mean: torch.Tensor, x_sample: torch.Tensor) -> None:
-    in_img = tensor_to_pil_rgb(x_in)
-    mean_img = tensor_to_pil_rgb(x_mean)
-    sample_img = tensor_to_pil_rgb(x_sample)
-    w, h = in_img.size
-    canvas = Image.new("RGB", (w * 3, h))
-    canvas.paste(in_img, (0, 0))
-    canvas.paste(mean_img, (w, 0))
-    canvas.paste(sample_img, (w * 2, 0))
-    canvas.save(path)
 
 
 def sanitize(text: str, maxlen: int = 80) -> str:
@@ -598,11 +573,9 @@ def main(args: argparse.Namespace) -> None:
     transformer, optimizer, loader = accelerator.prepare(transformer, optimizer, loader)
 
     vis_dir = Path(args.output_dir) / "vis"
-    recon_dir = Path(args.output_dir) / "recon_debug"
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
         vis_dir.mkdir(parents=True, exist_ok=True)
-        recon_dir.mkdir(parents=True, exist_ok=True)
 
     VIS_PROMPTS = [
         "five apples on a table",
@@ -786,7 +759,6 @@ def main(args: argparse.Namespace) -> None:
                 std_w = torch.exp(0.5 * log_var_w.clamp(-30, 20))
                 latents_w = mean_w + std_w * torch.randn_like(mean_w)
                 latents_w = latents_w * vae.config.scaling_factor
-                latents_w_mean = mean_w * vae.config.scaling_factor
 
                 # Encode loser
                 h_l = vae.encoder(pixel_values_l)
@@ -795,42 +767,6 @@ def main(args: argparse.Namespace) -> None:
                 std_l = torch.exp(0.5 * log_var_l.clamp(-30, 20))
                 latents_l = mean_l + std_l * torch.randn_like(mean_l)
                 latents_l = latents_l * vae.config.scaling_factor
-
-            if (
-                args.recon_test_every > 0
-                and is_main
-                and global_step % args.recon_test_every == 0
-            ):
-                with torch.no_grad():
-                    x_in = ((pixel_values_w.float() / 2.0) + 0.5).clamp(0.0, 1.0)
-                    x_recon_mean = decode_latents_to_pixels(vae, latents_w_mean)
-                    x_recon_sample = decode_latents_to_pixels(vae, latents_w)
-                    mse_mean = F.mse_loss(x_recon_mean, x_in).item()
-                    mse_sample = F.mse_loss(x_recon_sample, x_in).item()
-                    psnr_mean = -10.0 * math.log10(mse_mean + 1e-8)
-                    psnr_sample = -10.0 * math.log10(mse_sample + 1e-8)
-                    print(
-                        f"[ReconTest step={global_step}] "
-                        f"MSE(mean)={mse_mean:.6f} PSNR(mean)={psnr_mean:.2f}dB | "
-                        f"MSE(sample)={mse_sample:.6f} PSNR(sample)={psnr_sample:.2f}dB"
-                    )
-                    if use_wandb:
-                        wandb.log(
-                            {
-                                "recon/mse_mean": mse_mean,
-                                "recon/mse_sample": mse_sample,
-                                "recon/psnr_mean": psnr_mean,
-                                "recon/psnr_sample": psnr_sample,
-                            },
-                            step=global_step,
-                        )
-                    if args.recon_test_save_images:
-                        save_recon_triplet(
-                            recon_dir / f"step{global_step:06d}.png",
-                            x_in[0],
-                            x_recon_mean[0],
-                            x_recon_sample[0],
-                        )
 
             # Shared noise and sigma for fair comparison
             noise = torch.randn_like(latents_w)
@@ -1045,8 +981,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"],
                    help="Accelerate mixed precision mode")
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--recon_test_every", type=int, default=0, help="Run VAE reconstruction test every N steps (0 disables).")
-    p.add_argument("--recon_test_save_images", action="store_true", help="Save [input|mean-recon|sample-recon] debug strips during reconstruction tests.")
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default="z-image-counting")
     p.add_argument("--wandb_run", type=str, default="")
