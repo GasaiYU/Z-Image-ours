@@ -36,11 +36,11 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-true}
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 NUM_NEGATIVES=${NUM_NEGATIVES:-12}
-LOSS_TYPE=${LOSS_TYPE:-dcl}
+LOSS_TYPE=${LOSS_TYPE:-infonce}
 TEMPERATURE=${TEMPERATURE:-0.07}
 CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}
 DIFFUSION_WEIGHT=${DIFFUSION_WEIGHT:-1.0}
-BETA_DPO=${BETA_DPO:-0.1}
+BETA_DPO=${BETA_DPO:-0.3}
 CTR_DECAY_STEPS=${CTR_DECAY_STEPS:-0}
 NO_CTR_DECAY=${NO_CTR_DECAY:-true}
 APPLY_ZSCORE_BEFORE_LOSS=${APPLY_ZSCORE_BEFORE_LOSS:-true}
