@@ -431,6 +431,8 @@ class CountingVerdictDataset(Dataset):
             "target_word": s.target_word,
             "pixel_values_w": winner_img,
             "pixel_values_l": loser_img,
+            "pixel_values_p": winner_path,
+            "pixel_values_n": loser_path,
         }
 
     def sample_text_batch(self, n: int) -> list[dict[str, Any]]:
