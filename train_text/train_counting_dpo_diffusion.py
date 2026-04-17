@@ -1,23 +1,7 @@
-"""
-Train counting-aware transformer refiners with joint losses:
-1) Counting-token contrastive loss (InfoNCE, 1 positive : K negatives)
-2) Diffusion denoising loss
-
-Losses are decoupled:
-- Diffusion loss: small image batch (batch_size, GPU-memory bound)
-- Contrastive loss: large text-only batch (contrastive_batch_size, very cheap, no images)
-
-Key constraints:
-- Only train transformer context_refiner layers.
-- Data source: data/train_triplets/counting_triplets_filtered.jsonl
-- The JSONL is assumed pre-filtered; uses all images under
-  data/generated_images/counting/<sanitized_anchor>/
-"""
-
 import argparse
 import json
+import math
 import os
-
 import random
 import re
 import sys
@@ -44,6 +28,30 @@ except ImportError:
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 from utils import load_from_local_dir  # noqa: E402
 from zimage.pipeline import generate as pipeline_generate  # noqa: E402
+
+
+def decode_latents_to_pixels(vae, latents: torch.Tensor) -> torch.Tensor:
+    latents = latents / vae.config.scaling_factor
+    z = vae.post_quant_conv(latents) if vae.post_quant_conv is not None else latents
+    x = vae.decoder(z)
+    return (x.float() / 2.0 + 0.5).clamp(0.0, 1.0)
+
+
+def tensor_to_pil_rgb(x: torch.Tensor) -> Image.Image:
+    arr = (x.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255.0).round().astype("uint8")
+    return Image.fromarray(arr)
+
+
+def save_recon_triplet(path: Path, x_in: torch.Tensor, x_mean: torch.Tensor, x_sample: torch.Tensor) -> None:
+    in_img = tensor_to_pil_rgb(x_in)
+    mean_img = tensor_to_pil_rgb(x_mean)
+    sample_img = tensor_to_pil_rgb(x_sample)
+    w, h = in_img.size
+    canvas = Image.new("RGB", (w * 3, h))
+    canvas.paste(in_img, (0, 0))
+    canvas.paste(mean_img, (w, 0))
+    canvas.paste(sample_img, (w * 2, 0))
+    canvas.save(path)
 
 
 def sanitize(text: str, maxlen: int = 80) -> str:
@@ -102,12 +110,6 @@ def chunked_encode_and_extract(
     target_words: list[str] = None,
     target_token_weight: float = 1.0,
 ) -> torch.Tensor:
-    """
-    Pipeline: encode → refine → extract features, chunk by chunk.
-
-    If target_words is provided and target_token_weight != 1.0, applies a higher
-    weight to the specific target token (e.g. "three") during mean pooling.
-    """
     special_ids = set(tokenizer.all_special_ids)
     all_feats: list[torch.Tensor] = []
     N = input_ids.shape[0]
@@ -116,11 +118,10 @@ def chunked_encode_and_extract(
         ids  = input_ids[i : i + chunk_size]
         mask = attention_mask[i : i + chunk_size]
 
-        # Content mask: real token (mask==1) AND not a special token
         is_special = torch.zeros_like(ids, dtype=torch.bool)
         for sid in special_ids:
             is_special |= (ids == sid)
-        content_mask = mask.bool() & ~is_special          # [chunk, seq_len]
+        content_mask = mask.bool() & ~is_special
         float_mask = content_mask.float()
 
         if target_words is not None and target_token_weight != 1.0:
@@ -130,7 +131,6 @@ def chunked_encode_and_extract(
                 if idx >= 0 and content_mask[j, idx]:
                     float_mask[j, idx] = target_token_weight
 
-        # Step 1: frozen text encoder — use full attention_mask for the encoder itself
         with torch.no_grad():
             out = text_encoder(input_ids=ids, attention_mask=mask.bool(), output_hidden_states=True)
         h = select_text_source_hidden(
@@ -142,11 +142,9 @@ def chunked_encode_and_extract(
         ).detach().clone()
         del out
 
-        # Step 2: context_refiner — trainable, gradients flow; full mask for padding
         h_ref = run_context_refiner(transformer, h, mask)
         del h
 
-        # Step 3: weighted mean pool over content tokens, then L2-normalise
         float_mask = float_mask.unsqueeze(-1)
         denom = float_mask.sum(dim=1).clamp(min=1e-6)
         pooled = (h_ref * float_mask).sum(dim=1) / denom
@@ -192,9 +190,6 @@ def zscore_then_l2(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     merged = torch.cat([ea.float(), ep.float(), en_flat.float()], dim=0)
     
-    # 核心修改：detach() 阻断梯度！
-    # 这样模型就不能通过改变整体的 mean 和 std 来“作弊”降低 loss 了，
-    # 它必须真刀真枪地在原始空间里把 ea, ep, en 推开。
     mu = merged.mean(dim=0, keepdim=True).detach()
     sigma = merged.std(dim=0, keepdim=True, unbiased=False).detach()
     
@@ -205,25 +200,15 @@ def zscore_then_l2(
 
 
 def infonce_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
-    """
-    InfoNCE with one positive and K negatives per anchor.
-    ea: [B, D], ep: [B, D], en: [B, K, D]
-    """
     ea, ep, en = ea.float(), ep.float(), en.float()
-    pos_logits = (ea * ep).sum(dim=-1, keepdim=True)          # [B, 1]
-    neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1)           # [B, K]
+    pos_logits = (ea * ep).sum(dim=-1, keepdim=True)
+    neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1)
     logits = torch.cat([pos_logits, neg_logits], dim=1) / temperature
     labels = torch.zeros(ea.shape[0], dtype=torch.long, device=ea.device)
     return F.cross_entropy(logits, labels)
 
 
 def dcl_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: float) -> torch.Tensor:
-    """
-    Decoupled Contrastive Learning (DCL) loss.
-    Removes the positive sample from the denominator, providing stronger negative gradients
-    even when similarities are high.
-    L = -(ea·ep)/tau + logsumexp((ea·en)/tau)
-    """
     ea, ep, en = ea.float(), ep.float(), en.float()
     pos_logits = (ea * ep).sum(dim=-1) / temperature
     neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1) / temperature
@@ -231,7 +216,6 @@ def dcl_loss(ea: torch.Tensor, ep: torch.Tensor, en: torch.Tensor, temperature: 
 
 
 def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[str]:
-    """Freeze all transformer params, then unfreeze only context_refiner (text conditioning side)."""
     for p in transformer.parameters():
         p.requires_grad_(False)
 
@@ -250,7 +234,6 @@ def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[st
 
 
 def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Project text features to transformer dim, then run context_refiner blocks."""
     model = transformer.module if hasattr(transformer, "module") else transformer
     bsz, seq_len, _ = token_hidden.shape
     device = token_hidden.device
@@ -272,12 +255,6 @@ def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor
 
 
 def make_anchor_variants(anchor: str) -> list[str]:
-    """
-    Generate template rewrites of the same anchor (same number + same object, different phrasing).
-    These are used as positives for contrastive learning, replacing cross-anchor positives.
-    All variants share the same semantic content, so context_refiner pollution from
-    the object is symmetric between anchor and positive — much easier to pull together.
-    """
     base = anchor.strip()
     candidates = [
         base,
@@ -308,14 +285,6 @@ NUMBER_WORDS = [
 
 
 def make_anchor_negatives(anchor: str, target_word: str) -> list[tuple[str, str]]:
-    """
-    Generate synthetic hard negatives by replacing the number word in the anchor
-    with every other number word, then expanding each with template variants.
-    Returns list of (neg_text, neg_target_word).
-
-    9 number substitutions × up to 10 templates = up to 90 unique negatives,
-    so any num_negatives ≤ 90 can be satisfied without repetition.
-    """
     tw = target_word.strip().lower()
     negatives: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -323,7 +292,7 @@ def make_anchor_negatives(anchor: str, target_word: str) -> list[tuple[str, str]
         if num == tw:
             continue
         neg_base = anchor.replace(target_word, num, 1)
-        if neg_base == anchor:          # replacement didn't happen (word not found)
+        if neg_base == anchor:
             continue
         for variant in make_anchor_variants(neg_base):
             key = variant.strip().lower()
@@ -336,10 +305,10 @@ def make_anchor_negatives(anchor: str, target_word: str) -> list[tuple[str, str]
 @dataclass
 class CountingSample:
     anchor: str
-    anchor_variants: list[str]          # template rewrites of anchor (used as positives)
-    synthetic_negatives: list[tuple[str, str]]  # (neg_text, neg_target_word) — same object, diff number
-    positive_pool: list[str]            # kept for reference only
-    negative_pool: list[str]            # kept for reference only
+    anchor_variants: list[str]
+    synthetic_negatives: list[tuple[str, str]]
+    positive_pool: list[str]
+    negative_pool: list[str]
     target_word: str
     image_paths: list[Path]
 
@@ -442,11 +411,6 @@ class CountingVerdictDataset(Dataset):
         return len(self.samples)
 
     def _sample_negatives(self, synthetic_negatives: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
-        """Return (neg_texts, neg_target_words) sampled from synthetic hard negatives.
-
-        Synthetic negatives are generated by replacing the anchor's number word with
-        every other number word — guaranteed same object, different number.
-        """
         pool = synthetic_negatives
         if not pool:
             return [], []
@@ -457,31 +421,44 @@ class CountingVerdictDataset(Dataset):
         return [t for t, _ in chosen], [tw for _, tw in chosen]
 
     def _sample_anchor_positive(self, anchor: str, variants: list[str]) -> str:
-        """
-        Sample a template rewrite of the same anchor as the positive.
-        Positive shares the same number word AND object as the anchor — only phrasing differs.
-        This ensures context_refiner's bidirectional object-context pollution is symmetric
-        between anchor and positive, making them naturally easier to pull together.
-        """
         pool = [v for v in variants if v.strip().lower() != anchor.strip().lower()]
         if not pool:
             return anchor
         return random.choice(pool)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        """Returns one image sample for diffusion loss (includes pixel_values)."""
+        """Returns image samples for DPO/CPO loss (includes pixel_values_w and pixel_values_l)."""
         s = self.samples[idx]
-        image_path = random.choice(s.image_paths)
-        image = Image.open(image_path).convert("RGB")
-        pixel_values = self.image_tf(image)
+        
+        # 1. Winner Image
+        winner_path = random.choice(s.image_paths)
+        winner_img = self.image_tf(Image.open(winner_path).convert("RGB"))
+        
+        # 2. Loser Image
+        loser_img = None
+        neg_pool = random.sample(s.synthetic_negatives, len(s.synthetic_negatives))
+        for neg_text, _ in neg_pool:
+            neg_dir = self.generated_root / "counting" / sanitize(neg_text)
+            if neg_dir.exists():
+                valid_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+                valid_imgs = [p for p in neg_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_suffixes]
+                if valid_imgs:
+                    loser_path = random.choice(valid_imgs)
+                    loser_img = self.image_tf(Image.open(loser_path).convert("RGB"))
+                    break
+                    
+        if loser_img is None:
+            # Fallback if no valid negative image is found
+            loser_img = winner_img
+
         return {
             "anchor": s.anchor,
             "target_word": s.target_word,
-            "pixel_values": pixel_values,
+            "pixel_values_w": winner_img,
+            "pixel_values_l": loser_img,
         }
 
     def sample_text_batch(self, n: int) -> list[dict[str, Any]]:
-        """Sample n text-only items for contrastive loss (no image loading)."""
         chosen = random.choices(self.samples, k=n)
         items = []
         for s in chosen:
@@ -498,16 +475,16 @@ class CountingVerdictDataset(Dataset):
 
 
 def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate image batch (for diffusion loss). No text fields needed here."""
+    """Collate image batch (for DPO/CPO loss)."""
     return {
         "anchor": [b["anchor"] for b in batch],
         "target_word": [b["target_word"] for b in batch],
-        "pixel_values": torch.stack([b["pixel_values"] for b in batch], dim=0),
+        "pixel_values_w": torch.stack([b["pixel_values_w"] for b in batch], dim=0),
+        "pixel_values_l": torch.stack([b["pixel_values_l"] for b in batch], dim=0),
     }
 
 
 def collate_text_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate text-only batch (for contrastive loss)."""
     return {
         "anchor": [b["anchor"] for b in items],
         "positive": [b["positive"] for b in items],
@@ -547,7 +524,6 @@ def main(args: argparse.Namespace) -> None:
         )
         print(f"[WandB] Run: {wandb.run.url}")
 
-    # Load all components on CPU first to save GPU memory during setup
     components = load_from_local_dir(
         args.model_dir,
         device="cpu",
@@ -577,7 +553,6 @@ def main(args: argparse.Namespace) -> None:
             if is_main:
                 print("[Init] Warning: transformer does not support enable_gradient_checkpointing().")
 
-    # Get transformer hidden dim before accelerator wraps it
     _raw_transformer = transformer.module if hasattr(transformer, "module") else transformer
     _transformer_dim = _raw_transformer.dim
 
@@ -620,15 +595,15 @@ def main(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
     )
 
-    # accelerate wraps transformer (trainable) + optimizer + loader
     transformer, optimizer, loader = accelerator.prepare(transformer, optimizer, loader)
 
     vis_dir = Path(args.output_dir) / "vis"
+    recon_dir = Path(args.output_dir) / "recon_debug"
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
         vis_dir.mkdir(parents=True, exist_ok=True)
+        recon_dir.mkdir(parents=True, exist_ok=True)
 
-    # Fixed prompts for periodic visualization
     VIS_PROMPTS = [
         "five apples on a table",
         "seven birds on a wire",
@@ -637,13 +612,11 @@ def main(args: argparse.Namespace) -> None:
     ]
 
     def visualize(step: int) -> None:
-        """Generate images with current weights and save/log them (main process only)."""
         if not is_main:
             return
         unwrapped = accelerator.unwrap_model(transformer)
         unwrapped.eval()
         
-        # Use a fixed generator for visualization so noise is exactly the same every time
         gen = torch.Generator(device=device)
         if args.seed is not None:
             gen.manual_seed(args.seed + 2026)
@@ -686,6 +659,7 @@ def main(args: argparse.Namespace) -> None:
         else:
             print(f"[Init] contrastive weight: {args.contrastive_weight:.3f} → 0.0 over {ctr_decay_steps} steps")
         print(f"[Init] diffusion weight: {args.diffusion_weight:.3f} (fixed)")
+        print(f"[Init] DPO beta: {args.beta_dpo:.3f}")
 
     def get_ctr_weight(step: int) -> float:
         if args.no_ctr_decay:
@@ -694,7 +668,6 @@ def main(args: argparse.Namespace) -> None:
             return 0.0
         return args.contrastive_weight * (1.0 - step / ctr_decay_steps)
 
-    # Baseline visualization before any training
     if args.vis_every > 0:
         visualize(0)
 
@@ -702,7 +675,7 @@ def main(args: argparse.Namespace) -> None:
         transformer.train()
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         running_total = 0.0
-        running_diff = 0.0
+        running_dpo = 0.0
         running_ctr = 0.0
         steps = 0
 
@@ -785,8 +758,7 @@ def main(args: argparse.Namespace) -> None:
                 B_ctr = args.contrastive_batch_size
                 K = args.num_negatives
 
-            # ── Diffusion loss (small image batch, GPU-memory bound) ─────────────
-            # Use anchor text from the image batch for diffusion conditioning
+            # ── DPO / CPO loss (small image batch, GPU-memory bound) ─────────────
             diff_anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in batch["anchor"]]
             da_ids, da_mask = tokenize_texts(tokenizer, diff_anchor_texts, args.max_length)
             da_ids = da_ids.to(device)
@@ -803,34 +775,95 @@ def main(args: argparse.Namespace) -> None:
                 ).detach().clone()
                 del da_out
 
-            pixel_values = batch["pixel_values"].to(device, dtype=vae.dtype)
-            with torch.no_grad():
-                h = vae.encoder(pixel_values)
-                moments = vae.quant_conv(h) if vae.quant_conv is not None else h
-                mean, log_var = moments.chunk(2, dim=1)
-                std = torch.exp(0.5 * log_var.clamp(-30, 20))
-                latents = mean + std * torch.randn_like(mean)
-                latents = latents * vae.config.scaling_factor
+            pixel_values_w = batch["pixel_values_w"].to(device, dtype=vae.dtype)
+            pixel_values_l = batch["pixel_values_l"].to(device, dtype=vae.dtype)
 
-            noise = torch.randn_like(latents)
-            sigma = torch.rand((latents.shape[0],), device=device, dtype=latents.dtype)
+            with torch.no_grad():
+                # Encode winner
+                h_w = vae.encoder(pixel_values_w)
+                moments_w = vae.quant_conv(h_w) if vae.quant_conv is not None else h_w
+                mean_w, log_var_w = moments_w.chunk(2, dim=1)
+                std_w = torch.exp(0.5 * log_var_w.clamp(-30, 20))
+                latents_w = mean_w + std_w * torch.randn_like(mean_w)
+                latents_w = latents_w * vae.config.scaling_factor
+                latents_w_mean = mean_w * vae.config.scaling_factor
+
+                # Encode loser
+                h_l = vae.encoder(pixel_values_l)
+                moments_l = vae.quant_conv(h_l) if vae.quant_conv is not None else h_l
+                mean_l, log_var_l = moments_l.chunk(2, dim=1)
+                std_l = torch.exp(0.5 * log_var_l.clamp(-30, 20))
+                latents_l = mean_l + std_l * torch.randn_like(mean_l)
+                latents_l = latents_l * vae.config.scaling_factor
+
+            if (
+                args.recon_test_every > 0
+                and is_main
+                and global_step % args.recon_test_every == 0
+            ):
+                with torch.no_grad():
+                    x_in = ((pixel_values_w.float() / 2.0) + 0.5).clamp(0.0, 1.0)
+                    x_recon_mean = decode_latents_to_pixels(vae, latents_w_mean)
+                    x_recon_sample = decode_latents_to_pixels(vae, latents_w)
+                    mse_mean = F.mse_loss(x_recon_mean, x_in).item()
+                    mse_sample = F.mse_loss(x_recon_sample, x_in).item()
+                    psnr_mean = -10.0 * math.log10(mse_mean + 1e-8)
+                    psnr_sample = -10.0 * math.log10(mse_sample + 1e-8)
+                    print(
+                        f"[ReconTest step={global_step}] "
+                        f"MSE(mean)={mse_mean:.6f} PSNR(mean)={psnr_mean:.2f}dB | "
+                        f"MSE(sample)={mse_sample:.6f} PSNR(sample)={psnr_sample:.2f}dB"
+                    )
+                    if use_wandb:
+                        wandb.log(
+                            {
+                                "recon/mse_mean": mse_mean,
+                                "recon/mse_sample": mse_sample,
+                                "recon/psnr_mean": psnr_mean,
+                                "recon/psnr_sample": psnr_sample,
+                            },
+                            step=global_step,
+                        )
+                    if args.recon_test_save_images:
+                        save_recon_triplet(
+                            recon_dir / f"step{global_step:06d}.png",
+                            x_in[0],
+                            x_recon_mean[0],
+                            x_recon_sample[0],
+                        )
+
+            # Shared noise and sigma for fair comparison
+            noise = torch.randn_like(latents_w)
+            sigma = torch.rand((latents_w.shape[0],), device=device, dtype=latents_w.dtype)
             sigma_b = sigma.view(-1, 1, 1, 1)
-            noisy_latents = (1.0 - sigma_b) * latents + sigma_b * noise
-            target = latents - noise
+            
+            noisy_w = (1.0 - sigma_b) * latents_w + sigma_b * noise
+            target_w = latents_w - noise
+            
+            noisy_l = (1.0 - sigma_b) * latents_l + sigma_b * noise
+            target_l = latents_l - noise
 
             t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
-            lat_list = [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_latents]
             cap_feats = [da_h[i][da_mask[i].bool()].to(dtype=transformer_dtype) for i in range(da_h.shape[0])]
 
-            pred_list = transformer(lat_list, t_norm, cap_feats)[0]
-            pred = torch.stack(pred_list, dim=0).squeeze(2).float()
+            # Forward pass Winner
+            pred_w_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w], t_norm, cap_feats)[0]
+            pred_w = torch.stack(pred_w_list, dim=0).squeeze(2).float()
+            loss_w = F.mse_loss(pred_w, target_w.float(), reduction="none").mean(dim=[1,2,3])
 
-            loss_diff = F.mse_loss(pred.float(), target.float(), reduction="mean")
+            # Forward pass Loser
+            pred_l_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l], t_norm, cap_feats)[0]
+            pred_l = torch.stack(pred_l_list, dim=0).squeeze(2).float()
+            loss_l = F.mse_loss(pred_l, target_l.float(), reduction="none").mean(dim=[1,2,3])
+
+            # CPO Loss
+            loss_dpo = -F.logsigmoid(args.beta_dpo * (loss_l - loss_w)).mean()
+
             ctr_w = get_ctr_weight(global_step)
-            loss = args.diffusion_weight * loss_diff + ctr_w * loss_ctr
+            loss = args.diffusion_weight * loss_dpo + ctr_w * loss_ctr
 
             if global_step == 0 and is_main:
-                print(f"[Pretrained baseline] L_diff={loss_diff.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
+                print(f"[Pretrained baseline] L_dpo={loss_dpo.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
                       f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
                       f"p-n={pos_sim - neg_sim:+.4f}  "
                       f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
@@ -844,13 +877,13 @@ def main(args: argparse.Namespace) -> None:
             global_step += 1
             steps += 1
             running_total += loss.item()
-            running_diff += loss_diff.item()
+            running_dpo += loss_dpo.item()
             running_ctr += loss_ctr.item()
 
             if is_main:
                 pbar.set_postfix(
                     {
-                        "L_diff": f"{loss_diff.item():.4f}",
+                        "L_dpo": f"{loss_dpo.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
                         "p-n": f"{pos_sim - neg_sim:+.3f}",
                     }
@@ -859,7 +892,7 @@ def main(args: argparse.Namespace) -> None:
                     wandb.log(
                         {
                             "train/loss_total": loss.item(),
-                            "train/loss_diff": loss_diff.item(),
+                            "train/loss_dpo": loss_dpo.item(),
                             "train/loss_ctr": loss_ctr.item(),
                             "train/pos_sim": pos_sim,
                             "train/neg_sim": neg_sim,
@@ -894,15 +927,15 @@ def main(args: argparse.Namespace) -> None:
             continue
 
         avg_total = running_total / steps
-        avg_diff = running_diff / steps
+        avg_dpo = running_dpo / steps
         avg_ctr = running_ctr / steps
         if is_main:
-            print(f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_diff={avg_diff:.4f} avg_ctr={avg_ctr:.4f}")
+            print(f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_dpo={avg_dpo:.4f} avg_ctr={avg_ctr:.4f}")
             if use_wandb:
                 wandb.log(
                     {
                         "epoch/avg_total": avg_total,
-                        "epoch/avg_diff": avg_diff,
+                        "epoch/avg_dpo": avg_dpo,
                         "epoch/avg_ctr": avg_ctr,
                         "epoch/epoch": epoch,
                     },
@@ -928,11 +961,11 @@ def main(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train transformer refiners with counting contrastive + diffusion losses")
+    p = argparse.ArgumentParser(description="Train transformer refiners with counting contrastive + DPO/CPO losses")
     p.add_argument("--model_dir", type=str, default="ckpts/Z-Image-Turbo")
     p.add_argument("--triplets_jsonl", type=str, default="data/train_triplets/counting_triplets_filtered.jsonl")
     p.add_argument("--generated_root", type=str, default="data/generated_images")
-    p.add_argument("--output_dir", type=str, default="checkpoints/counting_text_refiner")
+    p.add_argument("--output_dir", type=str, default="checkpoints/counting_text_refiner_dpo")
 
     p.add_argument("--verdict_threshold", type=float, default=0.8)
     p.add_argument("--resolution", type=int, default=1024)
@@ -994,6 +1027,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--contrastive_weight", type=float, default=1.0,
                    help="Initial contrastive loss weight (linearly decays to 0 over ctr_decay_steps).")
     p.add_argument("--diffusion_weight", type=float, default=1.0, help="Diffusion loss weight (fixed).")
+    p.add_argument("--beta_dpo", type=float, default=0.1, help="Beta parameter for DPO/CPO loss.")
     p.add_argument("--ctr_decay_steps", type=int, default=0,
                    help="Steps over which contrastive weight decays to 0. 0 = decay over all training steps.")
     p.add_argument("--no_ctr_decay", action="store_true",
@@ -1011,6 +1045,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"],
                    help="Accelerate mixed precision mode")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--recon_test_every", type=int, default=0, help="Run VAE reconstruction test every N steps (0 disables).")
+    p.add_argument("--recon_test_save_images", action="store_true", help="Save [input|mean-recon|sample-recon] debug strips during reconstruction tests.")
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default="z-image-counting")
     p.add_argument("--wandb_run", type=str, default="")
