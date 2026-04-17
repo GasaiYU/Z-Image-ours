@@ -206,6 +206,12 @@ def main() -> None:
     ap.add_argument("--generated_root", type=str, default="data/generated_images")
     ap.add_argument("--task", type=str, default="counting")
     ap.add_argument("--min_valid_images", type=int, default=1)
+    ap.add_argument("--merge_by_anchor", action="store_true",
+                    help="Merge multiple rows with the same normalized anchor into one row.")
+    ap.add_argument("--max_positive_pool", type=int, default=64,
+                    help="Max number of positives kept in positive_pool when --merge_by_anchor is enabled.")
+    ap.add_argument("--max_negative_pool", type=int, default=64,
+                    help="Max number of negatives kept in negative_pool when --merge_by_anchor is enabled.")
     ap.add_argument("--require_verdict_pass", action="store_true",
                     help="If set, only keep images with pass=true in verdict.json.")
     ap.add_argument("--prune_source_bad_images", action="store_true",
@@ -317,15 +323,63 @@ def main() -> None:
         })
 
     # Recompute valid_image_count and filter rows by min image count
-    final_rows: list[dict[str, Any]] = []
-    for r in normalized_rows:
-        anchor = r.get("anchor", "")
-        count = anchor_valid_count.get(anchor, 0)
-        if count < args.min_valid_images:
-            continue
-        rr = dict(r)
-        rr["valid_image_count"] = count
-        final_rows.append(rr)
+    if args.merge_by_anchor:
+        grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for r in normalized_rows:
+            task = r.get("task", "")
+            target_word = r.get("target_word", "")
+            anchor = r.get("anchor", "")
+            count = anchor_valid_count.get(anchor, 0)
+            if count < args.min_valid_images:
+                continue
+
+            key = (task, target_word, anchor)
+            g = grouped.get(key)
+            if g is None:
+                g = {
+                    "task": task,
+                    "target_word": target_word,
+                    "anchor": anchor,
+                    "noun": r.get("noun", ""),
+                    "positive_pool": [],
+                    "negative_pool": [],
+                    "_pos_set": set(),
+                    "_neg_set": set(),
+                    "valid_image_count": count,
+                    "num_merged_rows": 0,
+                }
+                grouped[key] = g
+
+            g["num_merged_rows"] += 1
+
+            p = r.get("positive", "")
+            if p and p not in g["_pos_set"] and len(g["positive_pool"]) < args.max_positive_pool:
+                g["positive_pool"].append(p)
+                g["_pos_set"].add(p)
+
+            n = r.get("negative", "")
+            if n and n not in g["_neg_set"] and len(g["negative_pool"]) < args.max_negative_pool:
+                g["negative_pool"].append(n)
+                g["_neg_set"].add(n)
+
+        final_rows: list[dict[str, Any]] = []
+        for g in grouped.values():
+            # keep compatibility with old consumers that expect single positive/negative fields
+            g["positive"] = g["positive_pool"][0] if g["positive_pool"] else ""
+            g["negative"] = g["negative_pool"][0] if g["negative_pool"] else ""
+            g.pop("_pos_set", None)
+            g.pop("_neg_set", None)
+            final_rows.append(g)
+    else:
+        final_rows = []
+        for r in normalized_rows:
+            anchor = r.get("anchor", "")
+            count = anchor_valid_count.get(anchor, 0)
+            if count < args.min_valid_images:
+                continue
+            rr = dict(r)
+            rr["valid_image_count"] = count
+            final_rows.append(rr)
 
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with output_jsonl.open("w", encoding="utf-8") as f:
@@ -341,6 +395,7 @@ def main() -> None:
         "apply": args.apply,
         "require_verdict_pass": args.require_verdict_pass,
         "min_valid_images": args.min_valid_images,
+        "merge_by_anchor": args.merge_by_anchor,
         "merge_report_head": merge_report[:20],
     }
     report_path = output_jsonl.with_suffix(".report.json")
