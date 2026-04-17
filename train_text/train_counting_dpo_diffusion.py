@@ -374,13 +374,43 @@ class CountingVerdictDataset(Dataset):
         sample_dir = self.generated_root / "counting" / sanitize(anchor)
         if not sample_dir.exists():
             return []
+        return self._collect_scored_images(sample_dir)
+
+    def _collect_scored_images(self, sample_dir: Path) -> list[Path]:
+        """
+        Keep only images whose per-image verdict score is strictly above threshold.
+        """
+        verdict_path = sample_dir / "verdict.json"
+        if not verdict_path.exists():
+            return []
+
+        try:
+            with open(verdict_path, "r", encoding="utf-8") as f:
+                verdict = json.load(f)
+        except Exception:
+            return []
+
+        score_by_name: dict[str, float] = {}
+        for item in verdict.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            image_name = item.get("image")
+            score = item.get("score")
+            if isinstance(image_name, str) and isinstance(score, (int, float)):
+                score_by_name[image_name] = float(score)
+
+        if not score_by_name:
+            return []
+
         valid_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-        return sorted(
-            [
-                p for p in sample_dir.iterdir()
-                if p.is_file() and p.suffix.lower() in valid_suffixes
-            ]
-        )
+        kept = []
+        for p in sample_dir.iterdir():
+            if not p.is_file() or p.suffix.lower() not in valid_suffixes:
+                continue
+            s = score_by_name.get(p.name)
+            if s is not None and s > self.threshold:
+                kept.append(p)
+        return sorted(kept)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -401,30 +431,44 @@ class CountingVerdictDataset(Dataset):
             return anchor
         return random.choice(pool)
 
+    def _sample_loser(self, idx: int) -> tuple["Path", "CountingSample"]:
+        """
+        Sample a loser (negative) from other anchors in the dataset.
+        Prefers anchors with a different target_word (different number).
+        Every sample in self.samples is guaranteed to have at least one image,
+        so this never fails.
+        """
+        n = len(self.samples)
+        # Try up to 20 times to find a sample with a different target_word
+        current_tw = self.samples[idx].target_word
+        for _ in range(20):
+            neg_idx = random.randrange(n)
+            if neg_idx == idx:
+                continue
+            neg_sample = self.samples[neg_idx]
+            if neg_sample.target_word != current_tw:
+                return random.choice(neg_sample.image_paths), neg_sample
+        # Fallback: any sample that is not the same index
+        for _ in range(20):
+            neg_idx = random.randrange(n)
+            if neg_idx != idx:
+                return random.choice(self.samples[neg_idx].image_paths), self.samples[neg_idx]
+        # Last resort: return winner itself (degenerate but safe)
+        return random.choice(self.samples[idx].image_paths), self.samples[idx]
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """Returns image samples for DPO/CPO loss (includes pixel_values_w and pixel_values_l)."""
         s = self.samples[idx]
         
-        # 1. Winner Image
+        # 1. Winner Image: from the current anchor (score > threshold guaranteed)
         winner_path = random.choice(s.image_paths)
         winner_img = self.image_tf(Image.open(winner_path).convert("RGB"))
         
-        # 2. Loser Image
-        loser_img = None
-        neg_pool = random.sample(s.synthetic_negatives, len(s.synthetic_negatives))
-        for neg_text, _ in neg_pool:
-            neg_dir = self.generated_root / "counting" / sanitize(neg_text)
-            if neg_dir.exists():
-                valid_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-                valid_imgs = [p for p in neg_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_suffixes]
-                if valid_imgs:
-                    loser_path = random.choice(valid_imgs)
-                    loser_img = self.image_tf(Image.open(loser_path).convert("RGB"))
-                    break
-                    
-        if loser_img is None:
-            # Fallback if no valid negative image is found
-            loser_img = winner_img
+        # 2. Loser Image: from a different anchor with a different count word.
+        #    All images in self.samples already passed score > threshold, so no
+        #    need to re-check; this also guarantees we always find a loser.
+        loser_path, _loser_sample = self._sample_loser(idx)
+        loser_img = self.image_tf(Image.open(loser_path).convert("RGB"))
 
         return {
             "anchor": s.anchor,
