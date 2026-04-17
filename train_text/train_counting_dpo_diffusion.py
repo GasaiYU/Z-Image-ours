@@ -292,8 +292,6 @@ class CountingSample:
     anchor: str
     anchor_variants: list[str]
     synthetic_negatives: list[tuple[str, str]]
-    positive_pool: list[str]
-    negative_pool: list[str]
     target_word: str
     noun: str          # noun phrase extracted from anchor (e.g. "cat trees")
     image_paths: list[Path]
@@ -334,19 +332,18 @@ class CountingVerdictDataset(Dataset):
                     continue
                 if obj.get("task", "counting") != "counting":
                     continue
-                if all(k in obj for k in ("anchor", "positive", "negative", "target_word")):
+                # Only require anchor + target_word; positive/negative pools are optional
+                # and not used by this trainer.
+                if all(k in obj for k in ("anchor", "target_word")):
                     rows.append(obj)
 
         image_cache: dict[str, list[Path]] = {}
-        same_word_texts: dict[str, set[str]] = defaultdict(set)
         grouped: dict[str, dict[str, Any]] = defaultdict(
-            lambda: {"target_word": "", "noun": "", "positive_pool": set(), "negative_pool": set()}
+            lambda: {"target_word": "", "noun": ""}
         )
         for obj in rows:
             anchor = obj["anchor"].strip()
             target_word = obj["target_word"].strip()
-            positive = obj["positive"].strip()
-            negative = obj["negative"].strip()
 
             grouped[anchor]["target_word"] = target_word
             # Use pre-computed noun from the cleaned JSONL when available;
@@ -354,13 +351,6 @@ class CountingVerdictDataset(Dataset):
             # original (non-cleaned) file.
             if not grouped[anchor]["noun"]:
                 grouped[anchor]["noun"] = obj.get("noun", "") or extract_noun(anchor, target_word)
-            if positive:
-                grouped[anchor]["positive_pool"].add(positive)
-                same_word_texts[target_word].add(positive)
-            if negative:
-                grouped[anchor]["negative_pool"].add(negative)
-            if anchor:
-                same_word_texts[target_word].add(anchor)
 
         self.samples: list[CountingSample] = []
         for anchor, item in grouped.items():
@@ -375,8 +365,6 @@ class CountingVerdictDataset(Dataset):
                     anchor=anchor,
                     anchor_variants=make_anchor_variants(anchor),
                     synthetic_negatives=make_anchor_negatives(anchor, tw),
-                    positive_pool=[x for x in item["positive_pool"] if x],
-                    negative_pool=[x for x in item["negative_pool"] if x],
                     target_word=tw,
                     noun=item["noun"],
                     image_paths=image_paths,

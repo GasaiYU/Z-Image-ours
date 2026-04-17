@@ -212,6 +212,8 @@ def main() -> None:
                     help="Max number of positives kept in positive_pool when --merge_by_anchor is enabled.")
     ap.add_argument("--max_negative_pool", type=int, default=64,
                     help="Max number of negatives kept in negative_pool when --merge_by_anchor is enabled.")
+    ap.add_argument("--keep_all_fields", action="store_true",
+                    help="Keep full fields in output rows. Default is minimal fields only.")
     ap.add_argument("--require_verdict_pass", action="store_true",
                     help="If set, only keep images with pass=true in verdict.json.")
     ap.add_argument("--prune_source_bad_images", action="store_true",
@@ -369,7 +371,19 @@ def main() -> None:
             g["negative"] = g["negative_pool"][0] if g["negative_pool"] else ""
             g.pop("_pos_set", None)
             g.pop("_neg_set", None)
-            final_rows.append(g)
+            if args.keep_all_fields:
+                final_rows.append(g)
+            else:
+                final_rows.append(
+                    {
+                        "task": g["task"],
+                        "target_word": g["target_word"],
+                        "anchor": g["anchor"],
+                        "noun": g.get("noun", ""),
+                        "valid_image_count": g["valid_image_count"],
+                        "num_merged_rows": g["num_merged_rows"],
+                    }
+                )
     else:
         final_rows = []
         for r in normalized_rows:
@@ -377,9 +391,20 @@ def main() -> None:
             count = anchor_valid_count.get(anchor, 0)
             if count < args.min_valid_images:
                 continue
-            rr = dict(r)
-            rr["valid_image_count"] = count
-            final_rows.append(rr)
+            if args.keep_all_fields:
+                rr = dict(r)
+                rr["valid_image_count"] = count
+                final_rows.append(rr)
+            else:
+                final_rows.append(
+                    {
+                        "task": r.get("task", ""),
+                        "target_word": r.get("target_word", ""),
+                        "anchor": r.get("anchor", ""),
+                        "noun": r.get("noun", ""),
+                        "valid_image_count": count,
+                    }
+                )
 
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with output_jsonl.open("w", encoding="utf-8") as f:
@@ -396,6 +421,7 @@ def main() -> None:
         "require_verdict_pass": args.require_verdict_pass,
         "min_valid_images": args.min_valid_images,
         "merge_by_anchor": args.merge_by_anchor,
+        "keep_all_fields": args.keep_all_fields,
         "merge_report_head": merge_report[:20],
     }
     report_path = output_jsonl.with_suffix(".report.json")
