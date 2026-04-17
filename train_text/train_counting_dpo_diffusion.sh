@@ -12,7 +12,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_dpo}
 
 # ── Data / model ──────────────────────────────────────────────────────────────
 VERDICT_THRESHOLD=${VERDICT_THRESHOLD:-0.8}
-RESOLUTION=${RESOLUTION:-1024}
+RESOLUTION=${RESOLUTION:-512}
 MAX_LENGTH=${MAX_LENGTH:-128}
 TEXT_SOURCE_MODE=${TEXT_SOURCE_MODE:-avg_range}
 TEXT_SOURCE_LAYER_IDX=${TEXT_SOURCE_LAYER_IDX:--2}
