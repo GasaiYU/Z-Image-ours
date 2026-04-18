@@ -69,7 +69,7 @@ WORD_TO_INT = {v: k for k, v in INT_TO_WORD.items()}
 
 DEFAULT_GEN_MODEL  = "Qwen/Qwen-Image-2512"
 DEFAULT_EDIT_MODEL = "Qwen/Qwen-Image-Edit"
-DEFAULT_VLM_MODEL  = "Qwen/Qwen2-VL-7B-Instruct"
+DEFAULT_VLM_MODEL  = "Qwen/Qwen3-VL-8B-Instruct"
 
 GEN_NEG_PROMPT = (
     "low resolution, low quality, deformed limbs, deformed fingers, "

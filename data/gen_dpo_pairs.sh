@@ -36,7 +36,7 @@ OUTDIR=${OUTDIR:-"data/dpo_edit_images"}
 
 GEN_MODEL=${GEN_MODEL:-"Qwen/Qwen-Image-2512"}
 EDIT_MODEL=${EDIT_MODEL:-"Qwen/Qwen-Image-Edit"}
-VLM_MODEL=${VLM_MODEL:-"Qwen/Qwen2-VL-7B-Instruct"}
+VLM_MODEL=${VLM_MODEL:-"Qwen/Qwen3-VL-8B-Instruct"}
 
 # ── 打印配置 ──────────────────────────────────────────────────────────────────
 echo "========================================================"
