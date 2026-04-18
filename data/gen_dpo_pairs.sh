@@ -24,9 +24,10 @@ set -euo pipefail
 N_GPUS=${N_GPUS:-8}
 GPU_START=${GPU_START:-0}
 SKIP_VLM=${SKIP_VLM:-0}
-N_EDITS=${N_EDITS:-3}
+N_EDITS=${N_EDITS:-3}          # 每个 count 先生 1 张，质量验证通过后再扩充
+EDIT_STEPS=${EDIT_STEPS:-28}   # 28 步对 edit 模型已经足够，原来 50 步太慢
 MIN_COUNT=${MIN_COUNT:-1}
-MAX_COUNT=${MAX_COUNT:-10}
+MAX_COUNT=${MAX_COUNT:-5}
 MIN_SEED_SCORE=${MIN_SEED_SCORE:-0.8}
 
 JSONL=${JSONL:-"data/train_triplets/counting_triplets_minimal_origin.jsonl"}
@@ -77,6 +78,7 @@ for (( rank=0; rank<N_GPUS; rank++ )); do
         --min_count       "${MIN_COUNT}" \
         --max_count       "${MAX_COUNT}" \
         --n_edits         "${N_EDITS}" \
+        --edit_steps      "${EDIT_STEPS}" \
         --rank            "${rank}" \
         --world_size      "${N_GPUS}" \
         ${SKIP_VLM_FLAG} \

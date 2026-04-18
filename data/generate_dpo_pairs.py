@@ -338,7 +338,6 @@ def edit_count(
     prompt = make_edit_prompt(target_count, noun)
     gen = torch.Generator(device=device).manual_seed(opt.seed + edit_idx * 100 + target_count)
     try:
-        torch.cuda.empty_cache()
         with torch.inference_mode():
             out = edit_pipe(
                 image=seed_img,
@@ -605,6 +604,7 @@ def run(opt):
             continue
         seed_path, seed_score, seed_count = noun_seeds[noun]
         run_stage2(noun, seed_path, seed_score, seed_count, edit_pipe, device, outdir, opt)
+        torch.cuda.empty_cache()   # 每个名词处理完统一清一次，避免碎片积累
 
     # 释放 edit 模型
     del edit_pipe
@@ -655,7 +655,7 @@ def parse_args():
 
     # Stage 2 参数
     p.add_argument("--min_count",  type=int, default=1,   help="编辑数量范围下界（含）")
-    p.add_argument("--max_count",  type=int, default=10,  help="编辑数量范围上界（含）")
+    p.add_argument("--max_count",  type=int, default=5,   help="编辑数量范围上界（含）")
     p.add_argument("--n_edits",    type=int, default=3,
                    help="每个 (名词, 数量) 组合生成几张编辑图")
     p.add_argument("--edit_steps", type=int, default=50,  help="QwenImageEdit 推理步数")
