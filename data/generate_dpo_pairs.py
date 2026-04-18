@@ -44,6 +44,20 @@ from typing import Optional
 from PIL import Image
 from tqdm import tqdm
 
+# 复用 filter_triplet_images 中的 VLM 加载与推理逻辑，避免重复实现
+# 同在 data/ 目录，支持两种运行方式：
+#   python data/generate_dpo_pairs.py  （从项目根目录）
+#   python generate_dpo_pairs.py       （从 data/ 目录内）
+import importlib, sys as _sys
+_here = Path(__file__).resolve().parent
+for _candidate in [_here, _here.parent]:
+    if str(_candidate) not in _sys.path:
+        _sys.path.insert(0, str(_candidate))
+try:
+    from filter_triplet_images import load_vlm, vlm_answer, make_vqa
+except ModuleNotFoundError:
+    from data.filter_triplet_images import load_vlm, vlm_answer, make_vqa
+
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
@@ -405,73 +419,18 @@ def run_stage2(
 
 
 # ── Stage 3: VLM 验证 ─────────────────────────────────────────────────────────
-
-def load_vlm(model_name: str, device: str):
-    from transformers import AutoProcessor
-    name_lower = model_name.lower()
-    print(f"  Loading VLM: {model_name} ...")
-    if "qwen3" in name_lower:
-        from transformers import Qwen3VLForConditionalGeneration
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16
-        ).to(device)
-    else:
-        from transformers import Qwen2VLForConditionalGeneration
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=torch.bfloat16
-        ).to(device)
-    model.eval()
-    processor = AutoProcessor.from_pretrained(model_name)
-    return model, processor
-
+# load_vlm / vlm_answer / make_vqa 均从 filter_triplet_images 导入，不再重复定义。
 
 def vlm_count_score(model, processor, image: Image.Image,
                     noun: str, expected_count: int, device: str) -> tuple[str, float]:
-    """VQA 数数并返回 (predicted_answer, score)。"""
-    question = (
-        f"How many {noun} are visible in this image? "
-        f"Answer with a single number only, e.g. '3'."
-    )
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text",  "text":  question},
-            ],
-        }
-    ]
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    try:
-        from qwen_vl_utils import process_vision_info
-        img_inputs, vid_inputs = process_vision_info(messages)
-        inputs = processor(
-            text=[text], images=img_inputs, videos=vid_inputs,
-            padding=True, return_tensors="pt",
-        ).to(device)
-    except ImportError:
-        inputs = processor(
-            text=[text], images=[image], padding=True, return_tensors="pt",
-        ).to(device)
-
-    with torch.inference_mode():
-        output_ids = model.generate(**inputs, max_new_tokens=16)
-    generated = [out[len(inp):] for out, inp in zip(output_ids, inputs.input_ids)]
-    pred = processor.batch_decode(
-        generated, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0].strip()
-
-    pred_int = parse_int_from_str(pred)
-    if pred_int is None:
-        score = 0.0
-    elif pred_int == expected_count:
-        score = 1.0
-    elif abs(pred_int - expected_count) == 1:
-        score = 0.5
-    else:
-        score = 0.0
+    """
+    用 filter_triplet_images 的 vlm_answer + make_vqa 做数量 VQA，
+    返回 (predicted_answer, score)。
+    """
+    anchor = f"{INT_TO_WORD.get(expected_count, str(expected_count))} {noun}"
+    question, score_fn = make_vqa("counting", anchor, INT_TO_WORD.get(expected_count, str(expected_count)))
+    pred  = vlm_answer(model, processor, image, question, device)
+    score = score_fn(pred)
     return pred, score
 
 
