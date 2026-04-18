@@ -11,6 +11,7 @@ balloon
 banana
 banner
 barbecue
+baseball
 baseball bat
 basket
 basketball
@@ -66,6 +67,7 @@ cherry
 chessboard
 children wearing goggle
 chimney
+computer keyboards
 chisel
 chocolate
 clipboard
@@ -80,7 +82,6 @@ crutch
 crutches
 cup
 cup of tea
-cup of teas
 daisy
 desk
 diaper bag
