@@ -563,6 +563,9 @@ class QwenVLCountingReward:
         self.model.eval()
         self.model.requires_grad_(False)
         self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+        # Decoder-only models require left-padding for correct batch generation.
+        if hasattr(self.processor, "tokenizer"):
+            self.processor.tokenizer.padding_side = "left"
 
     @torch.no_grad()
     def __call__(
