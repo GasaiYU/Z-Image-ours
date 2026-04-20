@@ -301,13 +301,12 @@ class CountingVerdictDataset(Dataset):
     def __init__(
         self,
         triplets_jsonl: str,
-        generated_root: str,
         threshold: float,
         resolution: int,
         num_negatives: int,
     ):
         self.triplets_jsonl = Path(triplets_jsonl)
-        self.generated_root = Path(generated_root)
+        self.project_root = Path(__file__).resolve().parents[1]
         self.threshold = threshold
         self.num_negatives = num_negatives
 
@@ -320,56 +319,8 @@ class CountingVerdictDataset(Dataset):
             ]
         )
 
-        rows = []
-        with open(self.triplets_jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("task", "counting") != "counting":
-                    continue
-                # Only require anchor + target_word; positive/negative pools are optional
-                # and not used by this trainer.
-                if all(k in obj for k in ("anchor", "target_word")):
-                    rows.append(obj)
-
-        image_cache: dict[str, list[Path]] = {}
-        grouped: dict[str, dict[str, Any]] = defaultdict(
-            lambda: {"target_word": "", "noun": ""}
-        )
-        for obj in rows:
-            anchor = obj["anchor"].strip()
-            target_word = obj["target_word"].strip()
-
-            grouped[anchor]["target_word"] = target_word
-            # Use pre-computed noun from the cleaned JSONL when available;
-            # fall back to extract_noun so the dataset still works with the
-            # original (non-cleaned) file.
-            if not grouped[anchor]["noun"]:
-                grouped[anchor]["noun"] = obj.get("noun", "") or extract_noun(anchor, target_word)
-
-        self.samples: list[CountingSample] = []
-        for anchor, item in grouped.items():
-            if anchor not in image_cache:
-                image_cache[anchor] = self._collect_anchor_images(anchor)
-            image_paths = image_cache[anchor]
-            if not image_paths:
-                continue
-            tw = item["target_word"]
-            self.samples.append(
-                CountingSample(
-                    anchor=anchor,
-                    anchor_variants=make_anchor_variants(anchor),
-                    synthetic_negatives=make_anchor_negatives(anchor, tw),
-                    target_word=tw,
-                    noun=item["noun"],
-                    image_paths=image_paths,
-                )
-            )
+        records = self._load_records()
+        self.samples, total_rows, unique_anchors = self._build_samples_from_dpo_index(records)
 
         # noun -> list of sample indices that share the same noun phrase.
         # Used by _sample_loser to find hard negatives (same object, different count).
@@ -377,52 +328,91 @@ class CountingVerdictDataset(Dataset):
         for i, s in enumerate(self.samples):
             self.noun_to_indices[s.noun].append(i)
 
-        print(f"[Dataset] Total counting triplets: {len(rows)}")
-        print(f"[Dataset] Unique anchors: {len(grouped)}")
+        print(f"[Dataset] Source format: noun_grouped_dpo_index")
+        print(f"[Dataset] Total anchor pools: {total_rows}")
+        print(f"[Dataset] Unique anchors: {unique_anchors}")
         print(f"[Dataset] Kept with available images: {len(self.samples)}")
         print(f"[Dataset] Unique nouns: {len(self.noun_to_indices)}")
-  
-    def _collect_anchor_images(self, anchor: str) -> list[Path]:
-        sample_dir = self.generated_root / "counting" / sanitize(anchor)
-        if not sample_dir.exists():
-            return []
-        return self._collect_scored_images(sample_dir)
 
-    def _collect_scored_images(self, sample_dir: Path) -> list[Path]:
-        """
-        Keep only images whose per-image verdict score is strictly above threshold.
-        """
-        verdict_path = sample_dir / "verdict.json"
-        if not verdict_path.exists():
+    def _load_records(self) -> list[dict[str, Any]]:
+        text = self.triplets_jsonl.read_text(encoding="utf-8")
+        stripped = text.lstrip()
+        if not stripped:
             return []
 
-        try:
-            with open(verdict_path, "r", encoding="utf-8") as f:
-                verdict = json.load(f)
-        except Exception:
+        if stripped.startswith("["):
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return []
+            if isinstance(data, list):
+                return [obj for obj in data if isinstance(obj, dict)]
             return []
 
-        score_by_name: dict[str, float] = {}
-        for item in verdict.get("results", []):
-            if not isinstance(item, dict):
+        raise ValueError(
+            f"{self.triplets_jsonl} should be a JSON array file produced by build_dpo_training_index.py"
+        )
+
+    def _extract_target_word(self, anchor: str) -> str:
+        parts = anchor.strip().split()
+        return parts[0].lower() if parts else ""
+
+    def _resolve_index_image_paths(self, image_paths: list[str]) -> list[Path]:
+        resolved: list[Path] = []
+        for image_path in image_paths:
+            if not isinstance(image_path, str) or not image_path.strip():
                 continue
-            image_name = item.get("image")
-            score = item.get("score")
-            if isinstance(image_name, str) and isinstance(score, (int, float)):
-                score_by_name[image_name] = float(score)
+            p = Path(image_path)
+            candidates = [p] if p.is_absolute() else [self.project_root / p]
+            for candidate in candidates:
+                if candidate.exists():
+                    resolved.append(candidate)
+                    break
+        return sorted(set(resolved))
 
-        if not score_by_name:
-            return []
+    def _build_samples_from_dpo_index(
+        self,
+        records: list[dict[str, Any]],
+    ) -> tuple[list[CountingSample], int, int]:
+        samples: list[CountingSample] = []
+        total_pools = 0
+        unique_anchors: set[str] = set()
 
-        valid_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-        kept = []
-        for p in sample_dir.iterdir():
-            if not p.is_file() or p.suffix.lower() not in valid_suffixes:
+        for obj in records:
+            if obj.get("task", "counting") != "counting":
                 continue
-            s = score_by_name.get(p.name)
-            if s is not None and s > self.threshold:
-                kept.append(p)
-        return sorted(kept)
+            noun = str(obj.get("noun", "")).strip()
+            pools = obj.get("anchor_pools", [])
+            if not isinstance(pools, list):
+                continue
+
+            for pool in pools:
+                if not isinstance(pool, dict):
+                    continue
+                anchor = str(pool.get("anchor", "")).strip()
+                if not anchor:
+                    continue
+                image_paths = self._resolve_index_image_paths(pool.get("image_paths", []))
+                total_pools += 1
+                unique_anchors.add(anchor)
+                if not image_paths:
+                    continue
+                tw = self._extract_target_word(anchor)
+                if not tw:
+                    continue
+                sample_noun = noun or extract_noun(anchor, tw)
+                samples.append(
+                    CountingSample(
+                        anchor=anchor,
+                        anchor_variants=make_anchor_variants(anchor),
+                        synthetic_negatives=make_anchor_negatives(anchor, tw),
+                        target_word=tw,
+                        noun=sample_noun,
+                        image_paths=image_paths,
+                    )
+                )
+        return samples, total_pools, len(unique_anchors)
+
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -618,7 +608,6 @@ def main(args: argparse.Namespace) -> None:
 
     dataset = CountingVerdictDataset(
         triplets_jsonl=args.triplets_jsonl,
-        generated_root=args.generated_root,
         threshold=args.verdict_threshold,
         resolution=args.resolution,
         num_negatives=args.num_negatives,
@@ -972,8 +961,12 @@ def main(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train transformer refiners with counting contrastive + DPO/CPO losses")
     p.add_argument("--model_dir", type=str, default="ckpts/Z-Image-Turbo")
-    p.add_argument("--triplets_jsonl", type=str, default="data/train_triplets/counting_triplets_filtered.jsonl")
-    p.add_argument("--generated_root", type=str, default="data/generated_images")
+    p.add_argument(
+        "--triplets_jsonl",
+        type=str,
+        default="data/train_triplets/DPO/counting_dpo_index.jsonl",
+        help="训练数据文件；仅支持 build_dpo_training_index.py 产出的 noun-grouped DPO index JSON/JSONL。",
+    )
     p.add_argument("--output_dir", type=str, default="checkpoints/counting_text_refiner_dpo")
 
     p.add_argument("--verdict_threshold", type=float, default=0.8)
