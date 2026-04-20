@@ -1164,7 +1164,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--contrastive_weight", type=float, default=1.0,
                    help="Initial contrastive loss weight (linearly decays to 0 over ctr_decay_steps).")
     p.add_argument("--diffusion_weight", type=float, default=1.0, help="Diffusion loss weight (fixed).")
-    p.add_argument("--beta_dpo", type=float, default=500.0, help="Beta parameter for reference-based DPO loss.")
+    p.add_argument("--beta_dpo", type=float, default=50.0, help="Beta parameter for reference-based DPO loss.")
     p.add_argument("--ctr_decay_steps", type=int, default=0,
                    help="Steps over which contrastive weight decays to 0. 0 = decay over all training steps.")
     p.add_argument("--no_ctr_decay", action="store_true",
