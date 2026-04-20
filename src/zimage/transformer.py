@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch.nn.utils.rnn import pad_sequence
 
 from config import (
@@ -342,6 +343,15 @@ class ZImageTransformer2DModel(nn.Module):
 
         self.rope_embedder = RopeEmbedder(theta=rope_theta, axes_dims=axes_dims, axes_lens=axes_lens)
 
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for the main DiT layers to save memory."""
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+
     def unpatchify(self, x: List[torch.Tensor], size: List[Tuple], patch_size, f_patch_size) -> List[torch.Tensor]:
         pH = pW = patch_size
         pF = f_patch_size
@@ -562,7 +572,13 @@ class ZImageTransformer2DModel(nn.Module):
             unified_attn_mask[i, :seq_len] = 1
 
         for layer in self.layers:
-            unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
+            if self.gradient_checkpointing and self.training:
+                unified = torch.utils.checkpoint.checkpoint(
+                    layer, unified, unified_attn_mask, unified_freqs_cis, adaln_input,
+                    use_reentrant=False,
+                )
+            else:
+                unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
         unified = list(unified.unbind(dim=0))
