@@ -4,7 +4,6 @@ import os
 import random
 import re
 import sys
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -253,10 +252,7 @@ def make_anchor_variants(anchor: str) -> list[str]:
     return variants
 
 
-NUMBER_WORDS = [
-    "one", "two", "three", "four", "five",
-    "six", "seven", "eight", "nine", "ten",
-]
+NUMBER_WORDS = ["one", "two", "three", "four", "five"]
 
 
 def extract_noun(anchor: str, target_word: str) -> str:
@@ -269,16 +265,18 @@ def extract_noun(anchor: str, target_word: str) -> str:
     return noun if noun else anchor.strip()
 
 
-def make_anchor_negatives(anchor: str, target_word: str) -> list[tuple[str, str]]:
+def compose_anchor(count_word: str, noun: str) -> str:
+    return f"{count_word.strip()} {noun.strip()}".strip()
+
+
+def make_anchor_negatives(noun: str, target_word: str) -> list[tuple[str, str]]:
     tw = target_word.strip().lower()
     negatives: list[tuple[str, str]] = []
     seen: set[str] = set()
     for num in NUMBER_WORDS:
         if num == tw:
             continue
-        neg_base = anchor.replace(target_word, num, 1)
-        if neg_base == anchor:
-            continue
+        neg_base = compose_anchor(num, noun)
         for variant in make_anchor_variants(neg_base):
             key = variant.strip().lower()
             if key not in seen:
@@ -288,13 +286,17 @@ def make_anchor_negatives(anchor: str, target_word: str) -> list[tuple[str, str]
 
 
 @dataclass
-class CountingSample:
+class AnchorPool:
+    count_word: str
     anchor: str
-    anchor_variants: list[str]
-    synthetic_negatives: list[tuple[str, str]]
-    target_word: str
-    noun: str          # noun phrase extracted from anchor (e.g. "cat trees")
     image_paths: list[Path]
+
+
+@dataclass
+class NounEntry:
+    noun: str
+    pools_by_count: dict[str, AnchorPool]
+    available_counts: list[str]
 
 
 class CountingVerdictDataset(Dataset):
@@ -320,19 +322,22 @@ class CountingVerdictDataset(Dataset):
         )
 
         records = self._load_records()
-        self.samples, total_rows, unique_anchors = self._build_samples_from_dpo_index(records)
-
-        # noun -> list of sample indices that share the same noun phrase.
-        # Used by _sample_loser to find hard negatives (same object, different count).
-        self.noun_to_indices: dict[str, list[int]] = defaultdict(list)
-        for i, s in enumerate(self.samples):
-            self.noun_to_indices[s.noun].append(i)
+        self.noun_store, total_rows, unique_anchors = self._build_noun_store(records)
+        self.text_nouns = sorted(self.noun_store.keys())
+        self.sample_keys = [
+            (noun, count_word)
+            for noun, entry in self.noun_store.items()
+            if len(entry.available_counts) >= 2
+            for count_word in entry.available_counts
+        ]
+        kept_pools = sum(len(entry.available_counts) for entry in self.noun_store.values())
 
         print(f"[Dataset] Source format: noun_grouped_dpo_index")
         print(f"[Dataset] Total anchor pools: {total_rows}")
         print(f"[Dataset] Unique anchors: {unique_anchors}")
-        print(f"[Dataset] Kept with available images: {len(self.samples)}")
-        print(f"[Dataset] Unique nouns: {len(self.noun_to_indices)}")
+        print(f"[Dataset] Kept with available images: {kept_pools}")
+        print(f"[Dataset] Unique nouns: {len(self.noun_store)}")
+        print(f"[Dataset] DPO-eligible (noun, count) keys: {len(self.sample_keys)}")
 
     def _load_records(self) -> list[dict[str, Any]]:
         text = self.triplets_jsonl.read_text(encoding="utf-8")
@@ -370,11 +375,11 @@ class CountingVerdictDataset(Dataset):
                     break
         return sorted(set(resolved))
 
-    def _build_samples_from_dpo_index(
+    def _build_noun_store(
         self,
         records: list[dict[str, Any]],
-    ) -> tuple[list[CountingSample], int, int]:
-        samples: list[CountingSample] = []
+    ) -> tuple[dict[str, NounEntry], int, int]:
+        noun_store: dict[str, dict[str, AnchorPool]] = {}
         total_pools = 0
         unique_anchors: set[str] = set()
 
@@ -398,27 +403,53 @@ class CountingVerdictDataset(Dataset):
                 if not image_paths:
                     continue
                 tw = self._extract_target_word(anchor)
-                if not tw:
+                if tw not in NUMBER_WORDS:
                     continue
                 sample_noun = noun or extract_noun(anchor, tw)
-                samples.append(
-                    CountingSample(
+                if not sample_noun:
+                    continue
+
+                pools_by_count = noun_store.setdefault(sample_noun, {})
+                existing = pools_by_count.get(tw)
+                if existing is None:
+                    pools_by_count[tw] = AnchorPool(
+                        count_word=tw,
                         anchor=anchor,
-                        anchor_variants=make_anchor_variants(anchor),
-                        synthetic_negatives=make_anchor_negatives(anchor, tw),
-                        target_word=tw,
-                        noun=sample_noun,
                         image_paths=image_paths,
                     )
+                    continue
+
+                merged_paths = sorted(set(existing.image_paths + image_paths))
+                pools_by_count[tw] = AnchorPool(
+                    count_word=tw,
+                    anchor=existing.anchor or anchor,
+                    image_paths=merged_paths,
                 )
-        return samples, total_pools, len(unique_anchors)
+
+        finalized: dict[str, NounEntry] = {}
+        for noun_key, pools_by_count in noun_store.items():
+            available_counts = [count_word for count_word in NUMBER_WORDS if count_word in pools_by_count]
+            if not available_counts:
+                continue
+            finalized[noun_key] = NounEntry(
+                noun=noun_key,
+                pools_by_count={count_word: pools_by_count[count_word] for count_word in available_counts},
+                available_counts=available_counts,
+            )
+        return finalized, total_pools, len(unique_anchors)
 
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.sample_keys)
 
-    def _sample_negatives(self, synthetic_negatives: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
-        pool = synthetic_negatives
+    def _get_anchor_text(self, entry: NounEntry, count_word: str) -> str:
+        pool = entry.pools_by_count.get(count_word)
+        if pool is not None and pool.anchor.strip():
+            return pool.anchor
+        return compose_anchor(count_word, entry.noun)
+
+    def _sample_negatives(self, noun: str, target_word: str) -> tuple[list[str], list[str]]:
+        pool = make_anchor_negatives(noun, target_word)
         if not pool:
             return [], []
         if len(pool) >= self.num_negatives:
@@ -427,60 +458,47 @@ class CountingVerdictDataset(Dataset):
             chosen = [random.choice(pool) for _ in range(self.num_negatives)]
         return [t for t, _ in chosen], [tw for _, tw in chosen]
 
-    def _sample_anchor_positive(self, anchor: str, variants: list[str]) -> str:
-        pool = [v for v in variants if v.strip().lower() != anchor.strip().lower()]
+    def _sample_anchor_positive(self, anchor: str) -> str:
+        pool = [v for v in make_anchor_variants(anchor) if v.strip().lower() != anchor.strip().lower()]
         if not pool:
             return anchor
         return random.choice(pool)
 
-    def _sample_loser(self, idx: int) -> tuple["Path", "CountingSample"]:
+    def _sample_loser(self, noun: str, winner_count: str) -> tuple[Path | None, AnchorPool | None]:
         """
-        Sample a loser (hard negative) using the noun_to_indices index.
-
-        Priority:
-          1. Same noun, different target_word  →  hardest negative
-             (same object type, wrong count — exactly what DPO should learn to reject)
-          2. Different noun, different target_word  →  easy negative (fallback)
-          3. Different index, any  →  last-resort fallback
-        Every sample in self.samples is guaranteed >= 1 valid image, so this
-        function never fails.
+        Sample a loser from the same noun but a different count.
         """
-        current = self.samples[idx]
-        current_noun = current.noun
-        current_tw = current.target_word
-
-        # ── Priority 1: same noun, different number ────────────────────────────
-        candidates = [
-            i for i in self.noun_to_indices.get(current_noun, [])
-            if i != idx and self.samples[i].target_word != current_tw
-        ]
+        entry = self.noun_store.get(noun)
+        if entry is None:
+            return None, None
+        candidates = [count_word for count_word in entry.available_counts if count_word != winner_count]
         if candidates:
-            neg_idx = random.choice(candidates)
-            neg = self.samples[neg_idx]
-            return random.choice(neg.image_paths), neg
-
-        # No same-noun hard negative found → caller should skip this sample
+            loser_count = random.choice(candidates)
+            loser_pool = entry.pools_by_count[loser_count]
+            return random.choice(loser_pool.image_paths), loser_pool
         return None, None
 
     def __getitem__(self, idx: int) -> dict[str, Any] | None:
         """Returns image samples for DPO/CPO loss (includes pixel_values_w and pixel_values_l).
         Returns None if no same-noun hard negative exists for this anchor (collate_fn will drop it)."""
-        s = self.samples[idx]
+        noun, count_word = self.sample_keys[idx]
+        entry = self.noun_store[noun]
+        winner_pool = entry.pools_by_count[count_word]
 
         # 1. Winner Image: from the current anchor (score > threshold guaranteed)
-        winner_path = random.choice(s.image_paths)
+        winner_path = random.choice(winner_pool.image_paths)
         winner_img = self.image_tf(Image.open(winner_path).convert("RGB"))
 
         # 2. Loser Image: must be same noun, different count (hard negative).
         #    If no such anchor exists, skip this sample entirely.
-        loser_path, _loser_sample = self._sample_loser(idx)
+        loser_path, _loser_sample = self._sample_loser(noun, count_word)
         if loser_path is None:
             return None
         loser_img = self.image_tf(Image.open(loser_path).convert("RGB"))
 
         return {
-            "anchor": s.anchor,
-            "target_word": s.target_word,
+            "anchor": winner_pool.anchor,
+            "target_word": winner_pool.count_word,
             "pixel_values_w": winner_img,
             "pixel_values_l": loser_img,
             "pixel_values_w_path": winner_path,
@@ -488,17 +506,22 @@ class CountingVerdictDataset(Dataset):
         }
 
     def sample_text_batch(self, n: int) -> list[dict[str, Any]]:
-        chosen = random.choices(self.samples, k=n)
+        if not self.text_nouns:
+            return []
+        chosen_nouns = random.choices(self.text_nouns, k=n)
         items = []
-        for s in chosen:
-            positive = self._sample_anchor_positive(s.anchor, s.anchor_variants)
-            negatives, neg_target_words = self._sample_negatives(s.synthetic_negatives)
+        for noun in chosen_nouns:
+            entry = self.noun_store[noun]
+            target_word = random.choice(entry.available_counts)
+            anchor = self._get_anchor_text(entry, target_word)
+            positive = self._sample_anchor_positive(anchor)
+            negatives, neg_target_words = self._sample_negatives(entry.noun, target_word)
             items.append({
-                "anchor": s.anchor,
+                "anchor": anchor,
                 "positive": positive,
                 "negatives": negatives,
                 "neg_target_words": neg_target_words,
-                "target_word": s.target_word,
+                "target_word": target_word,
             })
         return items
 
