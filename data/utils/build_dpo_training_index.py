@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         "--threshold",
         type=float,
         default=None,
-        help="覆盖 verdict.json 中的 per-image 通过阈值；不指定则优先用 verdict.threshold 或 item.pass",
+        help="单图筛选阈值；不指定则优先用 verdict.threshold，否则回退到脚本默认值",
     )
     p.add_argument(
         "--min_count_pools",
@@ -86,7 +86,6 @@ def resolve_anchor(noun: str, count_word: str) -> str:
 
 def choose_effective_threshold(
     verdict: Optional[dict[str, Any]],
-    item: dict[str, Any],
     cli_threshold: Optional[float],
 ) -> float:
     if cli_threshold is not None:
@@ -94,11 +93,6 @@ def choose_effective_threshold(
     threshold = None if verdict is None else verdict.get("threshold")
     if isinstance(threshold, (int, float)):
         return float(threshold)
-    item_score = item.get("score")
-    item_pass = item.get("pass")
-    if isinstance(item_pass, bool) and isinstance(item_score, (int, float)):
-        if item_pass:
-            return float(item_score)
     return DEFAULT_THRESHOLD
 
 
@@ -107,13 +101,10 @@ def is_valid_item(
     verdict: Optional[dict[str, Any]],
     cli_threshold: Optional[float],
 ) -> bool:
-    item_pass = item.get("pass")
-    if isinstance(item_pass, bool):
-        return item_pass
     score = item.get("score")
     if not isinstance(score, (int, float)):
         return False
-    return float(score) >= choose_effective_threshold(verdict, item, cli_threshold)
+    return float(score) >= choose_effective_threshold(verdict, cli_threshold)
 
 
 def build_pool_entry(
