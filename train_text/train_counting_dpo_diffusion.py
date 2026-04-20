@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -564,7 +565,10 @@ def tokenize_texts(tokenizer, texts: list[str], max_length: int) -> tuple[torch.
 
 
 def main(args: argparse.Namespace) -> None:
-    accelerator = Accelerator(mixed_precision=args.mixed_precision)
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+    )
     device = accelerator.device
     is_main = accelerator.is_main_process
 
@@ -619,6 +623,7 @@ def main(args: argparse.Namespace) -> None:
         n_refiner = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
         print(f"[Init] trainable transformer params: {n_refiner:,}")
         print(f"[Init] projection head: disabled")
+        print(f"[Init] gradient accumulation steps: {args.gradient_accumulation_steps}")
         if args.text_source_mode == "avg_range":
             print(f"[Init] refiner input source: avg layers [{args.text_source_range_start}, {args.text_source_range_end}]")
         else:
@@ -703,7 +708,8 @@ def main(args: argparse.Namespace) -> None:
     global_step = 0
     transformer_dtype = next(transformer.parameters()).dtype
 
-    total_steps = args.epochs * len(loader)
+    steps_per_epoch = math.ceil(len(loader) / args.gradient_accumulation_steps) if len(loader) > 0 else 0
+    total_steps = args.epochs * steps_per_epoch
     if args.no_ctr_decay:
         ctr_decay_steps = -1
     else:
@@ -738,162 +744,167 @@ def main(args: argparse.Namespace) -> None:
             # Skip batches where every sample lacked a same-noun hard negative
             if not batch:
                 continue
-            # ── Contrastive loss (large text-only batch, no images) ──────────────
-            if args.contrastive_weight > 0:
-                text_items = dataset.sample_text_batch(args.contrastive_batch_size)
-                text_batch = collate_text_batch(text_items)
+            with accelerator.accumulate(transformer):
+                # ── Contrastive loss (large text-only batch, no images) ──────────────
+                if args.contrastive_weight > 0:
+                    text_items = dataset.sample_text_batch(args.contrastive_batch_size)
+                    text_batch = collate_text_batch(text_items)
 
-                anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["anchor"]]
-                pos_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["positive"]]
-                neg_texts_nested = [
-                    [format_prompt(tokenizer, t, args.use_chat_template) for t in negs]
-                    for negs in text_batch["negatives"]
-                ]
-                flat_neg_texts = [x for negs in neg_texts_nested for x in negs]
+                    anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["anchor"]]
+                    pos_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in text_batch["positive"]]
+                    neg_texts_nested = [
+                        [format_prompt(tokenizer, t, args.use_chat_template) for t in negs]
+                        for negs in text_batch["negatives"]
+                    ]
+                    flat_neg_texts = [x for negs in neg_texts_nested for x in negs]
 
-                a_ids, a_mask = tokenize_texts(tokenizer, anchor_texts, args.max_length)
-                p_ids, p_mask = tokenize_texts(tokenizer, pos_texts, args.max_length)
-                n_ids, n_mask = tokenize_texts(tokenizer, flat_neg_texts, args.max_length)
+                    a_ids, a_mask = tokenize_texts(tokenizer, anchor_texts, args.max_length)
+                    p_ids, p_mask = tokenize_texts(tokenizer, pos_texts, args.max_length)
+                    n_ids, n_mask = tokenize_texts(tokenizer, flat_neg_texts, args.max_length)
 
-                a_ids = a_ids.to(device);  a_mask = a_mask.to(device)
-                p_ids = p_ids.to(device);  p_mask = p_mask.to(device)
-                n_ids = n_ids.to(device);  n_mask = n_mask.to(device)
+                    a_ids = a_ids.to(device);  a_mask = a_mask.to(device)
+                    p_ids = p_ids.to(device);  p_mask = p_mask.to(device)
+                    n_ids = n_ids.to(device);  n_mask = n_mask.to(device)
 
-                a_tws = text_batch["target_word"]
-                p_tws = text_batch["target_word"]
-                flat_neg_tws = [x for negs in text_batch["neg_target_words"] for x in negs]
+                    a_tws = text_batch["target_word"]
+                    p_tws = text_batch["target_word"]
+                    flat_neg_tws = [x for negs in text_batch["neg_target_words"] for x in negs]
 
-                ea = chunked_encode_and_extract(
-                    text_encoder, transformer, tokenizer, a_ids, a_mask, args.text_chunk_size,
-                    source_mode=args.text_source_mode,
-                    source_layer_idx=args.text_source_layer_idx,
-                    source_range_start=args.text_source_range_start,
-                    source_range_end=args.text_source_range_end,
-                    target_words=a_tws,
-                    target_token_weight=args.target_token_weight,
-                )
-                ep = chunked_encode_and_extract(
-                    text_encoder, transformer, tokenizer, p_ids, p_mask, args.text_chunk_size,
-                    source_mode=args.text_source_mode,
-                    source_layer_idx=args.text_source_layer_idx,
-                    source_range_start=args.text_source_range_start,
-                    source_range_end=args.text_source_range_end,
-                    target_words=p_tws,
-                    target_token_weight=args.target_token_weight,
-                )
-                en_flat = chunked_encode_and_extract(
-                    text_encoder, transformer, tokenizer, n_ids, n_mask, args.text_chunk_size,
-                    source_mode=args.text_source_mode,
-                    source_layer_idx=args.text_source_layer_idx,
-                    source_range_start=args.text_source_range_start,
-                    source_range_end=args.text_source_range_end,
-                    target_words=flat_neg_tws,
-                    target_token_weight=args.target_token_weight,
-                )
-                del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
+                    ea = chunked_encode_and_extract(
+                        text_encoder, transformer, tokenizer, a_ids, a_mask, args.text_chunk_size,
+                        source_mode=args.text_source_mode,
+                        source_layer_idx=args.text_source_layer_idx,
+                        source_range_start=args.text_source_range_start,
+                        source_range_end=args.text_source_range_end,
+                        target_words=a_tws,
+                        target_token_weight=args.target_token_weight,
+                    )
+                    ep = chunked_encode_and_extract(
+                        text_encoder, transformer, tokenizer, p_ids, p_mask, args.text_chunk_size,
+                        source_mode=args.text_source_mode,
+                        source_layer_idx=args.text_source_layer_idx,
+                        source_range_start=args.text_source_range_start,
+                        source_range_end=args.text_source_range_end,
+                        target_words=p_tws,
+                        target_token_weight=args.target_token_weight,
+                    )
+                    en_flat = chunked_encode_and_extract(
+                        text_encoder, transformer, tokenizer, n_ids, n_mask, args.text_chunk_size,
+                        source_mode=args.text_source_mode,
+                        source_layer_idx=args.text_source_layer_idx,
+                        source_range_start=args.text_source_range_start,
+                        source_range_end=args.text_source_range_end,
+                        target_words=flat_neg_tws,
+                        target_token_weight=args.target_token_weight,
+                    )
+                    del a_ids, p_ids, n_ids, a_mask, p_mask, n_mask
 
-                B_ctr = ea.shape[0]
-                K = args.num_negatives
+                    B_ctr = ea.shape[0]
+                    K = args.num_negatives
+
+                    with torch.no_grad():
+                        en_diag = en_flat.view(B_ctr, K, -1)
+                        pos_sim = (ea * ep).sum(dim=-1).mean().item()
+                        neg_sim = (ea.unsqueeze(1) * en_diag).sum(dim=-1).mean().item()
+                        del en_diag
+
+                    if args.apply_zscore_before_loss:
+                        ea, ep, en_flat = zscore_then_l2(ea, ep, en_flat, eps=args.zscore_eps)
+
+                    en = en_flat.view(B_ctr, K, -1)
+                    if args.loss_type == "dcl":
+                        loss_ctr = dcl_loss(ea, ep, en, temperature=args.temperature)
+                    else:
+                        loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature)
+                    del ea, ep, en, en_flat
+                else:
+                    loss_ctr = torch.tensor(0.0, device=device)
+                    pos_sim = neg_sim = 0.0
+                    B_ctr = args.contrastive_batch_size
+                    K = args.num_negatives
+
+                # ── DPO / CPO loss (small image batch, GPU-memory bound) ─────────────
+                diff_anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in batch["anchor"]]
+                da_ids, da_mask = tokenize_texts(tokenizer, diff_anchor_texts, args.max_length)
+                da_ids = da_ids.to(device)
+                da_mask = da_mask.to(device)
 
                 with torch.no_grad():
-                    en_diag = en_flat.view(B_ctr, K, -1)
-                    pos_sim = (ea * ep).sum(dim=-1).mean().item()
-                    neg_sim = (ea.unsqueeze(1) * en_diag).sum(dim=-1).mean().item()
-                    del en_diag
+                    da_out = text_encoder(input_ids=da_ids, attention_mask=da_mask.bool(), output_hidden_states=True)
+                    da_h = select_text_source_hidden(
+                        da_out.hidden_states,
+                        source_mode=args.text_source_mode,
+                        layer_idx=args.text_source_layer_idx,
+                        range_start=args.text_source_range_start,
+                        range_end=args.text_source_range_end,
+                    ).detach().clone()
+                    del da_out
 
-                if args.apply_zscore_before_loss:
-                    ea, ep, en_flat = zscore_then_l2(ea, ep, en_flat, eps=args.zscore_eps)
+                pixel_values_w = batch["pixel_values_w"].to(device, dtype=vae.dtype)
+                pixel_values_l = batch["pixel_values_l"].to(device, dtype=vae.dtype)
 
-                en = en_flat.view(B_ctr, K, -1)
-                if args.loss_type == "dcl":
-                    loss_ctr = dcl_loss(ea, ep, en, temperature=args.temperature)
-                else:
-                    loss_ctr = infonce_loss(ea, ep, en, temperature=args.temperature)
-                del ea, ep, en, en_flat
-            else:
-                loss_ctr = torch.tensor(0.0, device=device)
-                pos_sim = neg_sim = 0.0
-                B_ctr = args.contrastive_batch_size
-                K = args.num_negatives
+                with torch.no_grad():
+                    # Encode winner
+                    h_w = vae.encoder(pixel_values_w)
+                    moments_w = vae.quant_conv(h_w) if vae.quant_conv is not None else h_w
+                    mean_w, log_var_w = moments_w.chunk(2, dim=1)
+                    std_w = torch.exp(0.5 * log_var_w.clamp(-30, 20))
+                    latents_w = mean_w + std_w * torch.randn_like(mean_w)
+                    latents_w = latents_w * vae.config.scaling_factor
 
-            # ── DPO / CPO loss (small image batch, GPU-memory bound) ─────────────
-            diff_anchor_texts = [format_prompt(tokenizer, t, args.use_chat_template) for t in batch["anchor"]]
-            da_ids, da_mask = tokenize_texts(tokenizer, diff_anchor_texts, args.max_length)
-            da_ids = da_ids.to(device)
-            da_mask = da_mask.to(device)
+                    # Encode loser
+                    h_l = vae.encoder(pixel_values_l)
+                    moments_l = vae.quant_conv(h_l) if vae.quant_conv is not None else h_l
+                    mean_l, log_var_l = moments_l.chunk(2, dim=1)
+                    std_l = torch.exp(0.5 * log_var_l.clamp(-30, 20))
+                    latents_l = mean_l + std_l * torch.randn_like(mean_l)
+                    latents_l = latents_l * vae.config.scaling_factor
 
-            with torch.no_grad():
-                da_out = text_encoder(input_ids=da_ids, attention_mask=da_mask.bool(), output_hidden_states=True)
-                da_h = select_text_source_hidden(
-                    da_out.hidden_states,
-                    source_mode=args.text_source_mode,
-                    layer_idx=args.text_source_layer_idx,
-                    range_start=args.text_source_range_start,
-                    range_end=args.text_source_range_end,
-                ).detach().clone()
-                del da_out
+                # Shared noise and sigma for fair comparison
+                noise = torch.randn_like(latents_w)
+                sigma = torch.rand((latents_w.shape[0],), device=device, dtype=latents_w.dtype)
+                sigma_b = sigma.view(-1, 1, 1, 1)
 
-            pixel_values_w = batch["pixel_values_w"].to(device, dtype=vae.dtype)
-            pixel_values_l = batch["pixel_values_l"].to(device, dtype=vae.dtype)
+                noisy_w = (1.0 - sigma_b) * latents_w + sigma_b * noise
+                target_w = latents_w - noise
 
-            with torch.no_grad():
-                # Encode winner
-                h_w = vae.encoder(pixel_values_w)
-                moments_w = vae.quant_conv(h_w) if vae.quant_conv is not None else h_w
-                mean_w, log_var_w = moments_w.chunk(2, dim=1)
-                std_w = torch.exp(0.5 * log_var_w.clamp(-30, 20))
-                latents_w = mean_w + std_w * torch.randn_like(mean_w)
-                latents_w = latents_w * vae.config.scaling_factor
+                noisy_l = (1.0 - sigma_b) * latents_l + sigma_b * noise
+                target_l = latents_l - noise
 
-                # Encode loser
-                h_l = vae.encoder(pixel_values_l)
-                moments_l = vae.quant_conv(h_l) if vae.quant_conv is not None else h_l
-                mean_l, log_var_l = moments_l.chunk(2, dim=1)
-                std_l = torch.exp(0.5 * log_var_l.clamp(-30, 20))
-                latents_l = mean_l + std_l * torch.randn_like(mean_l)
-                latents_l = latents_l * vae.config.scaling_factor
+                t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
+                cap_feats = [da_h[i][da_mask[i].bool()].to(dtype=transformer_dtype) for i in range(da_h.shape[0])]
 
-            # Shared noise and sigma for fair comparison
-            noise = torch.randn_like(latents_w)
-            sigma = torch.rand((latents_w.shape[0],), device=device, dtype=latents_w.dtype)
-            sigma_b = sigma.view(-1, 1, 1, 1)
-            
-            noisy_w = (1.0 - sigma_b) * latents_w + sigma_b * noise
-            target_w = latents_w - noise
-            
-            noisy_l = (1.0 - sigma_b) * latents_l + sigma_b * noise
-            target_l = latents_l - noise
+                # Forward pass Winner
+                pred_w_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w], t_norm, cap_feats)[0]
+                pred_w = torch.stack(pred_w_list, dim=0).squeeze(2).float()
+                loss_w = F.mse_loss(pred_w, target_w.float(), reduction="none").mean(dim=[1,2,3])
 
-            t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
-            cap_feats = [da_h[i][da_mask[i].bool()].to(dtype=transformer_dtype) for i in range(da_h.shape[0])]
+                # Forward pass Loser
+                pred_l_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l], t_norm, cap_feats)[0]
+                pred_l = torch.stack(pred_l_list, dim=0).squeeze(2).float()
+                loss_l = F.mse_loss(pred_l, target_l.float(), reduction="none").mean(dim=[1,2,3])
 
-            # Forward pass Winner
-            pred_w_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w], t_norm, cap_feats)[0]
-            pred_w = torch.stack(pred_w_list, dim=0).squeeze(2).float()
-            loss_w = F.mse_loss(pred_w, target_w.float(), reduction="none").mean(dim=[1,2,3])
+                # CPO Loss
+                loss_dpo = -F.logsigmoid(args.beta_dpo * (loss_l - loss_w)).mean()
 
-            # Forward pass Loser
-            pred_l_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l], t_norm, cap_feats)[0]
-            pred_l = torch.stack(pred_l_list, dim=0).squeeze(2).float()
-            loss_l = F.mse_loss(pred_l, target_l.float(), reduction="none").mean(dim=[1,2,3])
+                ctr_w = get_ctr_weight(global_step)
+                loss = args.diffusion_weight * loss_dpo + ctr_w * loss_ctr
 
-            # CPO Loss
-            loss_dpo = -F.logsigmoid(args.beta_dpo * (loss_l - loss_w)).mean()
+                if global_step == 0 and accelerator.sync_gradients and is_main:
+                    print(f"[Pretrained baseline] L_dpo={loss_dpo.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
+                          f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
+                          f"p-n={pos_sim - neg_sim:+.4f}  "
+                          f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
-            ctr_w = get_ctr_weight(global_step)
-            loss = args.diffusion_weight * loss_dpo + ctr_w * loss_ctr
+                accelerator.backward(loss)
 
-            if global_step == 0 and is_main:
-                print(f"[Pretrained baseline] L_dpo={loss_dpo.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
-                      f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
-                      f"p-n={pos_sim - neg_sim:+.4f}  "
-                      f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            optimizer.zero_grad(set_to_none=True)
-            accelerator.backward(loss)
-
-            accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
-            optimizer.step()
+            if not accelerator.sync_gradients:
+                continue
 
             global_step += 1
             steps += 1
@@ -1029,6 +1040,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--text_chunk_size", type=int, default=16,
                    help="Chunk size for text encoder / context_refiner forward pass (controls peak memory)")
     p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                   help="Number of micro-batches to accumulate before each optimizer step.")
     p.add_argument("--lr", type=float, default=1e-3, help="(Deprecated) kept for launch-script compatibility; unused.")
     p.add_argument("--refiner_lr", type=float, default=5e-4, help="Learning rate for context_refiner (pre-trained, fine-tuned)")
     p.add_argument("--weight_decay", type=float, default=1e-4)

@@ -21,6 +21,7 @@ TEXT_SOURCE_RANGE_END=${TEXT_SOURCE_RANGE_END:-20}
 # ── Training ──────────────────────────────────────────────────────────────────
 EPOCHS=${EPOCHS:-100}
 BATCH_SIZE=${BATCH_SIZE:-1}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-2}
 CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-32}
 TEXT_CHUNK_SIZE=${TEXT_CHUNK_SIZE:-16}
 NUM_WORKERS=${NUM_WORKERS:-2}
@@ -101,6 +102,7 @@ accelerate launch \
     --text_source_range_end "$TEXT_SOURCE_RANGE_END" \
     --epochs "$EPOCHS" \
     --batch_size "$BATCH_SIZE" \
+    --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --contrastive_batch_size "$CONTRASTIVE_BATCH_SIZE" \
     --text_chunk_size "$TEXT_CHUNK_SIZE" \
     --num_workers "$NUM_WORKERS" \
