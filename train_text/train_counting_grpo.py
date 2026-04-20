@@ -215,9 +215,10 @@ def encode_text_hidden(tokenizer, text_encoder, prompts, max_length, device):
 
 def run_context_refiner(raw_transformer, text_hidden, attn_mask):
     """
-    Run context_refiner on (text_hidden, attn_mask).
-    Respects current autograd context (call inside torch.no_grad() for sampling,
-    or inside accumulate() for training).
+    [Unused in main training loop — kept for debugging / standalone testing]
+    Run cap_embedder + context_refiner standalone.
+    NOTE: do NOT pass the output of this function to transformer_forward_velocity;
+    the transformer's forward already runs cap_embedder + context_refiner internally.
 
     Returns list of B variable-length tensors, each (valid_len, D).
     """
@@ -242,10 +243,13 @@ def run_context_refiner(raw_transformer, text_hidden, attn_mask):
     return [refined[i][attn_mask[i]].to(dtype) for i in range(B)]
 
 
-def transformer_forward_velocity(raw_transformer, latents, t_raw, cap_feats_list):
+def transformer_forward_velocity(raw_transformer, latents, t_raw, text_hidden, attn_mask):
     """
     One DiT forward pass; returns velocity ≈ x1−x0  shape (B, C, H, W).
-    Adapts Z-Image's list-based API.
+
+    Passes raw text_hidden (2560-dim) directly to the transformer so that
+    the transformer's internal cap_embedder + context_refiner run once.
+    Gradients flow through context_refiner naturally when called with grad enabled.
     """
     dtype = next(raw_transformer.parameters()).dtype
     B = latents.shape[0]
@@ -254,6 +258,8 @@ def transformer_forward_velocity(raw_transformer, latents, t_raw, cap_feats_list
         t_norm = t_norm.expand(B)
     lat_in = latents.to(dtype).unsqueeze(2)      # (B, C, 1, H, W)
     lat_list = list(lat_in.unbind(0))            # list[(C, 1, H, W)]
+    # Transformer expects list of (valid_len, raw_dim) tensors — raw 2560-dim features
+    cap_feats_list = [text_hidden[i][attn_mask[i]].to(dtype) for i in range(B)]
     raw_out_list = raw_transformer(lat_list, t_norm, cap_feats_list)[0]
     velocity = torch.stack([o.squeeze(1).float() for o in raw_out_list])  # (B,C,H,W)
     return velocity
@@ -298,8 +304,8 @@ def sample_with_logprob(
     text_hidden, attn_mask = encode_text_hidden(
         tokenizer, text_encoder, prompts, max_length, device
     )
-    # No gradient needed during sampling
-    cap_feats_list = run_context_refiner(raw, text_hidden, attn_mask)
+    # raw text_hidden (2560-dim) is stored and re-used during training;
+    # the transformer handles cap_embedder + context_refiner internally.
 
     # ── Latent initialisation ──────────────────────────────────────────────
     vae_scale = 2 ** (len(vae.config.block_out_channels) - 1) * 2
@@ -346,7 +352,7 @@ def sample_with_logprob(
             all_timesteps.append(t.clone())
 
         t_batch = t.expand(B)
-        velocity = transformer_forward_velocity(raw, latents, t_batch, cap_feats_list)
+        velocity = transformer_forward_velocity(raw, latents, t_batch, text_hidden, attn_mask)
 
         latents, log_prob, _, _ = sde_step_with_logprob(
             scheduler, velocity, t_batch[:1], latents,
@@ -596,11 +602,9 @@ def compute_train_logprob(
     raw = transformer.module if hasattr(transformer, "module") else transformer
     B = sample_latents.shape[0]
 
-    # Current policy cap_feats (with gradient)
-    cap_feats = run_context_refiner(raw, text_hidden, attn_mask)
-
+    # Gradient flows through context_refiner inside transformer_forward_velocity
     t_batch = sample_timestep.expand(B)
-    velocity = transformer_forward_velocity(raw, sample_latents, t_batch, cap_feats)
+    velocity = transformer_forward_velocity(raw, sample_latents, t_batch, text_hidden, attn_mask)
 
     _, log_prob, prev_mean, std_dev = sde_step_with_logprob(
         scheduler,
