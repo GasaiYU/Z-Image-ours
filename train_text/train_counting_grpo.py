@@ -22,6 +22,7 @@ Usage example
 
 import argparse
 import contextlib
+import json
 import math
 import os
 import random
@@ -645,7 +646,8 @@ class QwenVLCountingReward:
         images: list[Image.Image],
         target_nouns: list[str],
         target_counts: list[int],
-    ) -> list[float]:
+        return_details: bool = False,
+    ) -> list[float] | list[dict[str, Any]]:
         import base64
         from io import BytesIO
 
@@ -690,16 +692,26 @@ class QwenVLCountingReward:
             trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=True
         )
 
-        rewards = []
-        for text, target in zip(texts_out, target_counts):
+        details = []
+        for text, noun, target in zip(texts_out, target_nouns, target_counts):
             predicted = parse_count_prediction(text)
             if predicted is not None:
                 offset = abs(predicted - target)
                 reward = max(0.0, 1.0 - 0.5 * offset)
             else:
                 reward = 0.0
-            rewards.append(reward)
-        return rewards
+            details.append(
+                {
+                    "target_noun": noun,
+                    "target_count": int(target),
+                    "predicted_count": None if predicted is None else int(predicted),
+                    "reward": float(reward),
+                    "raw_text": text.strip(),
+                }
+            )
+        if return_details:
+            return details
+        return [d["reward"] for d in details]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -959,6 +971,7 @@ def main(args: argparse.Namespace) -> None:
     # ── Stat tracker & vis setup ───────────────────────────────────────────
     stat_tracker = PerPromptStatTracker(global_std=args.global_std)
     vis_dir = Path(args.output_dir) / "vis"
+    reward_debug_path = Path(args.output_dir) / "reward_debug.jsonl"
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1048,10 +1061,10 @@ def main(args: argparse.Namespace) -> None:
             # ── Compute rewards (async on main; others wait) ───────────────
             if is_main:
                 reward_future = executor.submit(
-                    reward_fn, images, target_nouns, target_counts
+                    reward_fn, images, target_nouns, target_counts, True
                 )
-                rewards_raw = reward_future.result()
-                rewards_np = np.array(rewards_raw, dtype=np.float32)
+                reward_details = reward_future.result()
+                rewards_np = np.array([d["reward"] for d in reward_details], dtype=np.float32)
             else:
                 rewards_np = np.zeros(B, dtype=np.float32)
 
@@ -1087,13 +1100,29 @@ def main(args: argparse.Namespace) -> None:
                     "train/adv_abs_mean": advantages.abs().mean().item(),
                     "train/zero_adv_frac": (advantages.abs() < 1e-4).float().mean().item(),
                 }
+                with reward_debug_path.open("a", encoding="utf-8") as f:
+                    for prompt, detail in zip(prompts, reward_details):
+                        f.write(
+                            json.dumps(
+                                {
+                                    "step": global_step,
+                                    "prompt": prompt,
+                                    **detail,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
                 if use_wandb:
                     wandb.log(wandb_reward_dict, step=global_step)
                     # Log generated images with reward captions (one group per prompt)
                     vis_imgs = []
-                    rewards_list = rewards_t.cpu().tolist()
-                    for i, (img, prompt, r) in enumerate(zip(images, prompts, rewards_list)):
-                        caption = f"r={r:.2f} | {prompt}"
+                    for img, prompt, detail in zip(images, prompts, reward_details):
+                        raw_text = detail["raw_text"] or "<empty>"
+                        caption = (
+                            f"r={detail['reward']:.2f} | pred={detail['predicted_count']} "
+                            f"| target={detail['target_count']} | vlm={raw_text} | {prompt}"
+                        )
                         vis_imgs.append(wandb.Image(img, caption=caption))
                     wandb.log({"train/samples": vis_imgs}, step=global_step)
 
