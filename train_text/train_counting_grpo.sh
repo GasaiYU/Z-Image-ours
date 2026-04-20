@@ -73,7 +73,7 @@ SAVE_EVERY=${SAVE_EVERY:-100}
 VIS_EVERY=${VIS_EVERY:-50}
 SEED=${SEED:-42}
 USE_WANDB=${USE_WANDB:-true}
-WANDB_PROJECT=${WANDB_PROJECT:-z-image-counting-grpo}
+WANDB_PROJECT=${WANDB_PROJECT:-z-image-text-refiner-training}
 WANDB_RUN=${WANDB_RUN:-grpo_fast_qwenvl}
 
 # ─────────────────────────────────────────────────────────────────────────────
