@@ -247,6 +247,25 @@ def build_cap_feats(
     return [refined[i][attention_mask[i].bool()].to(dtype=target_dtype) for i in range(refined.shape[0])]
 
 
+def forward_with_refiner_override(
+    transformer: torch.nn.Module,
+    x: list[torch.Tensor],
+    t: torch.Tensor,
+    cap_feats: list[torch.Tensor],
+    refiner_override: torch.nn.Module | None = None,
+) -> list[torch.Tensor]:
+    if refiner_override is None:
+        return transformer(x, t, cap_feats)[0]
+
+    model = transformer.module if hasattr(transformer, "module") else transformer
+    original_refiner = model.context_refiner
+    model.context_refiner = refiner_override
+    try:
+        return transformer(x, t, cap_feats)[0]
+    finally:
+        model.context_refiner = original_refiner
+
+
 def make_anchor_variants(anchor: str) -> list[str]:
     base = anchor.strip()
     candidates = [
@@ -866,15 +885,7 @@ def main(args: argparse.Namespace) -> None:
                     ).detach().clone()
                     del da_out
 
-                policy_cap_feats = build_cap_feats(transformer, da_h, da_mask, transformer_dtype)
-                with torch.no_grad():
-                    ref_cap_feats = build_cap_feats(
-                        transformer,
-                        da_h,
-                        da_mask,
-                        transformer_dtype,
-                        refiner_override=ref_context_refiner,
-                    )
+                raw_cap_feats = [da_h[i][da_mask[i].bool()].to(dtype=transformer_dtype) for i in range(da_h.shape[0])]
 
                 pixel_values_w = batch["pixel_values_w"].to(device, dtype=vae.dtype)
                 pixel_values_l = batch["pixel_values_l"].to(device, dtype=vae.dtype)
@@ -910,28 +921,34 @@ def main(args: argparse.Namespace) -> None:
                 t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
 
                 # Policy forward pass
-                pred_w_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w], t_norm, policy_cap_feats)[0]
+                noisy_w_inputs = [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w]
+                noisy_l_inputs = [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l]
+                pred_w_list = forward_with_refiner_override(transformer, noisy_w_inputs, t_norm, raw_cap_feats)
                 pred_w = torch.stack(pred_w_list, dim=0).squeeze(2).float()
                 loss_w_policy = F.mse_loss(pred_w, target_w.float(), reduction="none").mean(dim=[1,2,3])
 
-                pred_l_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l], t_norm, policy_cap_feats)[0]
+                pred_l_list = forward_with_refiner_override(transformer, noisy_l_inputs, t_norm, raw_cap_feats)
                 pred_l = torch.stack(pred_l_list, dim=0).squeeze(2).float()
                 loss_l_policy = F.mse_loss(pred_l, target_l.float(), reduction="none").mean(dim=[1,2,3])
 
                 with torch.no_grad():
-                    ref_pred_w_list = transformer(
-                        [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w],
+                    ref_pred_w_list = forward_with_refiner_override(
+                        transformer,
+                        noisy_w_inputs,
                         t_norm,
-                        ref_cap_feats,
-                    )[0]
+                        raw_cap_feats,
+                        refiner_override=ref_context_refiner,
+                    )
                     ref_pred_w = torch.stack(ref_pred_w_list, dim=0).squeeze(2).float()
                     loss_w_ref = F.mse_loss(ref_pred_w, target_w.float(), reduction="none").mean(dim=[1,2,3])
 
-                    ref_pred_l_list = transformer(
-                        [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l],
+                    ref_pred_l_list = forward_with_refiner_override(
+                        transformer,
+                        noisy_l_inputs,
                         t_norm,
-                        ref_cap_feats,
-                    )[0]
+                        raw_cap_feats,
+                        refiner_override=ref_context_refiner,
+                    )
                     ref_pred_l = torch.stack(ref_pred_l_list, dim=0).squeeze(2).float()
                     loss_l_ref = F.mse_loss(ref_pred_l, target_l.float(), reduction="none").mean(dim=[1,2,3])
 
