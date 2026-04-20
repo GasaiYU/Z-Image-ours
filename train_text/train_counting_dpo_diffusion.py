@@ -955,10 +955,15 @@ def main(args: argparse.Namespace) -> None:
                 model_diff = loss_w_policy - loss_l_policy
                 ref_diff = loss_w_ref - loss_l_ref
                 inside_term = -0.5 * args.beta_dpo * (model_diff - ref_diff)
+                # Clamp inside_term to prevent logsigmoid from exploding
+                inside_term = torch.clamp(inside_term, min=-10.0, max=10.0)
+                
                 implicit_acc = (inside_term > 0).float().mean()
                 policy_mse = 0.5 * (loss_w_policy.mean() + loss_l_policy.mean())
                 ref_mse = 0.5 * (loss_w_ref.mean() + loss_l_ref.mean())
-                loss_dpo = -F.logsigmoid(inside_term).mean()
+                
+                # DPO loss + SFT Regularization (Reconstruction loss on winner)
+                loss_dpo = -F.logsigmoid(inside_term).mean() + loss_w_policy.mean()
 
                 ctr_w = get_ctr_weight(global_step)
                 loss = args.diffusion_weight * loss_dpo + ctr_w * loss_ctr
