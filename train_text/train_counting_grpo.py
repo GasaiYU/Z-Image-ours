@@ -1,5 +1,5 @@
 """
-train_counting_grpo.py — Flow-GRPO-Fast for Z-Image counting (1–5 objects).
+train_counting_grpo.py — Flow-GRPO-Fast for Z-Image counting (default 3–7 objects).
 
 Training strategy
 ─────────────────
@@ -60,7 +60,7 @@ from zimage.pipeline import generate as pipeline_generate  # noqa: E402
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
-NUMBER_WORDS = ["one", "two", "three", "four", "five"]
+NUMBER_WORDS = ["one", "two", "three", "four", "five", "six", "seven"]
 NUMBER_TO_INT = {w: i + 1 for i, w in enumerate(NUMBER_WORDS)}
 INT_TO_NUMBER = {v: k for k, v in NUMBER_TO_INT.items()}
 TEXT_TO_INT = {
@@ -174,6 +174,18 @@ def parse_yes_no_prediction(text: str) -> bool | None:
         return False
     return None
 
+
+def get_count_words(min_count: int, max_count: int) -> list[str]:
+    """Return the allowed number words for the configured counting range."""
+    if min_count < 1 or max_count < min_count:
+        raise ValueError(f"Invalid count range: [{min_count}, {max_count}]")
+    if max_count > len(NUMBER_WORDS):
+        raise ValueError(
+            f"max_count={max_count} exceeds supported range 1-{len(NUMBER_WORDS)}. "
+            "Extend NUMBER_WORDS first."
+        )
+    return NUMBER_WORDS[min_count - 1 : max_count]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1a. Prompt contrastive helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,15 +208,16 @@ def make_ctr_anchor_variants(anchor: str) -> list[str]:
     return candidates  # never contains the original anchor itself
 
 
-def make_ctr_negatives(noun: str, target_count: str) -> list[str]:
+def make_ctr_negatives(noun: str, target_count: str, count_words: list[str]) -> list[str]:
     """All other count variants of the same noun — hard negatives."""
-    return [compose_ctr_anchor(c, noun) for c in NUMBER_WORDS if c != target_count]
+    return [compose_ctr_anchor(c, noun) for c in count_words if c != target_count]
 
 
 def sample_ctr_batch(
     nouns: list[str],
     batch_size: int,
     num_negatives: int,
+    count_words: list[str],
 ) -> dict[str, list[str]]:
     """
     Build anchor / positive / negative text triplets for InfoNCE.
@@ -217,10 +230,10 @@ def sample_ctr_batch(
     sampled_nouns = random.choices(nouns, k=batch_size)
     anchors, positives, negatives_flat = [], [], []
     for noun in sampled_nouns:
-        count = random.choice(NUMBER_WORDS)
+        count = random.choice(count_words)
         anchor = compose_ctr_anchor(count, noun)
         positive = random.choice(make_ctr_anchor_variants(anchor))
-        neg_pool = make_ctr_negatives(noun, count)          # ≤ 4 unique strings
+        neg_pool = make_ctr_negatives(noun, count, count_words)
         if len(neg_pool) >= num_negatives:
             chosen_negs = random.sample(neg_pool, num_negatives)
         else:
@@ -778,11 +791,11 @@ class CountingPromptDataset(Dataset):
 
     PROMPT_TEMPLATE = "a photo of {count_phrase} on a white background"
 
-    def __init__(self, nouns: list[str], max_count: int = 5):
+    def __init__(self, nouns: list[str], min_count: int = 3, max_count: int = 7):
+        count_words = get_count_words(min_count, max_count)
         self.items: list[tuple[str, str, int]] = []
         for noun in nouns:
-            for cnt in range(1, max_count + 1):
-                cw = NUMBER_WORDS[cnt - 1]
+            for cnt, cw in zip(range(min_count, max_count + 1), count_words):
                 prompt = self.PROMPT_TEMPLATE.format(count_phrase=count_noun_phrase(cw, noun))
                 self.items.append((prompt, noun, cnt))
 
@@ -962,7 +975,12 @@ def main(args: argparse.Namespace) -> None:
 
     # ── Dataset & dataloader ───────────────────────────────────────────────
     nouns = load_nouns(args.nouns_file)
-    dataset = CountingPromptDataset(nouns=nouns, max_count=args.max_count)
+    count_words = get_count_words(args.min_count, args.max_count)
+    dataset = CountingPromptDataset(
+        nouns=nouns,
+        min_count=args.min_count,
+        max_count=args.max_count,
+    )
     # Each iteration: sample `train_batch_size` unique prompts
     loader = DataLoader(
         dataset,
@@ -1100,14 +1118,10 @@ def main(args: argparse.Namespace) -> None:
 
             # Drop samples where all advantages in group are zero (all same reward)
             group_adv = advantages.view(B_unique, args.group_size)
-            active_mask = group_adv.abs().sum(dim=1) != 0  # (B_unique,)
-            active_mask = active_mask.repeat_interleave(args.group_size)  # (B,)
-            if active_mask.sum() == 0:
-                if is_main:
-                    print(f"[Step {global_step}] All advantages zero, skipping.")
-                continue
-
-            # Log reward stats
+            active_groups = group_adv.abs().sum(dim=1) != 0  # (B_unique,)
+            active_mask = active_groups.repeat_interleave(args.group_size)  # (B,)
+            num_active_groups = int(active_groups.sum().item())
+            skipped_all_zero_adv = float(num_active_groups == 0)
             if is_main:
                 wandb_reward_dict = {
                     "train/reward_mean":  rewards_t.mean().item(),
@@ -1115,6 +1129,8 @@ def main(args: argparse.Namespace) -> None:
                     "train/adv_mean":     advantages.mean().item(),
                     "train/adv_abs_mean": advantages.abs().mean().item(),
                     "train/zero_adv_frac": (advantages.abs() < 1e-4).float().mean().item(),
+                    "train/active_group_frac": num_active_groups / max(B_unique, 1),
+                    "train/all_zero_adv_skip": skipped_all_zero_adv,
                 }
                 with reward_debug_path.open("a", encoding="utf-8") as f:
                     for prompt, detail in zip(prompts, reward_details):
@@ -1141,6 +1157,11 @@ def main(args: argparse.Namespace) -> None:
                         )
                         vis_imgs.append(wandb.Image(img, caption=caption))
                     wandb.log({"train/samples": vis_imgs}, step=global_step)
+
+            if active_mask.sum() == 0:
+                if is_main:
+                    print(f"[Step {global_step}] All advantages zero, skipping.")
+                continue
 
             # ── Policy gradient update ─────────────────────────────────────
             # For each SDE window step j, re-compute log_prob under current policy
@@ -1199,7 +1220,12 @@ def main(args: argparse.Namespace) -> None:
             # ── Prompt contrastive loss (text-only, independent of images) ────
             loss_ctr_val = 0.0
             if args.contrastive_weight > 0:
-                ctr_data = sample_ctr_batch(nouns, args.contrastive_batch_size, args.num_ctr_negatives)
+                ctr_data = sample_ctr_batch(
+                    nouns,
+                    args.contrastive_batch_size,
+                    args.num_ctr_negatives,
+                    count_words,
+                )
                 all_texts = ctr_data["anchors"] + ctr_data["positives"] + ctr_data["negatives_flat"]
                 with accelerator.accumulate(transformer):
                     all_feats = compute_ctr_feats(
@@ -1363,7 +1389,9 @@ def parse_args() -> argparse.Namespace:
                    help="Unique prompts per round (per GPU)")
     p.add_argument("--group_size", type=int, default=4,
                    help="Images per prompt (group for advantage normalisation)")
-    p.add_argument("--max_count", type=int, default=5,
+    p.add_argument("--min_count", type=int, default=3,
+                   help="Minimum object count in training prompts")
+    p.add_argument("--max_count", type=int, default=7,
                    help="Maximum object count in training prompts")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
