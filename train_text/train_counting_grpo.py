@@ -92,6 +92,137 @@ def load_nouns(path: str) -> list[str]:
     return nouns
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 1a. Prompt contrastive helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compose_ctr_anchor(count_word: str, noun: str) -> str:
+    return f"{count_word} {noun}"
+
+
+def make_ctr_anchor_variants(anchor: str) -> list[str]:
+    """Surface paraphrases of anchor — used as positives in InfoNCE."""
+    base = anchor.strip()
+    candidates = [
+        f"a photo of {base}",
+        f"an image of {base}",
+        f"a picture of {base}",
+        f"{base} on a white background",
+        f"a clear photo of {base}",
+        f"a detailed photo of {base}",
+    ]
+    return candidates  # never contains the original anchor itself
+
+
+def make_ctr_negatives(noun: str, target_count: str) -> list[str]:
+    """All other count variants of the same noun — hard negatives."""
+    return [compose_ctr_anchor(c, noun) for c in NUMBER_WORDS if c != target_count]
+
+
+def sample_ctr_batch(
+    nouns: list[str],
+    batch_size: int,
+    num_negatives: int,
+) -> dict[str, list[str]]:
+    """
+    Build anchor / positive / negative text triplets for InfoNCE.
+
+    Returns dict with keys:
+      anchors         : list[str]  length = batch_size
+      positives       : list[str]  length = batch_size
+      negatives_flat  : list[str]  length = batch_size * num_negatives
+    """
+    sampled_nouns = random.choices(nouns, k=batch_size)
+    anchors, positives, negatives_flat = [], [], []
+    for noun in sampled_nouns:
+        count = random.choice(NUMBER_WORDS)
+        anchor = compose_ctr_anchor(count, noun)
+        positive = random.choice(make_ctr_anchor_variants(anchor))
+        neg_pool = make_ctr_negatives(noun, count)          # ≤ 4 unique strings
+        if len(neg_pool) >= num_negatives:
+            chosen_negs = random.sample(neg_pool, num_negatives)
+        else:
+            chosen_negs = random.choices(neg_pool, k=num_negatives)
+        anchors.append(anchor)
+        positives.append(positive)
+        negatives_flat.extend(chosen_negs)
+    return {"anchors": anchors, "positives": positives, "negatives_flat": negatives_flat}
+
+
+def compute_ctr_feats(
+    raw_transformer,
+    text_encoder,
+    tokenizer,
+    texts: list[str],
+    max_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    text_encoder (frozen, no grad) → cap_embedder + context_refiner (trainable, grad)
+    → mean-pool valid tokens → L2-norm → (N, D_out) float32 tensor.
+
+    This is the standalone text-only path for contrastive learning.
+    It does NOT go through the full DiT forward pass.
+    """
+    enc = tokenizer(
+        texts,
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids = enc.input_ids.to(device)
+    attn_mask  = enc.attention_mask.to(device).bool()
+
+    # ── Frozen text encoder ────────────────────────────────────────────────
+    with torch.no_grad():
+        out = text_encoder(
+            input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True
+        )
+        hidden = out.hidden_states[-2].detach()  # (N, L, D_text)
+
+    # ── Trainable cap_embedder + context_refiner ───────────────────────────
+    N, L, _ = hidden.shape
+    dtype = next(raw_transformer.parameters()).dtype
+
+    cap_feats = raw_transformer.cap_embedder(hidden.to(dtype))
+    cap_feats = cap_feats.clone()
+    cap_feats[~attn_mask] = raw_transformer.cap_pad_token.to(dtype)
+
+    pos_ids = torch.zeros((N, L, 3), dtype=torch.int32, device=device)
+    pos_ids[:, :, 0] = (
+        torch.arange(1, L + 1, dtype=torch.int32, device=device).unsqueeze(0).expand(N, -1)
+    )
+    freqs = raw_transformer.rope_embedder(pos_ids.view(-1, 3)).view(N, L, -1)
+
+    refined = cap_feats
+    for layer in raw_transformer.context_refiner:
+        refined = layer(refined, attn_mask, freqs)   # (N, L, D_out)
+
+    # ── Mean-pool over valid tokens ────────────────────────────────────────
+    mask_f = attn_mask.float().unsqueeze(-1)         # (N, L, 1)
+    pooled = (refined.float() * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1e-6)
+    return F.normalize(pooled, dim=-1)               # (N, D_out)
+
+
+def infonce_loss(
+    ea: torch.Tensor,   # (B, D)  anchor features
+    ep: torch.Tensor,   # (B, D)  positive features
+    en: torch.Tensor,   # (B, K, D) negative features
+    temperature: float,
+) -> torch.Tensor:
+    """
+    InfoNCE: for each anchor, one positive vs K negatives.
+    Loss = -log( exp(a·p/τ) / (exp(a·p/τ) + Σ exp(a·n_k/τ)) )
+    """
+    ea, ep, en = ea.float(), ep.float(), en.float()
+    pos_logit = (ea * ep).sum(dim=-1, keepdim=True) / temperature          # (B, 1)
+    neg_logits = (ea.unsqueeze(1) * en).sum(dim=-1) / temperature          # (B, K)
+    logits = torch.cat([pos_logit, neg_logits], dim=1)                     # (B, 1+K)
+    labels = torch.zeros(ea.shape[0], dtype=torch.long, device=ea.device)
+    return F.cross_entropy(logits, labels)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 1. SDE step with log-probability  (Z-Image adaptation of flow_grpo)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -503,29 +634,34 @@ class QwenVLCountingReward:
 
 class PerPromptStatTracker:
     """
-    Tracks reward history per prompt; normalises rewards to advantages.
-    global_std=True: use batch-level std (more stable for small groups).
+    Standard GRPO within-group advantage normalisation.
+
+    For each unique prompt, normalise rewards by the mean and std of the group
+    (the group_size samples generated for that prompt in this iteration).
+    This is the formulation from the GRPO paper and is independent of history,
+    ensuring advantages are always well-scaled even at the start of training.
+
+    If all samples in a group share the same reward (std ≈ 0), advantages for
+    that group remain 0 — the sample will be skipped by the caller.
     """
 
     def __init__(self, global_std: bool = True):
-        self.stats: dict[str, list[float]] = {}
+        # global_std kept for API compatibility; within-group std is always used
         self.global_std = global_std
 
     def update(self, prompts: list[str], rewards: np.ndarray) -> np.ndarray:
-        unique_prompts = np.unique(prompts)
+        prompts_arr = np.array(prompts)
         advantages = np.zeros_like(rewards)
-        for p in unique_prompts:
-            mask = np.array(prompts) == p
-            pr = rewards[mask]
-            self.stats.setdefault(p, []).extend(pr.tolist())
-            all_r = np.array(self.stats[p])
-            mean = all_r.mean()
-            std = (rewards.std() if self.global_std else all_r.std()) + 1e-4
-            advantages[mask] = (pr - mean) / std
+        for p in np.unique(prompts_arr):
+            mask = prompts_arr == p
+            gr = rewards[mask]                     # rewards for this group
+            mean = gr.mean()
+            std = gr.std() + 1e-6                  # per-group std
+            advantages[mask] = (gr - mean) / std
         return advantages
 
     def clear(self):
-        self.stats.clear()
+        pass  # stateless — nothing to clear
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -690,6 +826,10 @@ def main(args: argparse.Namespace) -> None:
     tokenizer   = components["tokenizer"]
     scheduler   = components["scheduler"]
 
+    # Decoder-only text encoders need left-padding so that the last token
+    # (used as the sequence embedding) is always a real token, not a pad token.
+    tokenizer.padding_side = "left"
+
     for p in vae.parameters():
         p.requires_grad_(False)
     for p in text_encoder.parameters():
@@ -849,7 +989,6 @@ def main(args: argparse.Namespace) -> None:
             # ── Compute per-prompt advantages ──────────────────────────────
             if is_main:
                 advantages_np = stat_tracker.update(prompts, rewards_t.cpu().numpy())
-                stat_tracker.clear()
             else:
                 advantages_np = np.zeros(B, dtype=np.float32)
 
@@ -931,15 +1070,52 @@ def main(args: argparse.Namespace) -> None:
                 info_step["clipfrac"].append(clipfrac.item())
                 info_step["ratio_mean"].append(ratio.detach().mean().item())
 
+            # ── Prompt contrastive loss (text-only, independent of images) ────
+            loss_ctr_val = 0.0
+            if args.contrastive_weight > 0:
+                ctr_data = sample_ctr_batch(nouns, args.contrastive_batch_size, args.num_ctr_negatives)
+                all_texts = ctr_data["anchors"] + ctr_data["positives"] + ctr_data["negatives_flat"]
+                with accelerator.accumulate(transformer):
+                    all_feats = compute_ctr_feats(
+                        raw, text_encoder, tokenizer, all_texts, args.max_length, device
+                    )
+                    B_ctr = len(ctr_data["anchors"])
+                    K     = args.num_ctr_negatives
+                    ea      = all_feats[:B_ctr]
+                    ep      = all_feats[B_ctr : 2 * B_ctr]
+                    en_flat = all_feats[2 * B_ctr :]
+                    en = en_flat.view(B_ctr, K, -1)
+
+                    with torch.no_grad():
+                        pos_sim = (ea * ep).sum(dim=-1).mean().item()
+                        neg_sim = (ea.unsqueeze(1) * en).sum(dim=-1).mean().item()
+
+                    loss_ctr = infonce_loss(ea, ep, en, args.temperature) * args.contrastive_weight
+                    loss_ctr_val = loss_ctr.item()
+
+                    accelerator.backward(loss_ctr)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+            else:
+                pos_sim = neg_sim = 0.0
+
             if accelerator.sync_gradients:
                 global_step += 1
                 step_metrics = {k: float(np.mean(v)) for k, v in info_step.items()}
+                step_metrics["loss_ctr"] = loss_ctr_val
                 for k, v in step_metrics.items():
                     info_epoch[k].append(v)
 
                 if is_main and use_wandb:
                     wandb.log(
-                        {f"train/{k}": v for k, v in step_metrics.items()},
+                        {
+                            **{f"train/{k}": v for k, v in step_metrics.items()},
+                            "train/ctr_pos_sim": pos_sim,
+                            "train/ctr_neg_sim": neg_sim,
+                            "train/ctr_pos_neg_gap": pos_sim - neg_sim,
+                        },
                         step=global_step,
                     )
                 if is_main:
@@ -948,7 +1124,8 @@ def main(args: argparse.Namespace) -> None:
                         f"loss={step_metrics['loss']:.4f}  "
                         f"kl={step_metrics['approx_kl']:.4f}  "
                         f"clip={step_metrics['clipfrac']:.3f}  "
-                        f"reward={rewards_t.mean().item():.3f}"
+                        f"reward={rewards_t.mean().item():.3f}  "
+                        f"ctr={loss_ctr_val:.4f}  p-n={pos_sim - neg_sim:+.3f}"
                     )
 
                 # Save checkpoint
@@ -1070,6 +1247,16 @@ def parse_args() -> argparse.Namespace:
                    choices=["no", "fp16", "bf16"])
     p.add_argument("--gradient_checkpointing", action="store_true", default=False,
                    help="Enable gradient checkpointing on DiT layers to reduce memory usage")
+
+    # ── Prompt contrastive loss ───────────────────────────────────────────
+    p.add_argument("--contrastive_weight", type=float, default=1.0,
+                   help="Weight for InfoNCE prompt contrastive loss; 0 = disabled")
+    p.add_argument("--temperature", type=float, default=0.07,
+                   help="InfoNCE temperature")
+    p.add_argument("--num_ctr_negatives", type=int, default=4,
+                   help="Hard negatives per anchor (different-count variants; max 4 for 5 number words)")
+    p.add_argument("--contrastive_batch_size", type=int, default=16,
+                   help="Number of anchor prompts per contrastive update step")
 
     # ── GRPO loss ─────────────────────────────────────────────────────────
     p.add_argument("--clip_range", type=float, default=1e-5,

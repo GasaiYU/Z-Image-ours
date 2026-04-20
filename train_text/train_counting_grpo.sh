@@ -57,6 +57,12 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-true}
 
+# ── Prompt contrastive loss ───────────────────────────────────────────────────
+CONTRASTIVE_WEIGHT=${CONTRASTIVE_WEIGHT:-1.0}   # 0 to disable
+TEMPERATURE=${TEMPERATURE:-0.07}
+NUM_CTR_NEGATIVES=${NUM_CTR_NEGATIVES:-4}
+CONTRASTIVE_BATCH_SIZE=${CONTRASTIVE_BATCH_SIZE:-16}
+
 # ── GRPO loss ─────────────────────────────────────────────────────────────────
 # flow_grpo fast configs use clip_range=1e-5
 CLIP_RANGE=${CLIP_RANGE:-1e-5}
@@ -129,6 +135,10 @@ accelerate launch \
         --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
         --max_grad_norm          "${MAX_GRAD_NORM}" \
         --mixed_precision        "${MIXED_PRECISION}" \
+        --contrastive_weight     "${CONTRASTIVE_WEIGHT}" \
+        --temperature            "${TEMPERATURE}" \
+        --num_ctr_negatives      "${NUM_CTR_NEGATIVES}" \
+        --contrastive_batch_size "${CONTRASTIVE_BATCH_SIZE}" \
         --clip_range             "${CLIP_RANGE}" \
         --adv_clip_max           "${ADV_CLIP_MAX}" \
         --global_std \
