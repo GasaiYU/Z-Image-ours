@@ -6,8 +6,7 @@ NUM_GPUS=${NUM_GPUS:-8}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 MODEL_DIR=${MODEL_DIR:-ckpts/Z-Image-Turbo}
-TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/counting_triplets_filtered.jsonl}
-GENERATED_ROOT=${GENERATED_ROOT:-data/generated_images}
+TRIPLETS_JSONL=${TRIPLETS_JSONL:-data/train_triplets/DPO/counting_dpo_index.jsonl}
 OUTPUT_DIR=${OUTPUT_DIR:-train_text/checkpoints/counting_text_refiner_dpo}
 
 # ── Data / model ──────────────────────────────────────────────────────────────
@@ -92,7 +91,6 @@ accelerate launch \
   train_text/train_counting_dpo_diffusion.py \
     --model_dir "$MODEL_DIR" \
     --triplets_jsonl "$TRIPLETS_JSONL" \
-    --generated_root "$GENERATED_ROOT" \
     --output_dir "$OUTPUT_DIR" \
     --verdict_threshold "$VERDICT_THRESHOLD" \
     --resolution "$RESOLUTION" \
