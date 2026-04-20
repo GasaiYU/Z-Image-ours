@@ -1018,6 +1018,13 @@ def main(args: argparse.Namespace) -> None:
                 }
                 if use_wandb:
                     wandb.log(wandb_reward_dict, step=global_step)
+                    # Log generated images with reward captions (one group per prompt)
+                    vis_imgs = []
+                    rewards_list = rewards_t.cpu().tolist()
+                    for i, (img, prompt, r) in enumerate(zip(images, prompts, rewards_list)):
+                        caption = f"r={r:.2f} | {prompt}"
+                        vis_imgs.append(wandb.Image(img, caption=caption))
+                    wandb.log({"train/samples": vis_imgs}, step=global_step)
 
             # ── Policy gradient update ─────────────────────────────────────
             # For each SDE window step j, re-compute log_prob under current policy
