@@ -260,8 +260,9 @@ def sde_step_with_logprob(
     dt = sigma_next - sigma  # negative: sigma decreases during denoising
 
     if noise_level <= 0.0:
-        # Pure ODE (Z-Image sign convention: noise_pred = −velocity)
-        prev_sample_mean = sample + dt * (-velocity)
+        # Pure ODE Euler step: x_next = x_t + dt * velocity, where dt = σ_next - σ < 0
+        # and velocity = x1 - x0.  With dt < 0 this correctly denoises toward x0.
+        prev_sample_mean = sample + dt * velocity
         log_prob = torch.zeros(sample.shape[0], device=sample.device)
         std_dev_t = torch.zeros(1, device=sample.device)
         return prev_sample_mean, log_prob, prev_sample_mean, std_dev_t
@@ -392,9 +393,10 @@ def transformer_forward_velocity(raw_transformer, latents, t_raw, text_hidden, a
     # Transformer expects list of (valid_len, raw_dim) tensors — raw 2560-dim features
     cap_feats_list = [text_hidden[i][attn_mask[i]].to(dtype) for i in range(B)]
     raw_out_list = raw_transformer(lat_list, t_norm, cap_feats_list)[0]
-    # Z-Image convention: transformer outputs (x1-x0), but scheduler.step expects -(x1-x0).
-    # The original pipeline negates before calling scheduler.step (see pipeline.py line 274).
-    velocity = -torch.stack([o.squeeze(1).float() for o in raw_out_list])  # (B,C,H,W)
+    # Return raw transformer output: velocity = x1 - x0.
+    # NOTE: the original pipeline negates this before calling scheduler.step(), but our
+    # sde_step_with_logprob implements the Euler/SDE math directly and expects x1-x0.
+    velocity = torch.stack([o.squeeze(1).float() for o in raw_out_list])  # (B,C,H,W)
     return velocity
 
 
