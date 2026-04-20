@@ -228,7 +228,7 @@ def infonce_loss(
 
 def sde_step_with_logprob(
     scheduler,
-    velocity: torch.Tensor,          # raw transformer output  ≈ x1 − x0
+    velocity: torch.Tensor,          # denoising velocity ≈ x1 − x0
     timestep: torch.Tensor,          # scalar or (B,) raw scheduler timestep
     sample: torch.Tensor,            # x_t  shape (B, C, H, W)
     noise_level: float = 0.8,
@@ -377,7 +377,7 @@ def run_context_refiner(raw_transformer, text_hidden, attn_mask):
 
 def transformer_forward_velocity(raw_transformer, latents, t_raw, text_hidden, attn_mask):
     """
-    One DiT forward pass; returns velocity ≈ x1−x0  shape (B, C, H, W).
+    One DiT forward pass; returns denoising velocity ≈ x1−x0  shape (B, C, H, W).
 
     Passes raw text_hidden (2560-dim) directly to the transformer so that
     the transformer's internal cap_embedder + context_refiner run once.
@@ -393,10 +393,14 @@ def transformer_forward_velocity(raw_transformer, latents, t_raw, text_hidden, a
     # Transformer expects list of (valid_len, raw_dim) tensors — raw 2560-dim features
     cap_feats_list = [text_hidden[i][attn_mask[i]].to(dtype) for i in range(B)]
     raw_out_list = raw_transformer(lat_list, t_norm, cap_feats_list)[0]
-    # Return raw transformer output: velocity = x1 - x0.
-    # NOTE: the original pipeline negates this before calling scheduler.step(), but our
-    # sde_step_with_logprob implements the Euler/SDE math directly and expects x1-x0.
-    velocity = torch.stack([o.squeeze(1).float() for o in raw_out_list])  # (B,C,H,W)
+    # Z-Image's native pipeline does:
+    #   noise_pred = -raw_out.squeeze(2)
+    #   latents = scheduler.step(noise_pred, t, latents)
+    # and scheduler.step implements x_next = x_t + dt * model_output.
+    # Therefore the raw transformer output is the opposite sign of the denoising
+    # velocity used by the flow-matching scheduler. Negate here so all custom
+    # ODE/SDE math below consistently works with velocity = x1 - x0.
+    velocity = -torch.stack([o.squeeze(1).float() for o in raw_out_list])  # (B,C,H,W)
     return velocity
 
 
