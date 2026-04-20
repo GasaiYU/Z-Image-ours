@@ -46,9 +46,9 @@ NOISE_LEVEL=${NOISE_LEVEL:-0.8}
 NUM_EPOCHS=${NUM_EPOCHS:-200}
 NUM_BATCHES_PER_EPOCH=${NUM_BATCHES_PER_EPOCH:-4}
 # unique prompts per batch (per GPU)
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}
 # images generated per prompt (larger = more stable advantages, more GPU memory)
-GROUP_SIZE=${GROUP_SIZE:-4}
+GROUP_SIZE=${GROUP_SIZE:-8}
 MAX_COUNT=${MAX_COUNT:-5}
 
 LR=${LR:-2e-4}
