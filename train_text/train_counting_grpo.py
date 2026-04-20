@@ -65,8 +65,18 @@ NUMBER_TO_INT = {w: i + 1 for i, w in enumerate(NUMBER_WORDS)}
 INT_TO_NUMBER = {v: k for k, v in NUMBER_TO_INT.items()}
 TEXT_TO_INT = {
     "zero": 0,
-    "no": 0,
-    **NUMBER_TO_INT,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
 }
 
 # Default nouns file (relative to repo root); overridden by --nouns_file arg
@@ -145,15 +155,14 @@ def count_noun_phrase(count: int | str, noun: str) -> str:
 
 
 def parse_count_prediction(text: str) -> int | None:
-    """Parse either digit counts ('4') or word counts ('four') from VLM output."""
-    nums = re.findall(r"\d+", text.strip())
-    if nums:
-        return int(nums[0])
-
-    tokens = re.findall(r"[a-z]+", text.lower())
-    for token in tokens:
-        if token in TEXT_TO_INT:
-            return TEXT_TO_INT[token]
+    """Parse counts exactly like filter_triplet_images.py."""
+    m = re.search(r"\b(\d+)\b", text)
+    if m:
+        return int(m.group(1))
+    lowered = text.lower()
+    for word, val in TEXT_TO_INT.items():
+        if re.search(rf"\b{word}\b", lowered):
+            return val
     return None
 
 
@@ -628,17 +637,12 @@ class QwenVLCountingReward:
     Wraps Qwen2.5-VL-7B-Instruct to score counting accuracy.
 
     Reward mapping:
-      ask VLM whether the image contains exactly the requested count.
-      yes -> 1.0
-      no / unknown -> 0.0
+      exact match -> 1.0
+      off by 1    -> 0.5
+      otherwise   -> 0.0
     """
 
-    _PROMPT_TEMPLATE = (
-        "Look at this image carefully. "
-        "Does this image show exactly {count_phrase}? "
-        "Count only complete objects and ignore shadows, printed patterns, object parts, and background shapes. "
-        "Reply with yes or no only."
-    )
+    _PROMPT_TEMPLATE = "How many {noun_phrase} are visible in this image? Answer with a single number only, e.g. '3'."
 
     def __init__(self, model_path: str, device: str = "cuda"):
         from transformers import AutoProcessor
@@ -695,7 +699,7 @@ class QwenVLCountingReward:
                 "role": "user",
                 "content": [
                     {"type": "image", "image": img_to_base64(img)},
-                    {"type": "text",  "text": self._PROMPT_TEMPLATE.format(count_phrase=count_noun_phrase(count, noun))},
+                    {"type": "text",  "text": self._PROMPT_TEMPLATE.format(noun_phrase=pluralize_noun(noun))},
                 ],
             }])
 
@@ -719,21 +723,28 @@ class QwenVLCountingReward:
                 text=texts, padding=True, return_tensors="pt"
             ).to(self.device)
 
-        gen_ids = self.model.generate(**inputs, max_new_tokens=8)
+        gen_ids = self.model.generate(**inputs, max_new_tokens=32)
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, gen_ids)]
         texts_out = self.processor.batch_decode(
-            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
 
         details = []
         for text, noun, target in zip(texts_out, target_nouns, target_counts):
-            predicted_match = parse_yes_no_prediction(text)
-            reward = 1.0 if predicted_match is True else 0.0
+            predicted_count = parse_count_prediction(text)
+            if predicted_count is None:
+                reward = 0.0
+            elif predicted_count == target:
+                reward = 1.0
+            elif abs(predicted_count - target) == 1:
+                reward = 0.5
+            else:
+                reward = 0.0
             details.append(
                 {
                     "target_noun": noun,
                     "target_count": int(target),
-                    "predicted_match": predicted_match,
+                    "predicted_count": predicted_count,
                     "reward": float(reward),
                     "raw_text": text.strip(),
                 }
@@ -1158,7 +1169,7 @@ def main(args: argparse.Namespace) -> None:
                         raw_text = detail["raw_text"] or "<empty>"
                         caption = (
                             f"rollout={rollout_step} | opt={global_step} | "
-                            f"r={detail['reward']:.2f} | match={detail['predicted_match']} "
+                            f"r={detail['reward']:.2f} | pred={detail['predicted_count']} "
                             f"| target={detail['target_count']} | vlm={raw_text} | {prompt}"
                         )
                         vis_imgs.append(wandb.Image(img, caption=caption))
