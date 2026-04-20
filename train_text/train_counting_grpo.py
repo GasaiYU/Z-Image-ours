@@ -1020,6 +1020,7 @@ def main(args: argparse.Namespace) -> None:
     executor = futures.ThreadPoolExecutor(max_workers=2)
 
     global_step = 0
+    rollout_step = 0
     raw = transformer.module if hasattr(transformer, "module") else transformer
 
     # ── Visualise at step 0 ────────────────────────────────────────────────
@@ -1044,6 +1045,7 @@ def main(args: argparse.Namespace) -> None:
             desc=f"Epoch {epoch}: sample+train",
             disable=not is_main,
         ):
+            rollout_step += 1
             try:
                 batch = next(train_iter)
             except StopIteration:
@@ -1138,6 +1140,7 @@ def main(args: argparse.Namespace) -> None:
                             json.dumps(
                                 {
                                     "step": global_step,
+                                    "rollout_step": rollout_step,
                                     "prompt": prompt,
                                     **detail,
                                 },
@@ -1146,21 +1149,24 @@ def main(args: argparse.Namespace) -> None:
                             + "\n"
                         )
                 if use_wandb:
-                    wandb.log(wandb_reward_dict, step=global_step)
+                    wandb_reward_dict["train/rollout_step"] = rollout_step
+                    wandb_reward_dict["train/optimizer_step"] = global_step
+                    wandb.log(wandb_reward_dict, step=rollout_step)
                     # Log generated images with reward captions (one group per prompt)
                     vis_imgs = []
                     for img, prompt, detail in zip(images, prompts, reward_details):
                         raw_text = detail["raw_text"] or "<empty>"
                         caption = (
+                            f"rollout={rollout_step} | opt={global_step} | "
                             f"r={detail['reward']:.2f} | match={detail['predicted_match']} "
                             f"| target={detail['target_count']} | vlm={raw_text} | {prompt}"
                         )
                         vis_imgs.append(wandb.Image(img, caption=caption))
-                    wandb.log({"train/samples": vis_imgs}, step=global_step)
+                    wandb.log({"train/samples": vis_imgs}, step=rollout_step)
 
             if active_mask.sum() == 0:
                 if is_main:
-                    print(f"[Step {global_step}] All advantages zero, skipping.")
+                    print(f"[Rollout {rollout_step} | Opt {global_step}] All advantages zero, skipping.")
                 continue
 
             # ── Policy gradient update ─────────────────────────────────────
@@ -1267,6 +1273,8 @@ def main(args: argparse.Namespace) -> None:
                             "train/ctr_pos_sim": pos_sim,
                             "train/ctr_neg_sim": neg_sim,
                             "train/ctr_pos_neg_gap": pos_sim - neg_sim,
+                            "train/rollout_step": rollout_step,
+                            "train/optimizer_step": global_step,
                         },
                         step=global_step,
                     )
