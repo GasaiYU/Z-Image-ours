@@ -412,10 +412,15 @@ class QwenVLCountingReward:
                 from transformers import AutoModelForVision2Seq as _VLModel
 
         self.device = device
+        try:
+            import flash_attn  # noqa: F401
+            _attn_impl = "flash_attention_2"
+        except ImportError:
+            _attn_impl = "sdpa"
         self.model = _VLModel.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_attn_impl,
             device_map=None,
         ).to(device)
         self.model.eval()
