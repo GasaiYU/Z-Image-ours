@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 
 VALID_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-DEFAULT_THRESHOLD = 0.5
+DEFAULT_THRESHOLD = 0.8
 
 
 def parse_args() -> argparse.Namespace:
