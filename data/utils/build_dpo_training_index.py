@@ -2,14 +2,15 @@
 build_dpo_training_index.py
 ===========================
 扫描 data/dpo_edit_images 下的 noun/count 目录，读取 meta.json 和 verdict.json，
-生成按 noun 聚合的 DPO 训练索引 JSONL。
+生成按 noun 聚合的 DPO 训练索引 JSON。
 
-输出每行一个 noun，包含该 noun 下不同数量词的可用图像池，供后续 DPO 训练使用。
+输出为一个带缩进的 JSON 数组，每个元素对应一个 noun，包含该 noun 下不同数量词
+的 anchor pools，以及满足阈值的图片路径。
 
 示例：
-  python data/build_dpo_training_index.py \
+  python data/utils/build_dpo_training_index.py \
       --dpo_root data/dpo_edit_images \
-      --output_jsonl data/train_triplets/DPO/counting_dpo_index.jsonl
+      --output_json data/train_triplets/DPO/counting_dpo_index.json
 """
 
 from __future__ import annotations
@@ -30,10 +31,16 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build noun-grouped DPO training index from dpo_edit_images.")
     p.add_argument("--dpo_root", type=str, default="data/dpo_edit_images", help="DPO 编辑图目录根路径")
     p.add_argument(
+        "--output_json",
+        type=str,
+        default="data/train_triplets/DPO/counting_dpo_index.json",
+        help="输出索引 JSON 文件",
+    )
+    p.add_argument(
         "--output_jsonl",
         type=str,
-        default="data/train_triplets/DPO/counting_dpo_index.jsonl",
-        help="输出索引 JSONL 文件",
+        default="",
+        help="兼容旧参数名；若提供则等价于 --output_json",
     )
     p.add_argument(
         "--threshold",
@@ -172,30 +179,22 @@ def build_pool_entry(
     anchor = resolve_anchor(noun, count_word)
 
     pool = {
-        "target_count": target_count,
-        "target_word": count_word,
+        "noun": noun,
         "anchor": anchor,
-        "dir": to_rel(count_dir, project_root),
-        "meta_path": to_rel(meta_path, project_root),
-        "verdict_path": to_rel(verdict_path, project_root),
-        "source": meta.get("source"),
-        "seed_source": meta.get("seed_source"),
-        "avg_score": verdict.get("avg_score"),
-        "threshold": cli_threshold if cli_threshold is not None else verdict.get("threshold"),
-        "pass": verdict.get("pass"),
-        "valid_images": valid_images,
-        "valid_image_count": len(valid_images),
-        "all_images": all_images,
-        "all_image_count": len(all_images),
+        "target_count": target_count,
+        "image_paths": [
+            to_rel(count_dir / image_name, project_root) for image_name in valid_images
+        ],
     }
     return pool, stats
 
 
 def main() -> None:
     args = parse_args()
-    project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(__file__).resolve().parents[2]
     dpo_root = Path(args.dpo_root)
-    output_path = Path(args.output_jsonl)
+    output_arg = args.output_jsonl or args.output_json
+    output_path = Path(output_arg)
 
     if not dpo_root.exists():
         print(f"[ERROR] dpo_root not found: {dpo_root}", file=sys.stderr)
@@ -214,18 +213,10 @@ def main() -> None:
             stats.update(pool_stats)
             if pool is None:
                 continue
-            if not args.include_empty_pools and not pool["valid_images"]:
+            if not args.include_empty_pools and not pool["image_paths"]:
                 continue
 
-            noun = str(pool["anchor"]).split(" ", 1)[1] if " " in str(pool["anchor"]) else noun_dir.name
-            noun = str(pool.get("anchor", "")).split(" ", 1)[1] if pool.get("anchor") else noun
-            noun = str(pool.get("anchor", "")).split(" ", 1)[1] if pool.get("anchor") else noun_dir.name
-            noun = str(pool.get("anchor", "")).split(" ", 1)[1] if pool.get("anchor") else noun_dir.name
-            noun = str(pool.get("anchor", "")).split(" ", 1)[1] if pool.get("anchor") else noun_dir.name
-            noun = str(pool.get("anchor", "")).split(" ", 1)[1] if pool.get("anchor") else noun_dir.name
-            noun = str(pool.get("anchor", "")).split(" ", 1)[1] if pool.get("anchor") else noun_dir.name
-            # Use meta noun when available; fallback to directory name only for robustness.
-            noun = str((maybe_load_json(count_dir / "meta.json") or {}).get("noun", "")).strip() or noun_dir.name.replace("_", " ")
+            noun = str(pool.get("noun", "")).strip() or noun_dir.name.replace("_", " ")
             noun_to_pools[noun].append(pool)
 
     kept_rows: list[dict[str, Any]] = []
@@ -237,26 +228,32 @@ def main() -> None:
             pools,
             key=lambda x: (
                 x.get("target_count") if isinstance(x.get("target_count"), int) else 1_000_000,
-                str(x.get("target_word", "")),
+                str(x.get("anchor", "")),
             ),
         )
         if len(pools) < args.min_count_pools:
             dropped_too_few_pools += 1
             continue
+        anchor_pools = [
+            {
+                "anchor": pool["anchor"],
+                "image_paths": pool["image_paths"],
+            }
+            for pool in pools
+        ]
         kept_rows.append(
             {
                 "task": "counting",
                 "noun": noun,
-                "count_pools": pools,
-                "num_count_pools": len(pools),
+                "anchor_pools": anchor_pools,
             }
         )
-        pool_hist[len(pools)] += 1
+        pool_hist[len(anchor_pools)] += 1
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        for row in kept_rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        json.dump(kept_rows, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
     print("\n[SCAN]")
     print(f"  noun_dirs_scanned     : {stats['noun_dirs_scanned']}")
