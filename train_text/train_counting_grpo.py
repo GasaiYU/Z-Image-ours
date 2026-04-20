@@ -210,7 +210,6 @@ def make_ctr_anchor_variants(anchor: str) -> list[str]:
         f"a photo of {base}",
         f"an image of {base}",
         f"a picture of {base}",
-        f"{base} on a white background",
         f"a clear photo of {base}",
         f"a detailed photo of {base}",
     ]
@@ -797,10 +796,10 @@ class PerPromptStatTracker:
 class CountingPromptDataset(Dataset):
     """
     Each item is (prompt_str, noun, count_int).
-    Prompts follow the template: "a photo of {count_phrase} on a white background"
+    Prompts follow the template: "a photo of {count_phrase}"
     """
 
-    PROMPT_TEMPLATE = "a photo of {count_phrase} on a white background"
+    PROMPT_TEMPLATE = "a photo of {count_phrase}"
 
     def __init__(self, nouns: list[str], min_count: int = 3, max_count: int = 7):
         count_words = get_count_words(min_count, max_count)
@@ -1021,10 +1020,10 @@ def main(args: argparse.Namespace) -> None:
         os.makedirs(args.output_dir, exist_ok=True)
 
     VIS_PROMPTS = [
-        "a photo of one apple on a white background",
-        "a photo of three cats on a white background",
-        "a photo of five birds on a white background",
-        "a photo of two dogs on a white background",
+        "a photo of one apple",
+        "a photo of three cats",
+        "a photo of five birds",
+        "a photo of two dogs",
     ]
 
     # ── Thread pool for async reward computation ───────────────────────────
