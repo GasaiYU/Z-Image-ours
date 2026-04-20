@@ -62,6 +62,11 @@ from zimage.pipeline import generate as pipeline_generate  # noqa: E402
 NUMBER_WORDS = ["one", "two", "three", "four", "five"]
 NUMBER_TO_INT = {w: i + 1 for i, w in enumerate(NUMBER_WORDS)}
 INT_TO_NUMBER = {v: k for k, v in NUMBER_TO_INT.items()}
+TEXT_TO_INT = {
+    "zero": 0,
+    "no": 0,
+    **NUMBER_TO_INT,
+}
 
 # Default nouns file (relative to repo root); overridden by --nouns_file arg
 DEFAULT_NOUNS_FILE = "data/train_triplets/counting_nouns.txt"
@@ -91,12 +96,71 @@ def load_nouns(path: str) -> list[str]:
     print(f"[Nouns] Loaded {len(nouns)} nouns from {p}")
     return nouns
 
+
+def pluralize_noun(noun: str) -> str:
+    """Best-effort English pluralization for prompt text."""
+    noun = noun.strip()
+    if not noun:
+        return noun
+
+    parts = noun.split()
+    head = parts[-1]
+    lower = head.lower()
+
+    irregular = {
+        "person": "people",
+        "man": "men",
+        "woman": "women",
+        "child": "children",
+        "mouse": "mice",
+        "goose": "geese",
+        "tooth": "teeth",
+        "foot": "feet",
+    }
+    if lower in irregular:
+        plural = irregular[lower]
+    elif re.search(r"[^aeiou]y$", lower):
+        plural = lower[:-1] + "ies"
+    elif re.search(r"(s|x|z|ch|sh)$", lower):
+        plural = lower + "es"
+    else:
+        plural = lower + "s"
+
+    parts[-1] = plural
+    return " ".join(parts)
+
+
+def count_noun_phrase(count: int | str, noun: str) -> str:
+    """Return grammatically matched count+noun phrase, e.g. 'one apple', 'four candies'."""
+    if isinstance(count, str):
+        count_word = count.strip().lower()
+        count_int = NUMBER_TO_INT.get(count_word)
+    else:
+        count_int = int(count)
+        count_word = INT_TO_NUMBER.get(count_int, str(count_int))
+
+    noun_form = noun.strip() if count_int == 1 else pluralize_noun(noun)
+    return f"{count_word} {noun_form}".strip()
+
+
+def parse_count_prediction(text: str) -> int | None:
+    """Parse either digit counts ('4') or word counts ('four') from VLM output."""
+    nums = re.findall(r"\d+", text.strip())
+    if nums:
+        return int(nums[0])
+
+    tokens = re.findall(r"[a-z]+", text.lower())
+    for token in tokens:
+        if token in TEXT_TO_INT:
+            return TEXT_TO_INT[token]
+    return None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1a. Prompt contrastive helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compose_ctr_anchor(count_word: str, noun: str) -> str:
-    return f"{count_word} {noun}"
+    return count_noun_phrase(count_word, noun)
 
 
 def make_ctr_anchor_variants(anchor: str) -> list[str]:
@@ -538,8 +602,8 @@ class QwenVLCountingReward:
 
     _PROMPT_TEMPLATE = (
         "Look at this image carefully. "
-        "How many {noun}s can you count? "
-        "Reply with ONLY a single integer number, nothing else."
+        "How many {noun_phrase} can you count? "
+        "Reply with ONLY the count, either as a single integer or a single English number word."
     )
 
     def __init__(self, model_path: str, device: str = "cuda"):
@@ -596,7 +660,7 @@ class QwenVLCountingReward:
                 "role": "user",
                 "content": [
                     {"type": "image", "image": img_to_base64(img)},
-                    {"type": "text",  "text": self._PROMPT_TEMPLATE.format(noun=noun)},
+                    {"type": "text",  "text": self._PROMPT_TEMPLATE.format(noun_phrase=pluralize_noun(noun))},
                 ],
             }])
 
@@ -628,9 +692,8 @@ class QwenVLCountingReward:
 
         rewards = []
         for text, target in zip(texts_out, target_counts):
-            nums = re.findall(r"\d+", text.strip())
-            if nums:
-                predicted = int(nums[0])
+            predicted = parse_count_prediction(text)
+            if predicted is not None:
                 offset = abs(predicted - target)
                 reward = max(0.0, 1.0 - 0.5 * offset)
             else:
@@ -682,17 +745,17 @@ class PerPromptStatTracker:
 class CountingPromptDataset(Dataset):
     """
     Each item is (prompt_str, noun, count_int).
-    Prompts follow the template: "a photo of {count_word} {noun}s on a white background"
+    Prompts follow the template: "a photo of {count_phrase} on a white background"
     """
 
-    PROMPT_TEMPLATE = "a photo of {count_word} {noun}s on a white background"
+    PROMPT_TEMPLATE = "a photo of {count_phrase} on a white background"
 
     def __init__(self, nouns: list[str], max_count: int = 5):
         self.items: list[tuple[str, str, int]] = []
         for noun in nouns:
             for cnt in range(1, max_count + 1):
                 cw = NUMBER_WORDS[cnt - 1]
-                prompt = self.PROMPT_TEMPLATE.format(count_word=cw, noun=noun)
+                prompt = self.PROMPT_TEMPLATE.format(count_phrase=count_noun_phrase(cw, noun))
                 self.items.append((prompt, noun, cnt))
 
     def __len__(self) -> int:
