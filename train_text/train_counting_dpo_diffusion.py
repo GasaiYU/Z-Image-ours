@@ -5,6 +5,7 @@ import os
 import random
 import re
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -208,7 +209,12 @@ def unfreeze_transformer_refiner_layers(transformer: torch.nn.Module) -> list[st
     return trainable_names
 
 
-def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+def run_context_refiner(
+    transformer: torch.nn.Module,
+    token_hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+    refiner_override: torch.nn.Module | None = None,
+) -> torch.Tensor:
     model = transformer.module if hasattr(transformer, "module") else transformer
     bsz, seq_len, _ = token_hidden.shape
     device = token_hidden.device
@@ -223,10 +229,22 @@ def run_context_refiner(transformer: torch.nn.Module, token_hidden: torch.Tensor
     pos_ids[:, :, 0] = torch.arange(1, seq_len + 1, dtype=torch.int32, device=device).unsqueeze(0).expand(bsz, -1)
     cap_freqs = model.rope_embedder(pos_ids.view(-1, 3)).view(bsz, seq_len, -1)
 
+    refiner_layers = model.context_refiner if refiner_override is None else refiner_override
     refined = cap_feats
-    for layer in model.context_refiner:
+    for layer in refiner_layers:
         refined = layer(refined, attn_mask, cap_freqs)
     return refined
+
+
+def build_cap_feats(
+    transformer: torch.nn.Module,
+    token_hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+    target_dtype: torch.dtype,
+    refiner_override: torch.nn.Module | None = None,
+) -> list[torch.Tensor]:
+    refined = run_context_refiner(transformer, token_hidden, attention_mask, refiner_override=refiner_override)
+    return [refined[i][attention_mask[i].bool()].to(dtype=target_dtype) for i in range(refined.shape[0])]
 
 
 def make_anchor_variants(anchor: str) -> list[str]:
@@ -593,6 +611,7 @@ def main(args: argparse.Namespace) -> None:
         verbose=is_main,
     )
     transformer = components["transformer"].to(device)
+    ref_context_refiner = deepcopy(transformer.context_refiner).to(device)
     vae = components["vae"].to(device)
     text_encoder = components["text_encoder"].to(device)
     tokenizer = components["tokenizer"]
@@ -601,6 +620,8 @@ def main(args: argparse.Namespace) -> None:
         p.requires_grad_(False)
     for p in vae.parameters():
         p.requires_grad_(False)
+    ref_context_refiner.requires_grad_(False)
+    ref_context_refiner.eval()
     text_encoder.eval()
     vae.eval()
 
@@ -623,6 +644,7 @@ def main(args: argparse.Namespace) -> None:
         n_refiner = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
         print(f"[Init] trainable transformer params: {n_refiner:,}")
         print(f"[Init] projection head: disabled")
+        print("[Init] reference refiner: frozen snapshot enabled for DPO")
         print(f"[Init] gradient accumulation steps: {args.gradient_accumulation_steps}")
         if args.text_source_mode == "avg_range":
             print(f"[Init] refiner input source: avg layers [{args.text_source_range_start}, {args.text_source_range_end}]")
@@ -734,10 +756,14 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(1, args.epochs + 1):
         transformer.train()
+        ref_context_refiner.eval()
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         running_total = 0.0
         running_dpo = 0.0
         running_ctr = 0.0
+        running_implicit_acc = 0.0
+        running_policy_mse = 0.0
+        running_ref_mse = 0.0
         steps = 0
 
         for batch in pbar:
@@ -840,6 +866,16 @@ def main(args: argparse.Namespace) -> None:
                     ).detach().clone()
                     del da_out
 
+                policy_cap_feats = build_cap_feats(transformer, da_h, da_mask, transformer_dtype)
+                with torch.no_grad():
+                    ref_cap_feats = build_cap_feats(
+                        transformer,
+                        da_h,
+                        da_mask,
+                        transformer_dtype,
+                        refiner_override=ref_context_refiner,
+                    )
+
                 pixel_values_w = batch["pixel_values_w"].to(device, dtype=vae.dtype)
                 pixel_values_l = batch["pixel_values_l"].to(device, dtype=vae.dtype)
 
@@ -872,20 +908,40 @@ def main(args: argparse.Namespace) -> None:
                 target_l = latents_l - noise
 
                 t_norm = (1.0 - sigma).to(dtype=transformer_dtype)
-                cap_feats = [da_h[i][da_mask[i].bool()].to(dtype=transformer_dtype) for i in range(da_h.shape[0])]
 
-                # Forward pass Winner
-                pred_w_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w], t_norm, cap_feats)[0]
+                # Policy forward pass
+                pred_w_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w], t_norm, policy_cap_feats)[0]
                 pred_w = torch.stack(pred_w_list, dim=0).squeeze(2).float()
-                loss_w = F.mse_loss(pred_w, target_w.float(), reduction="none").mean(dim=[1,2,3])
+                loss_w_policy = F.mse_loss(pred_w, target_w.float(), reduction="none").mean(dim=[1,2,3])
 
-                # Forward pass Loser
-                pred_l_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l], t_norm, cap_feats)[0]
+                pred_l_list = transformer([x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l], t_norm, policy_cap_feats)[0]
                 pred_l = torch.stack(pred_l_list, dim=0).squeeze(2).float()
-                loss_l = F.mse_loss(pred_l, target_l.float(), reduction="none").mean(dim=[1,2,3])
+                loss_l_policy = F.mse_loss(pred_l, target_l.float(), reduction="none").mean(dim=[1,2,3])
 
-                # CPO Loss
-                loss_dpo = -F.logsigmoid(args.beta_dpo * (loss_l - loss_w)).mean()
+                with torch.no_grad():
+                    ref_pred_w_list = transformer(
+                        [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_w],
+                        t_norm,
+                        ref_cap_feats,
+                    )[0]
+                    ref_pred_w = torch.stack(ref_pred_w_list, dim=0).squeeze(2).float()
+                    loss_w_ref = F.mse_loss(ref_pred_w, target_w.float(), reduction="none").mean(dim=[1,2,3])
+
+                    ref_pred_l_list = transformer(
+                        [x.unsqueeze(1).to(dtype=transformer_dtype) for x in noisy_l],
+                        t_norm,
+                        ref_cap_feats,
+                    )[0]
+                    ref_pred_l = torch.stack(ref_pred_l_list, dim=0).squeeze(2).float()
+                    loss_l_ref = F.mse_loss(ref_pred_l, target_l.float(), reduction="none").mean(dim=[1,2,3])
+
+                model_diff = loss_w_policy - loss_l_policy
+                ref_diff = loss_w_ref - loss_l_ref
+                inside_term = -0.5 * args.beta_dpo * (model_diff - ref_diff)
+                implicit_acc = (inside_term > 0).float().mean()
+                policy_mse = 0.5 * (loss_w_policy.mean() + loss_l_policy.mean())
+                ref_mse = 0.5 * (loss_w_ref.mean() + loss_l_ref.mean())
+                loss_dpo = -F.logsigmoid(inside_term).mean()
 
                 ctr_w = get_ctr_weight(global_step)
                 loss = args.diffusion_weight * loss_dpo + ctr_w * loss_ctr
@@ -893,6 +949,8 @@ def main(args: argparse.Namespace) -> None:
                 if global_step == 0 and accelerator.sync_gradients and is_main:
                     print(f"[Pretrained baseline] L_dpo={loss_dpo.item():.4f}  L_ctr={loss_ctr.item():.4f}  "
                           f"sigma_mean={sigma.mean().item():.3f}  ctr_batch={B_ctr}  "
+                          f"implicit_acc={implicit_acc.item():.3f}  "
+                          f"model_diff={model_diff.mean().item():+.4f}  ref_diff={ref_diff.mean().item():+.4f}  "
                           f"p-n={pos_sim - neg_sim:+.4f}  "
                           f"random_baseline={torch.log(torch.tensor(K+1.0)):.4f}")
 
@@ -911,12 +969,16 @@ def main(args: argparse.Namespace) -> None:
             running_total += loss.item()
             running_dpo += loss_dpo.item()
             running_ctr += loss_ctr.item()
+            running_implicit_acc += implicit_acc.item()
+            running_policy_mse += policy_mse.item()
+            running_ref_mse += ref_mse.item()
 
             if is_main:
                 pbar.set_postfix(
                     {
                         "L_dpo": f"{loss_dpo.item():.4f}",
                         "L_ctr": f"{loss_ctr.item():.4f}",
+                        "imp": f"{implicit_acc.item():.3f}",
                         "p-n": f"{pos_sim - neg_sim:+.3f}",
                     }
                 )
@@ -929,6 +991,16 @@ def main(args: argparse.Namespace) -> None:
                             "train/pos_sim": pos_sim,
                             "train/neg_sim": neg_sim,
                             "train/pos_neg_gap": pos_sim - neg_sim,
+                            "train/dpo_inside_term": inside_term.mean().item(),
+                            "train/dpo_implicit_acc": implicit_acc.item(),
+                            "train/dpo_model_diff": model_diff.mean().item(),
+                            "train/dpo_ref_diff": ref_diff.mean().item(),
+                            "train/dpo_policy_mse": policy_mse.item(),
+                            "train/dpo_ref_mse": ref_mse.item(),
+                            "train/dpo_policy_win_mse": loss_w_policy.mean().item(),
+                            "train/dpo_policy_lose_mse": loss_l_policy.mean().item(),
+                            "train/dpo_ref_win_mse": loss_w_ref.mean().item(),
+                            "train/dpo_ref_lose_mse": loss_l_ref.mean().item(),
                             "train/ctr_weight": ctr_w,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
@@ -961,14 +1033,24 @@ def main(args: argparse.Namespace) -> None:
         avg_total = running_total / steps
         avg_dpo = running_dpo / steps
         avg_ctr = running_ctr / steps
+        avg_implicit_acc = running_implicit_acc / steps
+        avg_policy_mse = running_policy_mse / steps
+        avg_ref_mse = running_ref_mse / steps
         if is_main:
-            print(f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_dpo={avg_dpo:.4f} avg_ctr={avg_ctr:.4f}")
+            print(
+                f"[Epoch {epoch}] avg_total={avg_total:.4f} avg_dpo={avg_dpo:.4f} "
+                f"avg_ctr={avg_ctr:.4f} avg_imp={avg_implicit_acc:.4f} "
+                f"avg_policy_mse={avg_policy_mse:.4f} avg_ref_mse={avg_ref_mse:.4f}"
+            )
             if use_wandb:
                 wandb.log(
                     {
                         "epoch/avg_total": avg_total,
                         "epoch/avg_dpo": avg_dpo,
                         "epoch/avg_ctr": avg_ctr,
+                        "epoch/avg_implicit_acc": avg_implicit_acc,
+                        "epoch/avg_policy_mse": avg_policy_mse,
+                        "epoch/avg_ref_mse": avg_ref_mse,
                         "epoch/epoch": epoch,
                     },
                     step=global_step,
@@ -1065,7 +1147,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--contrastive_weight", type=float, default=1.0,
                    help="Initial contrastive loss weight (linearly decays to 0 over ctr_decay_steps).")
     p.add_argument("--diffusion_weight", type=float, default=1.0, help="Diffusion loss weight (fixed).")
-    p.add_argument("--beta_dpo", type=float, default=0.3, help="Beta parameter for DPO/CPO loss.")
+    p.add_argument("--beta_dpo", type=float, default=500.0, help="Beta parameter for reference-based DPO loss.")
     p.add_argument("--ctr_decay_steps", type=int, default=0,
                    help="Steps over which contrastive weight decays to 0. 0 = decay over all training steps.")
     p.add_argument("--no_ctr_decay", action="store_true",
