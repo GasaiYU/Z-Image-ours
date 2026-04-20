@@ -156,6 +156,24 @@ def parse_count_prediction(text: str) -> int | None:
             return TEXT_TO_INT[token]
     return None
 
+
+def parse_yes_no_prediction(text: str) -> bool | None:
+    """Parse yes/no style VLM verification answers."""
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return None
+    if cleaned.startswith("yes"):
+        return True
+    if cleaned.startswith("no"):
+        return False
+    has_yes = re.search(r"\byes\b", cleaned) is not None
+    has_no = re.search(r"\bno\b", cleaned) is not None
+    if has_yes and not has_no:
+        return True
+    if has_no and not has_yes:
+        return False
+    return None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1a. Prompt contrastive helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -597,14 +615,16 @@ class QwenVLCountingReward:
     Wraps Qwen2.5-VL-7B-Instruct to score counting accuracy.
 
     Reward mapping:
-      offset = |predicted_count − target_count|
-      reward = max(0.0, 1.0 − 0.5 * offset)
+      ask VLM whether the image contains exactly the requested count.
+      yes -> 1.0
+      no / unknown -> 0.0
     """
 
     _PROMPT_TEMPLATE = (
         "Look at this image carefully. "
-        "How many {noun_phrase} can you count? "
-        "Reply with ONLY the count, either as a single integer or a single English number word."
+        "Does this image show exactly {count_phrase}? "
+        "Count only complete objects and ignore shadows, printed patterns, object parts, and background shapes. "
+        "Reply with yes or no only."
     )
 
     def __init__(self, model_path: str, device: str = "cuda"):
@@ -657,12 +677,12 @@ class QwenVLCountingReward:
             return "data:image;base64," + base64.b64encode(buf.getvalue()).decode()
 
         messages = []
-        for img, noun in zip(images, target_nouns):
+        for img, noun, count in zip(images, target_nouns, target_counts):
             messages.append([{
                 "role": "user",
                 "content": [
                     {"type": "image", "image": img_to_base64(img)},
-                    {"type": "text",  "text": self._PROMPT_TEMPLATE.format(noun_phrase=pluralize_noun(noun))},
+                    {"type": "text",  "text": self._PROMPT_TEMPLATE.format(count_phrase=count_noun_phrase(count, noun))},
                 ],
             }])
 
@@ -694,17 +714,13 @@ class QwenVLCountingReward:
 
         details = []
         for text, noun, target in zip(texts_out, target_nouns, target_counts):
-            predicted = parse_count_prediction(text)
-            if predicted is not None:
-                offset = abs(predicted - target)
-                reward = max(0.0, 1.0 - 0.5 * offset)
-            else:
-                reward = 0.0
+            predicted_match = parse_yes_no_prediction(text)
+            reward = 1.0 if predicted_match is True else 0.0
             details.append(
                 {
                     "target_noun": noun,
                     "target_count": int(target),
-                    "predicted_count": None if predicted is None else int(predicted),
+                    "predicted_match": predicted_match,
                     "reward": float(reward),
                     "raw_text": text.strip(),
                 }
@@ -1120,7 +1136,7 @@ def main(args: argparse.Namespace) -> None:
                     for img, prompt, detail in zip(images, prompts, reward_details):
                         raw_text = detail["raw_text"] or "<empty>"
                         caption = (
-                            f"r={detail['reward']:.2f} | pred={detail['predicted_count']} "
+                            f"r={detail['reward']:.2f} | match={detail['predicted_match']} "
                             f"| target={detail['target_count']} | vlm={raw_text} | {prompt}"
                         )
                         vis_imgs.append(wandb.Image(img, caption=caption))
